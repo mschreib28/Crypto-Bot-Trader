@@ -1,0 +1,313 @@
+openapi: 3.0.0
+info:
+  title: Omni-Bot API
+  version: "0.1.0"
+  description: |
+    API contract for the Omni-Bot Trading Platform.
+    This file defines external and internal HTTP interfaces.
+
+servers:
+  - url: http://localhost:8000
+    description: Local development
+
+paths:
+  /api/v1/health:
+    get:
+      summary: Health check
+      operationId: getHealth
+      tags:
+        - System
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "healthy"
+
+  /api/v1/panic:
+    post:
+      summary: Emergency panic endpoint
+      operationId: panic
+      tags:
+        - System
+      description: |
+        Cancels all open orders and attempts to flatten all positions.
+        This operation is idempotent.
+      responses:
+        "200":
+          description: Panic sequence initiated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "panic_initiated"
+                  orders_cancelled:
+                    type: integer
+                    description: Number of orders that were cancelled
+                    example: 3
+
+  /api/v1/strategies:
+    get:
+      summary: List registered strategies
+      operationId: listStrategies
+      tags:
+        - Strategies
+      responses:
+        "200":
+          description: Strategy list returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StrategyList"
+
+components:
+  schemas:
+    TradeIntent:
+      type: object
+      required:
+        - strategy_id
+        - symbol
+        - side
+        - intent_type
+        - notional_risk_pct
+        - metadata
+      description: |
+        Represents a strategy's request to enter or exit a position.
+        TradeIntents express desire, not permission. No execution-specific fields are allowed.
+      properties:
+        strategy_id:
+          type: string
+          description: |
+            Unique identifier for the strategy that generated this intent.
+            Must match a registered strategy in the strategies table.
+          example: "momentum_btc_v1"
+        symbol:
+          type: string
+          description: |
+            Trading pair symbol (e.g., "BTC/USD", "ETH/USD").
+            Must match Kraken symbol format.
+          example: "BTC/USD"
+        side:
+          type: string
+          enum:
+            - buy
+            - sell
+          description: |
+            Direction of the trade intent.
+            "buy" indicates entering a long position or closing a short.
+            "sell" indicates entering a short position or closing a long.
+          example: "buy"
+        intent_type:
+          type: string
+          enum:
+            - enter
+            - exit
+            - reduce
+          description: |
+            Type of intent.
+            "enter" opens a new position.
+            "exit" closes an entire position.
+            "reduce" partially closes a position.
+          example: "enter"
+        notional_risk_pct:
+          type: number
+          format: float
+          minimum: 0
+          exclusiveMinimum: true
+          description: |
+            Percentage of total account equity to risk on this trade.
+            Must be a positive number. Represents the maximum loss exposure
+            if the trade moves against the position.
+          example: 5.0
+        metadata:
+          type: object
+          additionalProperties: true
+          description: |
+            Opaque key/value map for strategy-specific context.
+            May include indicators, signal strength, or other strategy-internal state.
+            No schema enforcement; strategies are free to include any JSON-serializable data.
+          example:
+            signal_strength: 0.85
+            indicator_rsi: 65.2
+
+    RiskDecision:
+      type: object
+      required:
+        - intent_id
+        - approved
+        - evaluated_portfolio_risk
+        - timestamp
+      description: |
+        Represents the Risk Manager's evaluation of a TradeIntent.
+        Risk Manager defaults to fail-closed: if evaluation cannot be completed,
+        approved must be false.
+      properties:
+        intent_id:
+          type: string
+          description: |
+            Unique identifier linking this decision to the original TradeIntent.
+            Used for traceability and audit.
+          example: "intent_abc123"
+        approved:
+          type: boolean
+          description: |
+            Whether the TradeIntent is approved for execution.
+            true means the intent passes all risk checks and may proceed.
+            false means the intent is rejected.
+          example: true
+        rejection_reason:
+          type: string
+          nullable: true
+          description: |
+            If approved is false, this field contains the reason for rejection.
+            Common values: "exceeds_portfolio_limit", "exceeds_strategy_limit",
+            "system_halted", "stale_market_data".
+            If approved is true, this field must be null.
+          example: "exceeds_portfolio_limit"
+        evaluated_portfolio_risk:
+          type: number
+          format: float
+          description: |
+            The calculated portfolio exposure percentage at the time of evaluation.
+            Represents (total_exposure / total_equity) * 100.
+            Used for audit and debugging.
+          example: 12.5
+        timestamp:
+          type: string
+          format: date-time
+          description: |
+            UTC timestamp when the risk evaluation was performed.
+            Format: YYYY-MM-DDTHH:mm:ssZ (ISO8601).
+          example: "2024-01-01T12:00:00Z"
+
+    Fill:
+      type: object
+      required:
+        - order_id
+        - symbol
+        - side
+        - executed_price
+        - quantity
+        - fees
+        - slippage
+        - exchange_order_id
+        - timestamp
+      description: |
+        Represents the result of an executed order.
+        Fill objects are immutable once created.
+        Partial fills may result in multiple Fill objects for a single order_id.
+      properties:
+        order_id:
+          type: string
+          description: |
+            Internal order identifier generated by the Execution Engine.
+            Unique within the system. Used for tracking and audit.
+          example: "order_xyz789"
+        symbol:
+          type: string
+          description: |
+            Trading pair symbol that was executed (e.g., "BTC/USD", "ETH/USD").
+            Must match the TradeIntent symbol.
+          example: "BTC/USD"
+        side:
+          type: string
+          enum:
+            - buy
+            - sell
+          description: |
+            Execution side: "buy" or "sell".
+            Must match the TradeIntent side.
+          example: "buy"
+        executed_price:
+          type: number
+          format: float
+          minimum: 0
+          exclusiveMinimum: true
+          description: |
+            Average price at which the order was filled.
+            For partial fills, this is the volume-weighted average price.
+          example: 50000.25
+        quantity:
+          type: number
+          format: float
+          minimum: 0
+          exclusiveMinimum: true
+          description: |
+            Quantity of the base asset that was executed.
+            Must be positive.
+          example: 0.001
+        fees:
+          type: number
+          format: float
+          minimum: 0
+          description: |
+            Total fees paid for this execution, denominated in the quote currency (e.g., USD).
+            Must be non-negative.
+          example: 0.5
+        slippage:
+          type: number
+          format: float
+          description: |
+            Slippage amount, calculated as the difference between intended price and executed price.
+            Positive values indicate worse execution (buy higher, sell lower).
+            Denominated in quote currency.
+          example: 2.5
+        exchange_order_id:
+          type: string
+          description: |
+            Order identifier returned by the exchange (Kraken).
+            Used for reconciliation and support. Must be unique per exchange.
+          example: "O12345678-ABCD-EFGH-IJKL-MNOPQRSTUVWX"
+        timestamp:
+          type: string
+          format: date-time
+          description: |
+            UTC timestamp when the order was executed on the exchange.
+            Format: YYYY-MM-DDTHH:mm:ssZ (ISO8601).
+          example: "2024-01-01T12:00:00Z"
+
+    StrategyList:
+      type: object
+      properties:
+        strategies:
+          type: array
+          items:
+            $ref: "#/components/schemas/StrategyItem"
+
+    StrategyItem:
+      type: object
+      required:
+        - id
+        - name
+        - status
+        - created_at
+      properties:
+        id:
+          type: string
+          description: Unique strategy identifier
+          example: "strategy_001"
+        name:
+          type: string
+          description: Human-readable strategy name
+          example: "Momentum BTC v1"
+        status:
+          type: string
+          enum:
+            - active
+            - paused
+            - stopped
+          description: Current lifecycle status of the strategy
+          example: "active"
+        created_at:
+          type: string
+          format: date-time
+          description: UTC timestamp when the strategy was registered
+          example: "2024-01-01T00:00:00Z"
