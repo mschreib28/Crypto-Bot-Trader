@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import CORS_ORIGINS, LOG_LEVEL
-from backend.api.routes import health
+from backend.api.routes import health, panic, strategies
 
 # Configure structured logging
 logging.basicConfig(
@@ -33,7 +33,9 @@ app.add_middleware(
 )
 
 # Register routes
-app.include_router(health.router, prefix="/api/v1", tags=["health"])
+app.include_router(health.router, prefix="/api/v1", tags=["System"])
+app.include_router(panic.router, prefix="/api/v1", tags=["System"])
+app.include_router(strategies.router, prefix="/api/v1", tags=["Strategies"])
 
 logger.info("FastAPI application initialized")
 

@@ -41,7 +41,7 @@ class Signal(Base):
     side = Column(String(10), nullable=False)
     intent_type = Column(String(20), nullable=False)
     notional_risk_pct = Column(Numeric(10, 4), nullable=False)
-    metadata = Column(JSONB, nullable=False, default={})
+    signal_metadata = Column(JSONB, name='metadata', nullable=False, default={})
     status = Column(String(50), nullable=False, default="pending")
     created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
     

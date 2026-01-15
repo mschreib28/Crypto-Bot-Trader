@@ -1,0 +1,70 @@
+{
+    "openapi": "3.1.0",
+    "info": {
+        "title": "Omni-Bot API",
+        "description": "API for the Omni-Bot Trading Platform",
+        "version": "0.1.0"
+    },
+    "paths": {
+        "/api/v1/health": {
+            "get": {
+                "tags": [
+                    "System"
+                ],
+                "summary": "Health check",
+                "description": "Health check endpoint.\n\nReturns the health status of the API service.",
+                "operationId": "health_check_api_v1_health_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/panic": {
+            "post": {
+                "tags": [
+                    "System"
+                ],
+                "summary": "Emergency panic endpoint",
+                "description": "Emergency panic endpoint.\n\nCancels all open orders and attempts to flatten all positions.\nThis operation is idempotent and safe to retry.\n\nReturns:\n    Dictionary with status and orders_cancelled count:\n    {\n        \"status\": \"panic_initiated\",\n        \"orders_cancelled\": <int>\n    }\n    \nNote:\n    - Sets system halt mode to true\n    - Cancels all open orders via Kraken REST API\n    - Attempts to flatten positions (if supported by exchange)\n    - If execution fails, system remains halted (fail-closed)\n    - Multiple calls are safe and return the same result",
+                "operationId": "panic_api_v1_panic_post",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/strategies": {
+            "get": {
+                "tags": [
+                    "Strategies"
+                ],
+                "summary": "List registered strategies",
+                "description": "List all registered strategies.\n\nReturns a list of all strategies from the strategies table,\nincluding their id, name, status, and created_at timestamp.",
+                "operationId": "list_strategies_api_v1_strategies_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
