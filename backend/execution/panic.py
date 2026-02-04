@@ -15,6 +15,7 @@ from typing import Dict, Any, List
 from backend.execution.kraken_rest import KrakenClient
 from backend.risk.halt import set_halt_mode
 from backend.config import KRAKEN_API_KEY, KRAKEN_API_SECRET
+from backend.api.routes.trading import set_trading_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -127,13 +128,14 @@ def attempt_flatten_positions(client: KrakenClient) -> None:
 
 def execute_panic_sequence() -> Dict[str, Any]:
     """
-    Execute the panic sequence: halt system, cancel orders, flatten positions.
+    Execute the panic sequence: halt system, disable trading, cancel orders, flatten positions.
     
     Returns:
-        Dictionary with status and orders_cancelled count:
+        Dictionary with status, orders_cancelled count, and trading_disabled flag:
         {
             "status": "panic_initiated",
-            "orders_cancelled": <int>
+            "orders_cancelled": <int>,
+            "trading_disabled": True
         }
         
     Note:
@@ -156,7 +158,15 @@ def execute_panic_sequence() -> Dict[str, Any]:
         # Fail-closed: even if halt mode setting fails, we continue
         # The panic sequence should still attempt to cancel orders
     
-    # Step 2 & 3: Cancel all open orders and attempt to flatten positions
+    # Step 2: Disable live trading
+    try:
+        set_trading_enabled(False)
+        logger.info("Live trading disabled")
+    except Exception as e:
+        logger.error(f"Failed to disable trading: {e}")
+        # Fail-closed: continue with panic sequence
+    
+    # Step 3 & 4: Cancel all open orders and attempt to flatten positions
     orders_cancelled = 0
     client = None
     try:
@@ -166,7 +176,7 @@ def execute_panic_sequence() -> Dict[str, Any]:
         logger.error(f"Failed to initialize Kraken client or cancel orders: {e}")
         # Fail-closed: return 0 orders cancelled, but system remains halted
     
-    # Step 3: Attempt to flatten positions (use existing client if available)
+    # Step 5: Attempt to flatten positions (use existing client if available)
     try:
         if client is None:
             client = KrakenClient(api_key=KRAKEN_API_KEY, api_secret=KRAKEN_API_SECRET)
@@ -179,5 +189,6 @@ def execute_panic_sequence() -> Dict[str, Any]:
     
     return {
         "status": "panic_initiated",
-        "orders_cancelled": orders_cancelled
+        "orders_cancelled": orders_cancelled,
+        "trading_disabled": True
     }

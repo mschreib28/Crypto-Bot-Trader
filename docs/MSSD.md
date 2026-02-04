@@ -258,12 +258,40 @@ A milestone is considered complete only when:
 
 ## 11. Project Milestones
 
-| Milestone | Deliverable | Responsibility |
-|---------|-------------|----------------|
-| M1: The Hub | Data Ingestor, Redis pipeline, DB schema | Backend |
-| M2: The Guard | Risk Manager + Execution API | Backend + Quant |
-| M3: The Alpha | Momentum & Mean-Reversion strategies | Quant |
-| M4: The Window | Dashboard + Monitoring | Frontend + Ops |
+| Milestone | Deliverable | Responsibility | Status |
+|---------|-------------|----------------|--------|
+| M1: The Hub | Data Ingestor, Redis pipeline, DB schema | Backend | ✅ Complete |
+| M2: The Guard | Risk Manager + Execution API | Backend + Quant | ✅ Complete |
+| M3: The Alpha | Momentum & Mean-Reversion strategies | Quant | ✅ Complete |
+| M4: The Window | Dashboard + Monitoring | Frontend + Ops | ✅ Complete |
+| M5: The MVP | Live trading with Mean Reversion on ETH/USD | Backend + Frontend | 🚧 Active |
+
+### M5: MVP Trading Details
+
+**Objective:** Execute real micro-trades with $50-100 starting capital using Mean Reversion strategy on ETH/USD.
+
+**Approach: 2% Rule with Micro-Trading**
+- Kraken does not support paper trading
+- All trades are real but micro-sized using the 2% rule
+- Start small, prove profitability, then gradually scale up
+
+**Components:**
+- Strategy Runner (connects live data → strategy → execution)
+- Position Tracker (knows what we own)
+- 2% Risk Rule Engine (never risk more than 2% of account equity per trade)
+- Position Sizing Calculator (calculates quantity based on risk and stop-loss)
+
+**2% Rule Examples:**
+| Account | Max Risk (2%) | Position Size (5% SL) | ETH Qty @ $3,200 |
+|---------|---------------|----------------------|------------------|
+| $50     | $1.00         | $20.00               | 0.00625 ETH      |
+| $100    | $2.00         | $40.00               | 0.0125 ETH       |
+
+**Safety Constraints:**
+- 2% rule enforced before every trade
+- Daily loss limit: $10 (triggers halt)
+- Minimum trade size: $1 (Kraken minimum)
+- Scale up only after proven profitability
 
 ---
 

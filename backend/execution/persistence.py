@@ -22,6 +22,8 @@ def persist_fill(fill: Fill, signal_id: Optional[str] = None) -> bool:
     """
     Persist a Fill object to the orders table and update signal status.
     
+    TICKET-603: Sets is_live and execution_mode based on shadow mode state.
+    
     This function:
     - Inserts or updates the order record (idempotent via exchange_order_id)
     - Updates the associated signal status to "executed"
@@ -41,6 +43,17 @@ def persist_fill(fill: Fill, signal_id: Optional[str] = None) -> bool:
     session: Optional[Session] = None
     try:
         session = get_session()
+        
+        # TICKET-603: Detect shadow mode to set is_live and execution_mode
+        try:
+            from backend.api.routes.trading import get_shadow_live_mode
+            shadow_mode = get_shadow_live_mode()
+            is_live = not shadow_mode
+            execution_mode = 'shadow' if shadow_mode else 'live'
+        except Exception as e:
+            logger.warning(f"Failed to detect shadow mode, defaulting to live: {e}")
+            is_live = True
+            execution_mode = 'live'
         
         # Convert signal_id string to UUID if provided
         signal_uuid: Optional[uuid.UUID] = None
@@ -74,6 +87,9 @@ def persist_fill(fill: Fill, signal_id: Optional[str] = None) -> bool:
             existing_order.slippage = fill.slippage
             existing_order.status = "executed"
             existing_order.executed_at = executed_at
+            # TICKET-603: Update execution mode fields
+            existing_order.is_live = is_live
+            existing_order.execution_mode = execution_mode
             # Update signal_id if provided and different
             if signal_uuid and existing_order.signal_id != signal_uuid:
                 existing_order.signal_id = signal_uuid
@@ -91,11 +107,16 @@ def persist_fill(fill: Fill, signal_id: Optional[str] = None) -> bool:
                 exchange_order_id=fill.exchange_order_id,
                 status="executed",
                 executed_at=executed_at,
+                is_live=is_live,  # TICKET-603
+                execution_mode=execution_mode,  # TICKET-603
             )
             session.add(new_order)
             session.flush()  # Flush to get the ID
             order_id = new_order.id
-            logger.debug(f"Created new order with exchange_order_id: {fill.exchange_order_id}")
+            logger.debug(
+                f"Created new order with exchange_order_id: {fill.exchange_order_id}, "
+                f"is_live={is_live}, execution_mode={execution_mode}"
+            )
         
         # Update signal status to "executed" if signal_id is provided
         if signal_uuid:

@@ -241,27 +241,31 @@ def check_market_data_freshness(symbol: str) -> tuple[bool, Optional[str]]:
     Note: This is a basic implementation. A full implementation would check
     the timestamp of the latest market data event in Redis streams.
     """
-    # For Ticket 8, we'll do a basic check
-    # Ticket 9 or later tickets may implement full market data freshness checks
+    # Check multiple intervals since strategies use different timeframes
+    intervals_to_check = ["5m", "1h", "4h"]
+    
     try:
         redis_client = get_redis_client()
-        # Check if market data stream exists (basic check)
-        # Full implementation would check timestamp of latest message
-        stream_key = f"market:ohlcv:{symbol}:4h"
-        try:
-            stream_info = redis_client.xinfo_stream(stream_key)
-            if stream_info:
-                # Market data exists, assume fresh for now
-                # TODO: Check timestamp of latest message against current time
-                return True, None
-            else:
-                return False, "stale_market_data"
-        except redis.ResponseError as e:
-            # Stream doesn't exist (Redis returns error for non-existent streams)
-            if "no such key" in str(e).lower():
-                logger.warning(f"Market data stream {stream_key} does not exist. Rejecting (fail-closed).")
-                return False, "stale_market_data"
-            raise
+        
+        # Check if market data stream exists for ANY interval (basic check)
+        for interval in intervals_to_check:
+            stream_key = f"market:ohlcv:{symbol}:{interval}"
+            try:
+                stream_info = redis_client.xinfo_stream(stream_key)
+                if stream_info:
+                    # Market data exists for this interval, assume fresh
+                    # TODO: Check timestamp of latest message against current time
+                    return True, None
+            except redis.ResponseError as e:
+                # Stream doesn't exist, try next interval
+                if "no such key" not in str(e).lower():
+                    raise
+                continue
+        
+        # No streams found for any interval
+        logger.warning(f"No market data streams found for {symbol} at intervals {intervals_to_check}. Rejecting (fail-closed).")
+        return False, "stale_market_data"
+        
     except Exception as e:
         logger.warning(f"Failed to check market data freshness for {symbol}: {e}. Rejecting (fail-closed).")
         return False, "stale_market_data"

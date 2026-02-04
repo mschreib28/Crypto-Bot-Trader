@@ -1,4 +1,4 @@
-.PHONY: help up down restart logs ps health migrate test clean verify verify-services verify-contracts verify-api verify-database verify-redis verify-ingestor verify-modules
+.PHONY: help up down restart logs ps health migrate test test-strategies test-risk clean verify verify-services verify-contracts verify-api verify-database verify-redis verify-ingestor verify-modules verify-strategies verify-all verify-frontend verify-m4 verify-complete seed-strategies
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -46,8 +46,18 @@ migrate: ## Run database migrations
 migrate-create: ## Create a new migration (usage: make migrate-create NAME=migration_name)
 	docker compose exec api sh -c "cd /app/backend && alembic revision --autogenerate -m \"$(NAME)\""
 
-test: ## Run tests
-	docker compose exec api pytest backend/ -v
+seed-strategies: ## Seed strategy configurations into the database
+	docker compose cp backend/db/seeds/strategies.sql postgres:/tmp/strategies.sql
+	docker compose exec -T postgres psql -U omni_bot -d omni_bot -f /tmp/strategies.sql
+
+test: ## Run all tests (backend + strategies)
+	docker compose exec api pytest backend/ research/ -v
+
+test-strategies: ## Run strategy tests only
+	docker compose exec api pytest research/strategies/ -v --cov=research/strategies
+
+test-risk: ## Run 2% rule tests
+	docker compose exec api pytest backend/tests/test_two_percent_rule.py -v
 
 clean: ## Remove containers, volumes, and images
 	docker compose down -v --rmi local
@@ -107,3 +117,36 @@ verify: ## Run full M1-M2 integration verification
 	@$(MAKE) verify-ingestor
 	@$(MAKE) verify-modules
 	@echo "=== All checks passed ==="
+
+verify-strategies: ## Verify M3 strategy modules
+	@echo "=== Verifying Strategies (M3) ==="
+	@docker compose exec api python3 -c "from research.strategies.base import BaseStrategy; print('✓ BaseStrategy imports')" || (echo "❌ BaseStrategy import failed"; exit 1)
+	@docker compose exec api python3 -c "from research.strategies.momentum.strategy import MomentumStrategy; print('✓ MomentumStrategy imports')" || (echo "❌ MomentumStrategy import failed"; exit 1)
+	@docker compose exec api python3 -c "from research.strategies.meanrev.strategy import MeanReversionStrategy; print('✓ MeanReversionStrategy imports')" || (echo "❌ MeanReversionStrategy import failed"; exit 1)
+	@echo "✓ M3 strategies verified"
+
+verify-all: ## Run full M1-M2-M3 verification
+	@echo "=== Full System Verification (M1-M2-M3) ==="
+	@$(MAKE) verify
+	@$(MAKE) verify-strategies
+	@echo "=== All M1-M2-M3 checks passed ==="
+
+verify-frontend: ## Verify M4 frontend and new API endpoints
+	@echo "=== Verifying Frontend (M4) ==="
+	@curl -sf http://localhost:8000/api/v1/signals > /dev/null && echo "✓ Signals endpoint OK" || (echo "❌ Signals endpoint failed"; exit 1)
+	@curl -sf http://localhost:8000/api/v1/orders > /dev/null && echo "✓ Orders endpoint OK" || (echo "❌ Orders endpoint failed"; exit 1)
+	@curl -sf http://localhost:8000/api/v1/status | grep -q "halted" && echo "✓ Status endpoint OK" || (echo "❌ Status endpoint failed"; exit 1)
+	@test -f frontend/dist/index.html && echo "✓ Frontend build exists" || (echo "❌ Frontend build missing"; exit 1)
+	@echo "✓ M4 frontend verified"
+
+verify-m4: ## Run full M4 verification
+	@echo "=== M4 Verification ==="
+	@$(MAKE) verify-frontend
+	@echo "=== M4 checks passed ==="
+
+verify-complete: ## Run full M1-M2-M3-M4 verification
+	@echo "=== Complete System Verification (M1-M4) ==="
+	@$(MAKE) verify
+	@$(MAKE) verify-strategies
+	@$(MAKE) verify-frontend
+	@echo "=== All milestones verified ===" 

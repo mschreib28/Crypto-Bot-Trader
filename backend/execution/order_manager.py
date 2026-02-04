@@ -118,12 +118,57 @@ def _convert_symbol_to_kraken_pair(symbol: str) -> str:
     return pair
 
 
+def classify_kraken_error(error_message: str) -> str:
+    """
+    Classify Kraken API errors into specific error types.
+    
+    TICKET-605: Enhanced error handling with specific error types.
+    
+    Args:
+        error_message: Error message from Kraken API
+        
+    Returns:
+        Error type: 'insufficient_funds', 'price_moved', 'below_costmin', 
+                   'rate_limit', 'exchange_error', 'network_error', 'unknown_error'
+    """
+    error_lower = error_message.lower()
+    
+    # Check for insufficient funds
+    if "insufficient funds" in error_lower or "eorder:insufficient funds" in error_lower:
+        return "insufficient_funds"
+    
+    # Check for price moved
+    if "price changed" in error_lower or "eorder:price changed" in error_lower or "price moved" in error_lower:
+        return "price_moved"
+    
+    # Check for below costmin
+    if "order minimum not met" in error_lower or "below_costmin" in error_lower or "eorder:order minimum" in error_lower:
+        return "below_costmin"
+    
+    # Check for rate limit
+    if "rate limit" in error_lower or "eapi:rate limit" in error_lower:
+        return "rate_limit"
+    
+    # Check for exchange errors (5xx or invalid API)
+    if "eapi:invalid" in error_lower or "eapi:" in error_lower:
+        return "exchange_error"
+    
+    # Check for network errors
+    if "connection" in error_lower or "timeout" in error_lower or "network" in error_lower:
+        return "network_error"
+    
+    # Unknown error
+    return "unknown_error"
+
+
 def execute_order(
     client: KrakenClientInterface,
     order_params: Dict[str, Any],
 ) -> KrakenOrderResponse:
     """
     Execute an order on Kraken using the provided client.
+    
+    TICKET-605: Enhanced error handling with error classification.
     
     Args:
         client: Kraken REST API client (implements KrakenClientInterface)
@@ -133,7 +178,7 @@ def execute_order(
         KrakenOrderResponse with exchange_order_id and order details
         
     Raises:
-        Exception: If order execution fails
+        Exception: If order execution fails (with classified error type in message)
     """
     logger.info(f"Executing order with params: {order_params}")
     
@@ -142,14 +187,26 @@ def execute_order(
         
         if response.error:
             error_msg = ", ".join(response.error) if isinstance(response.error, list) else str(response.error)
-            raise Exception(f"Kraken order error: {error_msg}")
+            error_type = classify_kraken_error(error_msg)
+            classified_error = f"{error_type}: {error_msg}"
+            logger.error(f"Order execution failed: {classified_error}")
+            raise Exception(classified_error)
         
         logger.info(f"Order executed successfully: txid={response.txid}")
         return response
         
     except Exception as e:
-        logger.error(f"Order execution failed: {e}")
-        raise
+        # Classify error if not already classified
+        error_str = str(e)
+        if ":" not in error_str or error_str.split(":")[0] not in [
+            "insufficient_funds", "price_moved", "below_costmin", 
+            "rate_limit", "exchange_error", "network_error", "unknown_error"
+        ]:
+            error_type = classify_kraken_error(error_str)
+            error_str = f"{error_type}: {error_str}"
+        
+        logger.error(f"Order execution failed: {error_str}")
+        raise Exception(error_str)
 
 
 def calculate_slippage(

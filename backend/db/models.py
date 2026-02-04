@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from typing import Optional, Dict, Any
-from sqlalchemy import Column, String, Numeric, DateTime, ForeignKey, CheckConstraint, Index
+from sqlalchemy import Column, String, Numeric, DateTime, ForeignKey, CheckConstraint, Index, Boolean
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship, declarative_base
 import uuid
@@ -76,12 +76,21 @@ class Order(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
     executed_at = Column(DateTime(timezone=True), nullable=True)
     
+    # TICKET-603: Add is_live and execution_mode fields
+    is_live = Column(Boolean(), nullable=False, default=True)
+    execution_mode = Column(String(20), nullable=False, default="live")
+    
+    # TICKET-605: Add error tracking fields
+    error_type = Column(String(50), nullable=True)
+    error_message = Column(String(500), nullable=True)
+    
     # Relationships
     signal = relationship("Signal", back_populates="orders")
     
     __table_args__ = (
         CheckConstraint("side IN ('buy', 'sell')", name="orders_side_check"),
         CheckConstraint("status IN ('pending', 'executed', 'cancelled', 'failed')", name="orders_status_check"),
+        CheckConstraint("execution_mode IN ('shadow', 'live')", name="orders_execution_mode_check"),
         Index("idx_orders_signal_id", "signal_id"),
         Index("idx_orders_executed_at", "executed_at"),
     )

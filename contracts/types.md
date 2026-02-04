@@ -83,3 +83,210 @@ Represents the result of an executed order.
 - Fill objects are immutable once created.
 - Partial fills may result in multiple Fill objects for a single order_id.
 - All monetary values (executed_price, fees, slippage) are in the quote currency.
+
+---
+
+## StrategyConfig
+
+**Purpose:**  
+Represents the configuration and state of a registered trading strategy.
+
+**Produced by:** Backend API  
+**Consumed by:** Frontend, Strategy Modules
+
+**Fields (v1):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `strategy_id` | `string` | Unique identifier for the strategy. Must match a registered strategy in the `strategies` table. |
+| `name` | `string` | Human-readable name for the strategy (e.g., "Momentum BTC v1"). |
+| `symbol` | `string` | Trading pair symbol that this strategy operates on (e.g., "BTC/USD", "ETH/USD"). Must match Kraken symbol format. |
+| `interval` | `enum: "4h" \| "1d"` | Timeframe for the strategy's analysis. "4h" indicates 4-hour bars, "1d" indicates daily bars. |
+| `max_risk_pct` | `number` | Maximum percentage of total account equity that this strategy is allowed to risk per trade. Must be a positive number. |
+| `enabled` | `boolean` | Whether the strategy is currently active and generating signals. `true` means the strategy is enabled and may emit TradeIntents. `false` means the strategy is disabled. |
+| `parameters` | `object` | Opaque key/value map for strategy-specific configuration. No schema enforcement; strategies are free to include any JSON-serializable data. May include indicator settings, thresholds, or other strategy-internal parameters. |
+
+**Notes:**
+- StrategyConfig represents the complete configuration state of a strategy as stored in the `strategies` table.
+- The `parameters` field allows strategies to define custom configuration without requiring schema changes.
+- The `enabled` field maps to the strategy's lifecycle status (active/inactive/paused).
+
+---
+
+## OrderItem
+
+**Purpose:**  
+Represents an order record with current status for dashboard display.
+
+**Produced by:** Backend API  
+**Consumed by:** Frontend
+
+**Fields (v1):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `string` (uuid) | Unique order identifier. |
+| `symbol` | `string` | Trading pair symbol (e.g., "BTC/USD"). |
+| `side` | `enum: "buy" \| "sell"` | Order side. |
+| `quantity` | `number` | Quantity of the base asset. |
+| `price` | `number` | Order price (limit price or executed price). |
+| `status` | `enum: "pending" \| "filled" \| "cancelled"` | Current status of the order. |
+| `strategy_id` | `string \| null` (uuid) | ID of the strategy that generated this order, if any. |
+| `executed_at` | `string \| null` (ISO8601) | UTC timestamp when the order was executed (null if pending/cancelled). |
+
+**TypeScript Interface:**
+
+```typescript
+interface OrderItem {
+  id: string;
+  symbol: string;
+  side: 'buy' | 'sell';
+  quantity: number;
+  price: number;
+  status: 'pending' | 'filled' | 'cancelled';
+  strategy_id: string | null;
+  executed_at: string | null;
+}
+```
+
+---
+
+## HealthDetailed
+
+**Purpose:**  
+Represents detailed health status with individual component health metrics.
+
+**Produced by:** Backend API  
+**Consumed by:** Frontend
+
+**Fields (v1):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | `enum: "healthy" \| "degraded" \| "unhealthy"` | Overall system health status. |
+| `components` | `object` | Health status of individual components. |
+| `components.redis` | `{ status: string, latency_ms: number }` | Redis connection status and latency. |
+| `components.database` | `{ status: string, latency_ms: number }` | Database connection status and latency. |
+| `components.ingestor` | `{ status: string, symbols_count: number }` | Ingestor service status and active symbol count. |
+| `components.websocket` | `{ status: string, last_message: string }` | WebSocket connection status and last message timestamp. |
+| `uptime_seconds` | `number` | System uptime in seconds. |
+
+**TypeScript Interface:**
+
+```typescript
+interface ComponentHealth {
+  status: string;
+  latency_ms: number;
+}
+
+interface IngestorHealth {
+  status: string;
+  symbols_count: number;
+}
+
+interface WebSocketHealth {
+  status: string;
+  last_message: string;
+}
+
+interface HealthDetailed {
+  status: 'healthy' | 'degraded' | 'unhealthy';
+  components: {
+    redis: ComponentHealth;
+    database: ComponentHealth;
+    ingestor: IngestorHealth;
+    websocket: WebSocketHealth;
+  };
+  uptime_seconds: number;
+}
+```
+
+---
+
+## ActivityItem
+
+**Purpose:**  
+Represents a single activity/event in the system log.
+
+**Produced by:** Backend API  
+**Consumed by:** Frontend
+
+**Fields (v1):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `timestamp` | `string` (ISO8601) | UTC timestamp when the activity occurred. |
+| `type` | `enum: "signal" \| "order" \| "error" \| "system"` | Type of activity. |
+| `message` | `string` | Human-readable description of the activity. |
+| `details` | `object \| null` | Optional additional details about the activity. |
+
+**TypeScript Interface:**
+
+```typescript
+interface ActivityItem {
+  timestamp: string;
+  type: 'signal' | 'order' | 'error' | 'system';
+  message: string;
+  details: Record<string, unknown> | null;
+}
+```
+
+---
+
+## StrategyMetrics
+
+**Purpose:**  
+Represents performance metrics for a single strategy.
+
+**Produced by:** Backend API  
+**Consumed by:** Frontend
+
+**Fields (v1):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `accuracy_pct` | `number` | Win rate as a percentage. |
+| `total_pnl` | `number` | Total profit/loss for this strategy. |
+| `win_count` | `integer` | Number of winning trades. |
+| `loss_count` | `integer` | Number of losing trades. |
+| `open_count` | `integer` | Number of currently open positions. |
+
+**TypeScript Interface:**
+
+```typescript
+interface StrategyMetrics {
+  accuracy_pct: number;
+  total_pnl: number;
+  win_count: number;
+  loss_count: number;
+  open_count: number;
+}
+```
+
+---
+
+## MetricsResponse
+
+**Purpose:**  
+Represents aggregated performance metrics for all strategies.
+
+**Produced by:** Backend API  
+**Consumed by:** Frontend
+
+**Fields (v1):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `strategies` | `object` | Metrics keyed by strategy_id. Each value is a `StrategyMetrics` object. |
+| `total_pnl` | `number` | Total P&L across all strategies. |
+| `overall_accuracy_pct` | `number` | Overall accuracy percentage across all strategies. |
+
+**TypeScript Interface:**
+
+```typescript
+interface MetricsResponse {
+  strategies: Record<string, StrategyMetrics>;
+  total_pnl: number;
+  overall_accuracy_pct: number;
+}
+```

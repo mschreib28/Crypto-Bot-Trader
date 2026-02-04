@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS signals (
 );
 
 -- Orders table (corresponds to Fill)
+-- TICKET-603: Added is_live and execution_mode fields
 CREATE TABLE IF NOT EXISTS orders (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     signal_id UUID REFERENCES signals(id) ON DELETE SET NULL,
@@ -42,8 +43,13 @@ CREATE TABLE IF NOT EXISTS orders (
     status VARCHAR(50) NOT NULL DEFAULT 'pending',
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     executed_at TIMESTAMP WITH TIME ZONE,
+    is_live BOOLEAN NOT NULL DEFAULT TRUE,
+    execution_mode VARCHAR(20) NOT NULL DEFAULT 'live',
+    error_type VARCHAR(50),
+    error_message VARCHAR(500),
     CONSTRAINT orders_side_check CHECK (side IN ('buy', 'sell')),
-    CONSTRAINT orders_status_check CHECK (status IN ('pending', 'executed', 'cancelled', 'failed'))
+    CONSTRAINT orders_status_check CHECK (status IN ('pending', 'executed', 'cancelled', 'failed')),
+    CONSTRAINT orders_execution_mode_check CHECK (execution_mode IN ('shadow', 'live'))
 );
 
 -- Equity curve table (portfolio snapshots)
@@ -57,9 +63,25 @@ CREATE TABLE IF NOT EXISTS equity_curve (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Positions table (tracks open positions with strategy ownership)
+CREATE TABLE IF NOT EXISTS positions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    symbol VARCHAR(50) NOT NULL UNIQUE,
+    side VARCHAR(10) NOT NULL,
+    quantity NUMERIC(20, 8) NOT NULL,
+    entry_price NUMERIC(20, 8) NOT NULL,
+    entry_time TIMESTAMP WITH TIME ZONE NOT NULL,
+    unrealized_pnl NUMERIC(20, 8) NOT NULL DEFAULT 0,
+    opened_by_strategy_id VARCHAR(50),  -- NULL for legacy/manual trades
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT positions_side_check CHECK (side IN ('long', 'short'))
+);
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_signals_strategy_id ON signals(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals(created_at);
 CREATE INDEX IF NOT EXISTS idx_orders_signal_id ON orders(signal_id);
 CREATE INDEX IF NOT EXISTS idx_orders_executed_at ON orders(executed_at);
 CREATE INDEX IF NOT EXISTS idx_equity_curve_timestamp ON equity_curve(timestamp);
+CREATE INDEX IF NOT EXISTS idx_positions_opened_by_strategy_id ON positions(opened_by_strategy_id);

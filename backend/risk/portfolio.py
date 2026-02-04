@@ -40,6 +40,8 @@ def get_current_equity(session: Optional[Session] = None) -> Decimal:
 
 def _get_current_equity_impl(session: Session) -> Decimal:
     """Internal implementation of get_current_equity."""
+    from backend.config import ACCOUNT_EQUITY
+    
     latest_equity = (
         session.query(EquityCurve.total_equity)
         .order_by(desc(EquityCurve.timestamp))
@@ -47,8 +49,9 @@ def _get_current_equity_impl(session: Session) -> Decimal:
     )
     
     if latest_equity is None:
-        logger.warning("No equity curve data found, defaulting to 0")
-        return Decimal('0')
+        # Fall back to configured account equity
+        logger.info(f"No equity curve data found, using ACCOUNT_EQUITY=${ACCOUNT_EQUITY}")
+        return Decimal(str(ACCOUNT_EQUITY))
     
     return Decimal(str(latest_equity[0]))
 
@@ -208,3 +211,68 @@ def _get_pending_intents_exposure_impl(
     exposure = (total_equity * risk_pct_sum) / Decimal('100')
     
     return exposure
+
+
+def get_daily_pnl(session: Optional[Session] = None) -> float:
+    """
+    Calculate today's profit/loss from equity curve.
+    
+    Compares the latest equity snapshot to the first snapshot of the day.
+    
+    Args:
+        session: Optional database session. If None, creates a new session.
+        
+    Returns:
+        Today's PnL in dollars (negative means loss).
+        Returns 0.0 if insufficient data.
+    """
+    from datetime import datetime, timezone, timedelta
+    
+    if session is None:
+        session = get_session()
+        try:
+            return _get_daily_pnl_impl(session)
+        finally:
+            session.close()
+    else:
+        return _get_daily_pnl_impl(session)
+
+
+def _get_daily_pnl_impl(session: Session) -> float:
+    """Internal implementation of get_daily_pnl."""
+    from datetime import datetime, timezone, timedelta
+    
+    # Get start of today (UTC)
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # Get first equity snapshot of today
+    first_today = (
+        session.query(EquityCurve.total_equity)
+        .filter(EquityCurve.timestamp >= today_start)
+        .order_by(EquityCurve.timestamp)
+        .first()
+    )
+    
+    # Get latest equity snapshot
+    latest = (
+        session.query(EquityCurve.total_equity)
+        .order_by(desc(EquityCurve.timestamp))
+        .first()
+    )
+    
+    if first_today is None or latest is None:
+        logger.debug("Insufficient equity data for daily PnL calculation")
+        return 0.0
+    
+    start_equity = Decimal(str(first_today[0]))
+    current_equity = Decimal(str(latest[0]))
+    
+    daily_pnl = current_equity - start_equity
+    
+    logger.debug(
+        f"Daily PnL calculation: start=${start_equity}, "
+        f"current=${current_equity}, pnl=${daily_pnl}"
+    )
+    
+    return float(daily_pnl)

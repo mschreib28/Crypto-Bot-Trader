@@ -167,7 +167,9 @@ class Normalizer:
         while self.running:
             try:
                 # Consume messages with blocking (wait up to 1 second)
-                messages = consume_stream(
+                # Use asyncio.to_thread to avoid blocking the event loop
+                messages = await asyncio.to_thread(
+                    consume_stream,
                     stream_key=stream_key,
                     consumer_group=CONSUMER_GROUP,
                     consumer_name=CONSUMER_NAME,

@@ -29,6 +29,23 @@ paths:
                     type: string
                     example: "healthy"
 
+  /api/v1/status:
+    get:
+      summary: System status overview
+      operationId: getStatus
+      tags:
+        - System
+      description: |
+        Returns comprehensive system status including halt state, portfolio exposure,
+        active strategies count, and health of dependent services (Redis, DB, Ingestor).
+      responses:
+        "200":
+          description: System status returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SystemStatus"
+
   /api/v1/panic:
     post:
       summary: Emergency panic endpoint
@@ -66,10 +83,242 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/StrategyList"
+                type: array
+                items:
+                  $ref: "#/components/schemas/StrategyConfig"
+
+  /api/v1/signals:
+    get:
+      summary: List recent signals
+      operationId: listSignals
+      tags:
+        - Signals
+      parameters:
+        - name: limit
+          in: query
+          description: Maximum number of signals to return (default 50, max 100)
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: Signal list returned
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SignalResponse"
+
+  /api/v1/orders:
+    get:
+      summary: List recent orders
+      operationId: listOrders
+      tags:
+        - Orders
+      parameters:
+        - name: limit
+          in: query
+          description: Maximum number of orders to return (default 50, max 100)
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: Order list returned
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - orders
+                properties:
+                  orders:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OrderItem"
+
+  /api/v1/health/detailed:
+    get:
+      summary: Detailed health check with component status
+      operationId: getHealthDetailed
+      tags:
+        - System
+      description: |
+        Returns detailed health status including individual component health,
+        latency metrics, and system uptime.
+      responses:
+        "200":
+          description: Detailed health status returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthDetailed"
+
+  /api/v1/activity:
+    get:
+      summary: List recent system activity
+      operationId: listActivity
+      tags:
+        - System
+      description: |
+        Returns a chronological list of recent system events including
+        signals, orders, errors, and system events.
+      parameters:
+        - name: limit
+          in: query
+          description: Maximum number of activities to return (default 20, max 100)
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        "200":
+          description: Activity list returned
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - activities
+                properties:
+                  activities:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ActivityItem"
+
+  /api/v1/metrics:
+    get:
+      summary: Get strategy performance metrics
+      operationId: getMetrics
+      tags:
+        - Strategies
+      description: |
+        Returns aggregated performance metrics for all strategies
+        including accuracy, P&L, and win/loss counts.
+      responses:
+        "200":
+          description: Metrics returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetricsResponse"
+
+  /api/v1/ws:
+    get:
+      summary: WebSocket endpoint for real-time events
+      operationId: websocketEvents
+      tags:
+        - WebSocket
+      description: |
+        WebSocket endpoint for real-time event streaming.
+        Connect using ws://localhost:8000/api/v1/ws
+
+        **Note:** This is a WebSocket endpoint, not a REST endpoint.
+        The GET method is documented here for discoverability only.
+
+        ## Message Format
+
+        All messages follow this structure:
+        ```json
+        {
+          "type": "<event_type>",
+          "data": {...},
+          "timestamp": "2024-01-01T00:00:00Z"
+        }
+        ```
+
+        ## Event Types
+
+        - **signal_created**: A new trading signal was generated
+        - **order_executed**: An order was executed on the exchange
+        - **system_status**: System state changed (e.g., halt/resume)
+
+        ## Example Messages
+
+        Signal created:
+        ```json
+        {"type": "signal_created", "data": {"strategy_id": "momentum_btc_v1", "symbol": "BTC/USD", "side": "buy"}, "timestamp": "2024-01-01T00:00:00Z"}
+        ```
+
+        Order executed:
+        ```json
+        {"type": "order_executed", "data": {"order_id": "order_xyz789", "symbol": "BTC/USD", "executed_price": 50000.25}, "timestamp": "2024-01-01T00:00:00Z"}
+        ```
+
+        System status:
+        ```json
+        {"type": "system_status", "data": {"halted": true}, "timestamp": "2024-01-01T00:00:00Z"}
+        ```
+      x-websocket: true
+      responses:
+        "101":
+          description: Switching Protocols - WebSocket connection established
 
 components:
   schemas:
+    SystemStatus:
+      type: object
+      required:
+        - halted
+        - portfolio_exposure
+        - active_strategies
+        - redis_connected
+        - db_connected
+        - ingestor_healthy
+        - last_updated
+      description: |
+        Comprehensive system status including halt state, portfolio exposure,
+        active strategy count, and health of dependent services.
+      properties:
+        halted:
+          type: boolean
+          description: |
+            Whether the system is in halt mode. When true, all trade intents are rejected.
+            Read from Redis key system:halt.
+          example: false
+        portfolio_exposure:
+          type: number
+          format: float
+          description: |
+            Current total portfolio exposure as a percentage of equity.
+            Read from Redis key portfolio:exposure:total.
+          example: 12.5
+        active_strategies:
+          type: integer
+          description: |
+            Count of strategies with status 'active' in the database.
+          example: 2
+        redis_connected:
+          type: boolean
+          description: |
+            Whether Redis is reachable (ping succeeds).
+          example: true
+        db_connected:
+          type: boolean
+          description: |
+            Whether the database connection is healthy.
+          example: true
+        ingestor_healthy:
+          type: boolean
+          description: |
+            Whether the data ingestor is healthy (based on heartbeat or health file).
+          example: true
+        last_updated:
+          type: string
+          format: date-time
+          description: |
+            UTC timestamp when this status was generated.
+          example: "2024-01-01T00:00:00Z"
+
     TradeIntent:
       type: object
       required:
@@ -274,40 +523,435 @@ components:
             Format: YYYY-MM-DDTHH:mm:ssZ (ISO8601).
           example: "2024-01-01T12:00:00Z"
 
-    StrategyList:
+    StrategyConfig:
       type: object
+      required:
+        - strategy_id
+        - name
+        - symbol
+        - interval
+        - max_risk_pct
+        - enabled
+        - parameters
+      description: |
+        Represents the configuration and state of a registered trading strategy.
+        StrategyConfig represents the complete configuration state of a strategy
+        as stored in the strategies table.
       properties:
-        strategies:
-          type: array
-          items:
-            $ref: "#/components/schemas/StrategyItem"
+        strategy_id:
+          type: string
+          description: |
+            Unique identifier for the strategy.
+            Must match a registered strategy in the strategies table.
+          example: "momentum_btc_v1"
+        name:
+          type: string
+          description: |
+            Human-readable name for the strategy (e.g., "Momentum BTC v1").
+          example: "Momentum BTC v1"
+        symbol:
+          type: string
+          description: |
+            Trading pair symbol that this strategy operates on (e.g., "BTC/USD", "ETH/USD").
+            Must match Kraken symbol format.
+          example: "BTC/USD"
+        interval:
+          type: string
+          enum:
+            - "4h"
+            - "1d"
+          description: |
+            Timeframe for the strategy's analysis.
+            "4h" indicates 4-hour bars, "1d" indicates daily bars.
+          example: "4h"
+        max_risk_pct:
+          type: number
+          format: float
+          minimum: 0
+          exclusiveMinimum: true
+          description: |
+            Maximum percentage of total account equity that this strategy is allowed to risk per trade.
+            Must be a positive number.
+          example: 5.0
+        enabled:
+          type: boolean
+          description: |
+            Whether the strategy is currently active and generating signals.
+            true means the strategy is enabled and may emit TradeIntents.
+            false means the strategy is disabled.
+          example: true
+        parameters:
+          type: object
+          additionalProperties: true
+          description: |
+            Opaque key/value map for strategy-specific configuration.
+            No schema enforcement; strategies are free to include any JSON-serializable data.
+            May include indicator settings, thresholds, or other strategy-internal parameters.
+          example:
+            lookback_period: 20
+            rsi_threshold: 70
+            signal_strength_min: 0.8
 
-    StrategyItem:
+    SignalResponse:
       type: object
       required:
         - id
-        - name
+        - strategy_id
+        - symbol
+        - side
+        - intent_type
         - status
         - created_at
+      description: |
+        Represents a signal record from the signals table.
       properties:
         id:
           type: string
-          description: Unique strategy identifier
-          example: "strategy_001"
-        name:
+          format: uuid
+          description: Unique signal identifier.
+          example: "123e4567-e89b-12d3-a456-426614174000"
+        strategy_id:
           type: string
-          description: Human-readable strategy name
-          example: "Momentum BTC v1"
+          format: uuid
+          description: ID of the strategy that generated this signal.
+          example: "987fcdeb-51a2-3b4c-d567-890123456789"
+        symbol:
+          type: string
+          description: Trading pair symbol (e.g., "BTC/USD").
+          example: "BTC/USD"
+        side:
+          type: string
+          enum:
+            - buy
+            - sell
+          description: Direction of the signal.
+          example: "buy"
+        intent_type:
+          type: string
+          enum:
+            - enter
+            - exit
+            - reduce
+          description: Type of trade intent.
+          example: "enter"
         status:
           type: string
           enum:
-            - active
-            - paused
-            - stopped
-          description: Current lifecycle status of the strategy
-          example: "active"
+            - pending
+            - approved
+            - rejected
+            - executed
+          description: Current status of the signal.
+          example: "approved"
         created_at:
           type: string
           format: date-time
-          description: UTC timestamp when the strategy was registered
-          example: "2024-01-01T00:00:00Z"
+          description: UTC timestamp when the signal was created.
+          example: "2024-01-01T12:00:00Z"
+
+    OrderResponse:
+      type: object
+      required:
+        - id
+        - symbol
+        - side
+        - executed_price
+        - quantity
+        - fees
+        - exchange_order_id
+        - executed_at
+      description: |
+        Represents an executed order record from the orders table.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique order identifier.
+          example: "456e7890-a12b-34c5-d678-901234567890"
+        symbol:
+          type: string
+          description: Trading pair symbol (e.g., "BTC/USD").
+          example: "BTC/USD"
+        side:
+          type: string
+          enum:
+            - buy
+            - sell
+          description: Execution side.
+          example: "buy"
+        executed_price:
+          type: number
+          format: float
+          description: Price at which the order was executed.
+          example: 50000.25
+        quantity:
+          type: number
+          format: float
+          description: Quantity of the base asset executed.
+          example: 0.001
+        fees:
+          type: number
+          format: float
+          description: Total fees paid for this execution.
+          example: 0.5
+        exchange_order_id:
+          type: string
+          description: Order ID from the exchange (Kraken).
+          example: "O12345678-ABCD-EFGH-IJKL-MNOPQRSTUVWX"
+        executed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: UTC timestamp when the order was executed.
+          example: "2024-01-01T12:00:00Z"
+
+    OrderItem:
+      type: object
+      required:
+        - id
+        - symbol
+        - side
+        - quantity
+        - price
+        - status
+      description: |
+        Represents an order record with current status.
+        Used for listing orders in the dashboard.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique order identifier.
+          example: "456e7890-a12b-34c5-d678-901234567890"
+        symbol:
+          type: string
+          description: Trading pair symbol (e.g., "BTC/USD").
+          example: "BTC/USD"
+        side:
+          type: string
+          enum:
+            - buy
+            - sell
+          description: Order side.
+          example: "buy"
+        quantity:
+          type: number
+          format: float
+          description: Quantity of the base asset.
+          example: 0.001
+        price:
+          type: number
+          format: float
+          description: Order price (limit price or executed price).
+          example: 50000.25
+        status:
+          type: string
+          enum:
+            - pending
+            - filled
+            - cancelled
+          description: Current status of the order.
+          example: "filled"
+        strategy_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: ID of the strategy that generated this order, if any.
+          example: "987fcdeb-51a2-3b4c-d567-890123456789"
+        executed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: UTC timestamp when the order was executed (null if pending/cancelled).
+          example: "2024-01-01T12:00:00Z"
+
+    HealthDetailed:
+      type: object
+      required:
+        - status
+        - components
+        - uptime_seconds
+      description: |
+        Detailed health status with individual component health metrics.
+      properties:
+        status:
+          type: string
+          enum:
+            - healthy
+            - degraded
+            - unhealthy
+          description: Overall system health status.
+          example: "healthy"
+        components:
+          type: object
+          required:
+            - redis
+            - database
+            - ingestor
+            - websocket
+          properties:
+            redis:
+              type: object
+              required:
+                - status
+                - latency_ms
+              properties:
+                status:
+                  type: string
+                  description: Redis connection status.
+                  example: "connected"
+                latency_ms:
+                  type: number
+                  format: float
+                  description: Redis ping latency in milliseconds.
+                  example: 1.5
+            database:
+              type: object
+              required:
+                - status
+                - latency_ms
+              properties:
+                status:
+                  type: string
+                  description: Database connection status.
+                  example: "connected"
+                latency_ms:
+                  type: number
+                  format: float
+                  description: Database query latency in milliseconds.
+                  example: 2.3
+            ingestor:
+              type: object
+              required:
+                - status
+                - symbols_count
+              properties:
+                status:
+                  type: string
+                  description: Ingestor service status.
+                  example: "running"
+                symbols_count:
+                  type: integer
+                  description: Number of symbols being ingested.
+                  example: 5
+            websocket:
+              type: object
+              required:
+                - status
+                - last_message
+              properties:
+                status:
+                  type: string
+                  description: WebSocket connection status.
+                  example: "connected"
+                last_message:
+                  type: string
+                  description: Timestamp or description of last message received.
+                  example: "2024-01-01T12:00:00Z"
+        uptime_seconds:
+          type: number
+          format: float
+          description: System uptime in seconds.
+          example: 86400.5
+
+    ActivityItem:
+      type: object
+      required:
+        - timestamp
+        - type
+        - message
+      description: |
+        Represents a single activity/event in the system log.
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: UTC timestamp when the activity occurred.
+          example: "2024-01-01T12:00:00Z"
+        type:
+          type: string
+          enum:
+            - signal
+            - order
+            - error
+            - system
+          description: Type of activity.
+          example: "signal"
+        message:
+          type: string
+          description: Human-readable description of the activity.
+          example: "Signal generated for BTC/USD: buy"
+        details:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Optional additional details about the activity.
+          example:
+            strategy_id: "momentum_btc_v1"
+            symbol: "BTC/USD"
+
+    StrategyMetrics:
+      type: object
+      required:
+        - accuracy_pct
+        - total_pnl
+        - win_count
+        - loss_count
+        - open_count
+      description: |
+        Performance metrics for a single strategy.
+      properties:
+        accuracy_pct:
+          type: number
+          format: float
+          description: Win rate as a percentage.
+          example: 65.5
+        total_pnl:
+          type: number
+          format: float
+          description: Total profit/loss for this strategy.
+          example: 1250.75
+        win_count:
+          type: integer
+          description: Number of winning trades.
+          example: 15
+        loss_count:
+          type: integer
+          description: Number of losing trades.
+          example: 8
+        open_count:
+          type: integer
+          description: Number of currently open positions.
+          example: 2
+
+    MetricsResponse:
+      type: object
+      required:
+        - strategies
+        - total_pnl
+        - overall_accuracy_pct
+      description: |
+        Aggregated performance metrics for all strategies.
+      properties:
+        strategies:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/StrategyMetrics"
+          description: Metrics keyed by strategy_id.
+          example:
+            momentum_btc_v1:
+              accuracy_pct: 65.5
+              total_pnl: 1250.75
+              win_count: 15
+              loss_count: 8
+              open_count: 2
+        total_pnl:
+          type: number
+          format: float
+          description: Total P&L across all strategies.
+          example: 2500.50
+        overall_accuracy_pct:
+          type: number
+          format: float
+          description: Overall accuracy percentage across all strategies.
+          example: 62.3

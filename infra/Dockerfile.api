@@ -16,6 +16,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy backend code
 COPY backend/ /app/backend/
 
+# Copy research/strategies code
+COPY research/ /app/research/
+
+# Copy contracts for type references
+COPY contracts/ /app/contracts/
+
 # Set Python path
 ENV PYTHONPATH=/app
 

@@ -30,21 +30,60 @@ class BarBuilder:
     def _parse_interval(self, interval: str) -> int:
         """Parse interval string to seconds."""
         interval = interval.lower()
-        if interval == "4h":
+        if interval == "1m":
+            return 60  # 1 minute in seconds
+        elif interval == "5m":
+            return 5 * 60  # 5 minutes in seconds
+        elif interval == "15m":
+            return 15 * 60  # 15 minutes in seconds
+        elif interval == "30m":
+            return 30 * 60  # 30 minutes in seconds
+        elif interval == "1h":
+            return 3600  # 1 hour in seconds
+        elif interval == "4h":
             return 4 * 3600  # 4 hours in seconds
         elif interval == "1d":
             return 24 * 3600  # 1 day in seconds
         else:
-            raise ValueError(f"Unsupported interval: {interval}. Supported: '4h', '1d'")
+            raise ValueError(
+                f"Unsupported interval: {interval}. "
+                f"Supported: '1m', '5m', '15m', '30m', '1h', '4h', '1d'"
+            )
     
     def _align_timestamp(self, timestamp: datetime) -> datetime:
         """
         Align timestamp to interval boundary.
         
+        For 1M: aligns to minute boundary
+        For 5M: aligns to 5-minute boundaries (00, 05, 10, ...)
+        For 15M: aligns to 15-minute boundaries (00, 15, 30, 45)
+        For 30M: aligns to 30-minute boundaries (00, 30)
+        For 1H: aligns to hour boundary
         For 4H: aligns to 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
         For 1D: aligns to 00:00 UTC
         """
-        if self.interval == "4h":
+        if self.interval == "1m":
+            # Align to minute boundary
+            return timestamp.replace(second=0, microsecond=0)
+        elif self.interval == "5m":
+            # Align to 5-minute boundaries
+            minute = timestamp.minute
+            aligned_minute = (minute // 5) * 5
+            return timestamp.replace(minute=aligned_minute, second=0, microsecond=0)
+        elif self.interval == "15m":
+            # Align to 15-minute boundaries
+            minute = timestamp.minute
+            aligned_minute = (minute // 15) * 15
+            return timestamp.replace(minute=aligned_minute, second=0, microsecond=0)
+        elif self.interval == "30m":
+            # Align to 30-minute boundaries
+            minute = timestamp.minute
+            aligned_minute = (minute // 30) * 30
+            return timestamp.replace(minute=aligned_minute, second=0, microsecond=0)
+        elif self.interval == "1h":
+            # Align to hour boundary
+            return timestamp.replace(minute=0, second=0, microsecond=0)
+        elif self.interval == "4h":
             # Align to 4-hour boundaries: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00
             hour = timestamp.hour
             aligned_hour = (hour // 4) * 4
