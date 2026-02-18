@@ -10,16 +10,25 @@ signals are automatically sent to the risk evaluator and executed.
 import asyncio
 import json
 import logging
-import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.config import ACCOUNT_EQUITY, RISK_PCT_PER_TRADE, CONFIDENCE_THRESHOLD_PCT
 from backend.db import get_session
 from backend.db.models import Strategy
-from backend.ingestor.config import get_symbols
-from backend.ingestor.symbols import normalize_symbol, is_stablecoin_pair, is_in_live_universe
+from backend.ingestor.config import (
+    get_symbols,
+    get_max_spread_bps,
+    get_min_24h_volume_usd,
+    get_enforce_whitelist_in_shadow,
+)
+from backend.ingestor.symbols import (
+    normalize_symbol,
+    get_symbol_spread,
+    get_symbol_volume,
+    is_in_live_universe,
+)
 from backend.redis import get_redis_client
 from backend.redis.keys import (
     INGESTOR_ACTIVE_SYMBOLS_KEY,
@@ -29,16 +38,12 @@ from backend.redis.keys import (
     SCREENER_RESULTS_TTL,
     SCREENER_SIGNALS_HISTORY_KEY,
     SCREENER_STRATEGY_RESULTS_KEY,
+    SHADOW_LIVE_MODE_KEY,
     SIGNAL_COOLDOWN_SECONDS,
     SIGNAL_EXECUTED_KEY,
-    SIGNAL_EXECUTED_KEY_LEGACY,
-    SIGNAL_LAST_LOGGED_KEY,
-    SIGNAL_LOG_COOLDOWN_SECONDS,
     STRATEGY_LAST_EVAL_KEY,
     STRATEGY_LAST_EVAL_TTL,
     TRADING_ENABLED_KEY,
-    EXECUTION_ALLOWED_LOGGED_KEY,
-    EXECUTION_ALLOWED_TTL,
 )
 from backend.api.routes.events import log_activity
 from backend.risk.evaluator import evaluate_intent, TradeIntent
@@ -82,53 +87,13 @@ def get_trading_enabled() -> bool:
 def _load_enabled_strategies() -> List[Strategy]:
     """
     Load all ENABLED (active) strategies from the database.
-    Prioritizes better-performing strategies.
     
     Returns:
-        List of Strategy objects with status='active', sorted by performance
+        List of Strategy objects with status='active'
     """
     session = get_session()
     try:
-        # Check for auto-disabled strategies before fetching active ones
-        try:
-            from backend.risk.metrics import get_strategy_metrics
-            metrics = get_strategy_metrics()
-            all_strategies = session.query(Strategy).all()
-            for strategy in all_strategies:
-                if strategy.status == "active":
-                    # Check drawdown periodically (every scan)
-                    metrics.check_strategy_drawdown(str(strategy.id))
-        except Exception as e:
-            logger.debug(f"Failed to check strategy drawdowns: {e}")
-        
         strategies = session.query(Strategy).filter(Strategy.status == "active").all()
-        
-        # Prioritize by performance if enabled
-        if os.getenv("PERFORMANCE_PRIORITIZATION_ENABLED", "true").lower() == "true":
-            try:
-                from backend.performance.monitor import get_performance_monitor
-                perf_monitor = get_performance_monitor()
-                
-                # Calculate performance scores
-                strategy_scores = []
-                for strategy in strategies:
-                    perf = perf_monitor.get_performance(str(strategy.id))
-                    if perf:
-                        # Score = (win_rate * 0.7) + (normalized_pnl * 0.3)
-                        normalized_pnl = min(1.0, perf.total_pnl / 100.0)  # Cap at $100
-                        score = (perf.win_rate / 100.0 * 0.7) + (normalized_pnl * 0.3)
-                    else:
-                        score = 0.0  # New strategies evaluated last
-                    strategy_scores.append((score, strategy))
-                
-                # Sort by score (descending)
-                strategy_scores.sort(key=lambda x: x[0], reverse=True)
-                strategies = [s for _, s in strategy_scores]
-                
-                logger.debug(f"Strategies prioritized by performance: {[s.name for s in strategies[:3]]}")
-            except Exception as e:
-                logger.debug(f"Performance prioritization failed: {e}, using default order")
-        
         return strategies
     except Exception as e:
         logger.error(f"Failed to load strategies: {e}")
@@ -227,14 +192,7 @@ class _StrategyEvaluateAdapter:
                 signal_type="NONE",
                 confidence=0.0,
                 strategy_id=self.strategy_id,
-                indicators={
-                    "current_price": current_price, 
-                    "note": "no_signal_conditions_met",
-                    # Include frontend indicators as None for consistency
-                    "bb_position": None,
-                    "adx": None,
-                    "atr_ratio": None,
-                },
+                indicators={"current_price": current_price, "note": "no_signal_conditions_met"},
                 timestamp=timestamp,
             )
         
@@ -361,13 +319,8 @@ class ScreenerService:
                 symbols = json.loads(symbols_json)
                 # Normalize symbols to standard format (safety net)
                 symbols = [normalize_symbol(s) for s in symbols]
-                # Filter out stablecoins (USDC/USD, USDT/USD, etc.) - these shouldn't be traded
-                filtered_symbols = [s for s in symbols if not is_stablecoin_pair(s)]
-                if len(filtered_symbols) < len(symbols):
-                    removed = [s for s in symbols if is_stablecoin_pair(s)]
-                    logger.info(f"Filtered out {len(removed)} stablecoin(s) from symbol list: {removed}")
-                logger.info(f"Using {len(filtered_symbols)} symbols from ingestor (after stablecoin filter)")
-                return filtered_symbols
+                logger.info(f"Using {len(symbols)} symbols from ingestor")
+                return symbols
         except Exception as e:
             logger.warning(f"Failed to get symbols from Redis: {e}")
         
@@ -375,13 +328,131 @@ class ScreenerService:
         fallback_symbols = get_symbols()
         # Normalize fallback symbols as well
         fallback_symbols = [normalize_symbol(s) for s in fallback_symbols]
-        # Filter out stablecoins from fallback as well
-        filtered_fallback = [s for s in fallback_symbols if not is_stablecoin_pair(s)]
-        if len(filtered_fallback) < len(fallback_symbols):
-            removed = [s for s in fallback_symbols if is_stablecoin_pair(s)]
-            logger.info(f"Filtered out {len(removed)} stablecoin(s) from fallback symbols: {removed}")
-        logger.info(f"Using {len(filtered_fallback)} symbols from config (fallback, after stablecoin filter)")
-        return filtered_fallback
+        logger.info(f"Using {len(fallback_symbols)} symbols from config (fallback)")
+        return fallback_symbols
+    
+    async def _apply_global_filters(
+        self,
+        symbols: List[str],
+        strategy_id: str,
+    ) -> Tuple[List[str], Dict[str, str]]:
+        """
+        Apply global filters: whitelist → liquidity → spread (fail-fast).
+        
+        Filters symbols before strategy evaluation to ensure only tradeable
+        symbols are evaluated according to Global Crypto Pillars:
+        - Pillar 1: Liquidity (24h volume >= $10M)
+        - Pillar 2: Spread Efficiency (bid-ask spread <= 15 bps)
+        - Pillar 3: Tier 1 Whitelist (only high-liquidity assets in shadow mode)
+        
+        Args:
+            symbols: List of symbols to filter
+            strategy_id: Strategy identifier for logging
+            
+        Returns:
+            Tuple of (filtered_symbols, skip_reasons_dict) where skip_reasons_dict
+            maps symbol -> reason string for filtered symbols
+        """
+        client = get_redis_client()
+        
+        # Check if in shadow mode
+        try:
+            shadow_mode_value = client.get(SHADOW_LIVE_MODE_KEY)
+            shadow_mode = shadow_mode_value == b"shadow" if shadow_mode_value else False
+        except Exception as e:
+            logger.debug(f"Failed to check shadow mode: {e}, defaulting to False")
+            shadow_mode = False
+        
+        # Get filter thresholds
+        max_spread_bps = get_max_spread_bps()
+        min_volume_usd = get_min_24h_volume_usd()
+        enforce_whitelist = get_enforce_whitelist_in_shadow()
+        
+        filtered = []
+        skip_reasons = {}
+        skip_counts = {"whitelist": 0, "liquidity": 0, "spread": 0}
+        
+        for symbol in symbols:
+            skip_reason = None
+            
+            # Filter 1: Whitelist (if enabled in shadow mode)
+            if shadow_mode and enforce_whitelist:
+                if not is_in_live_universe(symbol):
+                    skip_reason = "not in whitelist"
+                    skip_counts["whitelist"] += 1
+                    logger.debug(
+                        f"[FILTER] SKIP: {symbol} [whitelist_filter] - not in live universe"
+                    )
+                    log_activity(
+                        activity_type="signal",
+                        message=f"SKIP: {symbol} [whitelist_filter] - not in live universe",
+                        details={
+                            "symbol": symbol,
+                            "filter": "whitelist",
+                            "strategy": strategy_id,
+                            "reason": skip_reason,
+                        },
+                    )
+            
+            # Filter 2: Liquidity threshold
+            if not skip_reason:
+                volume = get_symbol_volume(symbol)
+                if volume is not None and volume < min_volume_usd:
+                    skip_reason = f"volume ${volume:,.0f} < threshold ${min_volume_usd:,.0f}"
+                    skip_counts["liquidity"] += 1
+                    logger.debug(
+                        f"[FILTER] SKIP: {symbol} [liquidity_filter] - volume ${volume:,.0f} < threshold ${min_volume_usd:,.0f}"
+                    )
+                    log_activity(
+                        activity_type="signal",
+                        message=f"SKIP: {symbol} [liquidity_filter] - volume ${volume:,.0f}",
+                        details={
+                            "symbol": symbol,
+                            "filter": "liquidity",
+                            "volume": volume,
+                            "threshold": min_volume_usd,
+                            "strategy": strategy_id,
+                            "reason": skip_reason,
+                        },
+                    )
+            
+            # Filter 3: Spread threshold
+            if not skip_reason:
+                spread_bps = get_symbol_spread(symbol)
+                if spread_bps is not None and spread_bps > max_spread_bps:
+                    skip_reason = f"spread {spread_bps:.1f} bps > threshold {max_spread_bps:.1f} bps"
+                    skip_counts["spread"] += 1
+                    logger.debug(
+                        f"[FILTER] SKIP: {symbol} [spread_filter] - spread {spread_bps:.1f} bps > threshold {max_spread_bps:.1f} bps"
+                    )
+                    log_activity(
+                        activity_type="signal",
+                        message=f"SKIP: {symbol} [spread_filter] - spread {spread_bps:.1f} bps",
+                        details={
+                            "symbol": symbol,
+                            "filter": "spread",
+                            "spread_bps": spread_bps,
+                            "threshold": max_spread_bps,
+                            "strategy": strategy_id,
+                            "reason": skip_reason,
+                        },
+                    )
+            
+            if skip_reason:
+                skip_reasons[symbol] = skip_reason
+            else:
+                filtered.append(symbol)
+        
+        # Log filter summary
+        total_skipped = len(skip_reasons)
+        if total_skipped > 0:
+            logger.info(
+                f"[FILTER] Strategy {strategy_id}: Filtered {len(symbols)} → {len(filtered)} symbols "
+                f"(skipped: {total_skipped}, whitelist={skip_counts['whitelist']}, "
+                f"liquidity={skip_counts['liquidity']}, spread={skip_counts['spread']})"
+            )
+        
+        return filtered, skip_reasons
     
     async def _get_recent_bars(
         self,
@@ -693,7 +764,7 @@ class ScreenerService:
         total_scanned: int = 0,
         confidence_buy: float = 90.0,
         confidence_sell: float = 90.0,
-    ) -> List[SignalResult]:
+    ) -> None:
         """
         Store strategy-specific results in Redis with TTL.
         
@@ -714,9 +785,6 @@ class ScreenerService:
             total_scanned: Total number of symbols scanned
             confidence_buy: Confidence threshold for BUY signals (default: 90.0)
             confidence_sell: Confidence threshold for SELL signals (default: 90.0)
-            
-        Returns:
-            List of SignalResult for signals restored by threshold changes (for auto-execution)
         """
         client = get_redis_client()
         key = SCREENER_STRATEGY_RESULTS_KEY.format(strategy_id=strategy_id)
@@ -740,126 +808,79 @@ class ScreenerService:
             if existing_data:
                 existing = json.loads(existing_data)
                 for r in existing.get("results", []):
-                    symbol = r.get("symbol")
-                    # Filter out stablecoins from preserved results
-                    if symbol and is_stablecoin_pair(symbol):
-                        logger.debug(f"[STORE] Filtering stablecoin from preserved results: {symbol}")
-                        continue
-                    existing_by_symbol[symbol] = r
+                    existing_by_symbol[r.get("symbol")] = r
         except Exception as e:
             logger.debug(f"[STORE] Could not load existing results: {e}")
         
         # Re-apply confidence thresholds to preserved results
-        # This ensures signals reflect current threshold configuration using
-        # the same logic as new results: confidence + direction determines signal
+        # This ensures signals reflect current threshold configuration
+        # Both filtering DOWN (BUY→NONE) and restoring UP (NONE→BUY) are handled
         filtered_down_count = 0
         restored_up_count = 0
-        restored_signals: List[SignalResult] = []  # Signals to send for auto-execution
         
         for symbol, result in existing_by_symbol.items():
-            original_signal = result.get("signal_type", "NONE")
+            signal_type = result.get("signal_type", "NONE")
             confidence = result.get("confidence", 0.0)
             indicators = result.get("indicators", {})
             
-            # Get direction from indicators (calculated by engine)
+            # Get trigger conditions from indicators (strategy-specific)
+            crossover_detected = indicators.get("crossover_detected", False)
+            roc_meets_threshold = indicators.get("roc_meets_threshold", False)
+            is_ranging = indicators.get("is_ranging", False)
             direction = indicators.get("direction", "neutral")
             
-            # Determine new signal based on confidence vs threshold AND direction
-            # This matches the logic in engine._apply_confidence_threshold()
-            if direction == "bullish":
-                threshold = confidence_buy
-                new_signal = "BUY" if confidence >= threshold else "NONE"
-            elif direction == "bearish":
-                threshold = confidence_sell
-                new_signal = "SELL" if confidence >= threshold else "NONE"
-            else:
-                # Neutral direction - keep original signal but filter if below threshold
-                threshold = confidence_buy if original_signal == "BUY" else confidence_sell
-                if original_signal in ("BUY", "SELL") and confidence < threshold:
-                    new_signal = "NONE"
-                else:
-                    new_signal = original_signal
+            # Determine if signal conditions are met (based on strategy type)
+            has_buy_condition = (crossover_detected or roc_meets_threshold or is_ranging) and direction == "bullish"
+            has_sell_condition = (crossover_detected or roc_meets_threshold or is_ranging) and direction == "bearish"
             
-            # Debug logging for preserved results
-            logger.info(
-                f"Symbol {symbol} confidence {confidence:.1f}% vs threshold {threshold:.1f}% -> {new_signal} "
-                f"(direction={direction}, original={original_signal}, preserved=True)"
-            )
+            # Filter DOWN: BUY/SELL → NONE when below threshold
+            if signal_type == "BUY" and confidence < confidence_buy:
+                result["signal_type"] = "NONE"
+                indicators["threshold_filtered"] = True
+                indicators["original_signal"] = "BUY"
+                filtered_down_count += 1
+            elif signal_type == "SELL" and confidence < confidence_sell:
+                result["signal_type"] = "NONE"
+                indicators["threshold_filtered"] = True
+                indicators["original_signal"] = "SELL"
+                filtered_down_count += 1
             
-            # DEBUG: Always log to verify code execution
-            logger.info(f"[DEBUG-PRESERVED] {symbol}: new_signal={new_signal!r}, original={original_signal!r}, direction={direction}")
-            
-            # DEBUG: Check if signal should be added
-            if new_signal in ("BUY", "SELL"):
-                logger.info(f"[DEBUG-BUYSELL] {symbol}: new_signal={new_signal!r}, type={type(new_signal)}, in check={new_signal in ('BUY', 'SELL')}")
-            
-            # Track changes
-            if original_signal != new_signal:
-                if new_signal == "NONE":
-                    filtered_down_count += 1
-                    indicators["threshold_filtered"] = True
-                    indicators["original_signal"] = original_signal
-                else:
-                    restored_up_count += 1
+            # Restore UP: NONE → BUY/SELL when conditions met AND above threshold
+            elif signal_type == "NONE":
+                if has_buy_condition and confidence >= confidence_buy:
+                    result["signal_type"] = "BUY"
                     indicators["threshold_filtered"] = False
-                    
-                    # Create SignalResult for auto-execution
-                    # Ensure frontend indicators are present
-                    if 'bb_position' not in indicators:
-                        indicators['bb_position'] = None
-                    if 'adx' not in indicators:
-                        indicators['adx'] = None
-                    if 'atr_ratio' not in indicators:
-                        indicators['atr_ratio'] = None
-                    
-                    restored_signal = SignalResult(
-                        symbol=symbol,
-                        signal_type=new_signal,
-                        confidence=confidence,
-                        strategy_id=strategy_id,
-                        indicators=indicators,
-                        timestamp=timestamp,
+                    # Log restored signal to activity
+                    log_activity(
+                        activity_type="signal",
+                        message=f"BUY signal for {symbol} [{strategy_name}]",
+                        details={
+                            "symbol": symbol,
+                            "signal_type": "BUY",
+                            "confidence": confidence,
+                            "strategy": strategy_name,
+                            "auto_execute": False,
+                            "reason": "restored_by_threshold_change",
+                        },
                     )
-                    restored_signals.append(restored_signal)
-                    
-                    # Log SIGNAL_CONFIRMED (restored by threshold change, will attempt execution)
-                    # Use debouncing to prevent duplicate logs
-                    bar_timestamp = result.get("timestamp") or indicators.get("bar_timestamp")
-                    if self._should_log_signal(strategy_id, symbol, new_signal, bar_timestamp):
-                        log_activity(
-                            activity_type="SIGNAL_CONFIRMED",
-                            message=f"{new_signal} signal confirmed for {symbol} [{strategy_name}]",
-                            details={
-                                "symbol": symbol,
-                                "signal_type": new_signal,
-                                "confidence": confidence,
-                                "strategy": strategy_name,
-                                "auto_execute": True,
-                                "reason": "restored_by_threshold_change",
-                            },
-                        )
-                        self._record_signal_logged(strategy_id, symbol, new_signal, bar_timestamp)
-                
-                result["signal_type"] = new_signal
-            
-            # Always include BUY/SELL signals that meet thresholds for auto-execution
-            # This ensures existing signals are processed even when no new bar data
-            if new_signal in ("BUY", "SELL"):
-                # CRITICAL: Add signal to restored_signals for auto-execution processing
-                logger.info(
-                    f"[STORE] Adding {new_signal} signal for {symbol} to restored_signals "
-                    f"(confidence={confidence:.1f}%, strategy={strategy_id}, new_signal={new_signal!r})"
-                )
-                restored_signal = SignalResult(
-                    symbol=symbol,
-                    signal_type=new_signal,
-                    confidence=confidence,
-                    strategy_id=strategy_id,
-                    indicators=indicators,
-                    timestamp=timestamp,
-                )
-                restored_signals.append(restored_signal)
-                logger.debug(f"[STORE] After append: restored_signals length={len(restored_signals)}")
+                    restored_up_count += 1
+                elif has_sell_condition and confidence >= confidence_sell:
+                    result["signal_type"] = "SELL"
+                    indicators["threshold_filtered"] = False
+                    # Log restored signal to activity
+                    log_activity(
+                        activity_type="signal",
+                        message=f"SELL signal for {symbol} [{strategy_name}]",
+                        details={
+                            "symbol": symbol,
+                            "signal_type": "SELL",
+                            "confidence": confidence,
+                            "strategy": strategy_name,
+                            "auto_execute": False,
+                            "reason": "restored_by_threshold_change",
+                        },
+                    )
+                    restored_up_count += 1
         
         if filtered_down_count > 0 or restored_up_count > 0:
             logger.info(
@@ -873,7 +894,7 @@ class ScreenerService:
             logger.info(
                 f"[STORE] Strategy {strategy_id}: No results to store (scanned={total_scanned})"
             )
-            return []
+            return
         
         all_results = results
         
@@ -902,18 +923,12 @@ class ScreenerService:
         new_by_symbol = {r.get("symbol"): r for r in normalized_results}
         merged_results = []
         
-        # Add all new results (filter out stablecoins)
+        # Add all new results
         for symbol, result in new_by_symbol.items():
-            if is_stablecoin_pair(symbol):
-                logger.debug(f"[STORE] Filtering stablecoin from new merged results: {symbol}")
-                continue
             merged_results.append(result)
         
-        # Add existing results for symbols not in new results (filter out stablecoins)
+        # Add existing results for symbols not in new results
         for symbol, result in existing_by_symbol.items():
-            if is_stablecoin_pair(symbol):
-                logger.debug(f"[STORE] Filtering stablecoin from preserved merged results: {symbol}")
-                continue
             if symbol not in new_by_symbol:
                 merged_results.append(result)
         
@@ -941,20 +956,13 @@ class ScreenerService:
             f"[STORE] Strategy {strategy_id}: Stored {len(merged_results)} results to {key} "
             f"(new={new_count}, preserved={preserved_count}, BUY={buy_count}, SELL={sell_count}, NONE={none_count}, TTL={SCREENER_RESULTS_TTL}s)"
         )
-        
-        # Return restored signals for auto-execution processing
-        if restored_signals:
-            signal_list = ", ".join([f"{s.symbol} {getattr(s, 'signal_type', getattr(s, 'signal', 'NONE'))}" 
-                                    for s in restored_signals[:5]])
-            logger.info(
-                f"[STORE] Strategy {strategy_id}: {len(restored_signals)} signals restored for auto-execution: {signal_list}"
-            )
-        return restored_signals
     
     async def _process_auto_execution(
         self,
         signal: SignalResult,
         trading_enabled: bool,
+        confidence_buy: float = CONFIDENCE_THRESHOLD_PCT,
+        confidence_sell: float = CONFIDENCE_THRESHOLD_PCT,
     ) -> None:
         """
         Process a signal for potential auto-execution.
@@ -965,16 +973,14 @@ class ScreenerService:
         Args:
             signal: SignalResult with confidence
             trading_enabled: Whether trading is currently enabled
+            confidence_buy: Confidence threshold for BUY signals (default: 90%)
+            confidence_sell: Confidence threshold for SELL signals (default: 90%)
         """
         confidence = signal.confidence
-        
         # Get signal type (handle both signal and signal_type attributes)
         signal_type = getattr(signal, 'signal_type', None) or getattr(signal, 'signal', 'NONE')
-        
-        # Only process actionable signals (BUY/SELL)
-        # NONE signals have already been filtered by strategy threshold
-        if signal_type.upper() not in ("BUY", "SELL"):
-            return
+        # Use strategy-specific threshold based on signal direction
+        threshold = confidence_buy if signal_type.upper() == "BUY" else confidence_sell
         
         # Get human-readable strategy name for logging (fallback to UUID)
         strategy_name = signal.strategy_id
@@ -987,74 +993,54 @@ class ScreenerService:
         except Exception:
             pass  # Keep UUID as fallback
         
-        # Get bar timestamp from signal (used for debouncing)
-        bar_timestamp = signal.timestamp or None
-        indicators = getattr(signal, 'indicators', None) or getattr(signal, 'metadata', {})
-        # Try to get bar timestamp from indicators if available
-        if not bar_timestamp and isinstance(indicators, dict):
-            bar_timestamp = indicators.get("bar_timestamp") or indicators.get("timestamp")
-        
-        # Check if shadow mode is active (needed for execution path)
-        from backend.api.routes.trading import get_shadow_live_mode
-        shadow_mode = get_shadow_live_mode()
-        
-        if not trading_enabled and not shadow_mode:
-            # Trading disabled AND not shadow mode - just log signal and return
-            # Check debouncing before logging
-            if not self._should_log_signal(signal.strategy_id, signal.symbol, signal_type, bar_timestamp):
-                logger.debug(
-                    f"[DEBOUNCE] Skipping activity log for {signal_type} {signal.symbol} "
-                    f"(trading-off, debounced)"
+        if not trading_enabled:
+            # Log signal but don't execute (only actionable BUY/SELL signals)
+            if signal_type.upper() in ("BUY", "SELL"):
+                logger.info(
+                    f"SIGNAL (trading-off): {signal_type} {signal.symbol} "
+                    f"confidence={confidence:.1f}% strategy={signal.strategy_id}"
                 )
-                return
-            
-            # Log SIGNAL_CONFIRMED but don't execute (trading disabled)
-            logger.info(
-                f"SIGNAL_CONFIRMED (trading-off): {signal_type} {signal.symbol} "
-                f"confidence={confidence:.1f}% strategy={strategy_name}"
-            )
-            log_activity(
-                activity_type="SIGNAL_CONFIRMED",
-                message=f"{signal_type} signal confirmed for {signal.symbol} [{strategy_name}]",
-                details={
-                    "symbol": signal.symbol,
-                    "signal_type": signal_type,
-                    "confidence": confidence,
-                    "strategy": strategy_name,
-                    "auto_execute": False,
-                    "reason": "trading_disabled",
-                },
-            )
-            # Record that we logged this signal
-            self._record_signal_logged(signal.strategy_id, signal.symbol, signal_type, bar_timestamp)
+                # Log to activity feed for strategy signals
+                log_activity(
+                    activity_type="signal",
+                    message=f"{signal_type} signal for {signal.symbol} [{strategy_name}]",
+                    details={
+                        "symbol": signal.symbol,
+                        "signal_type": signal_type,
+                        "confidence": confidence,
+                        "strategy": strategy_name,
+                        "auto_execute": False,
+                        "reason": "trading_disabled",
+                    },
+                )
+            else:
+                # NONE signals logged at DEBUG level for debugging purposes
+                logger.debug(
+                    f"SIGNAL (trading-off): {signal_type} {signal.symbol} "
+                    f"confidence={confidence:.1f}% strategy={signal.strategy_id}"
+                )
             return
         
-        # Signal is BUY/SELL (already passed strategy threshold)
-        # Proceed to execution checks (both live and shadow mode)
-        
-        # Live universe check: Skip live execution if symbol not in live universe
-        # Shadow mode can still proceed (evaluation only)
-        if trading_enabled and not shadow_mode:
-            if not is_in_live_universe(signal.symbol):
-                logger.info(
-                    f"Signal {signal.symbol} skipped: Not in live universe (shadow mode only)"
+        if confidence < threshold:
+            # Below threshold - log rejection (INFO level - this is normal behavior)
+            logger.info(
+                f"Signal rejected: {signal.symbol} confidence {confidence:.1f}% < threshold {threshold}%"
+            )
+            # Log to activity feed for below-threshold signals (only log non-NONE signals)
+            if signal_type.upper() != "NONE":
+                log_activity(
+                    activity_type="signal",
+                    message=f"{signal_type} signal for {signal.symbol} [{strategy_name}]",
+                    details={
+                        "symbol": signal.symbol,
+                        "signal_type": signal_type,
+                        "confidence": confidence,
+                        "strategy": strategy_name,
+                        "auto_execute": False,
+                        "reason": f"below_threshold ({confidence:.1f}% < {threshold}%)",
+                    },
                 )
-                # Log SIGNAL_CONFIRMED but don't execute (not in live universe)
-                if self._should_log_signal(signal.strategy_id, signal.symbol, signal_type, bar_timestamp):
-                    log_activity(
-                        activity_type="SIGNAL_CONFIRMED",
-                        message=f"{signal_type} signal confirmed for {signal.symbol} [{strategy_name}] - not in live universe",
-                        details={
-                            "symbol": signal.symbol,
-                            "signal_type": signal_type,
-                            "confidence": confidence,
-                            "strategy": strategy_name,
-                            "auto_execute": False,
-                            "reason": "not_in_live_universe",
-                        },
-                    )
-                    self._record_signal_logged(signal.strategy_id, signal.symbol, signal_type, bar_timestamp)
-                return
+            return
         
         # No-shorting: Only execute SELL signals if we own the asset
         if signal_type.upper() == "SELL":
@@ -1062,21 +1048,18 @@ class ScreenerService:
             
             # Check if we have a position to sell (no shorting)
             if not tracker.has_position(signal.symbol):
-                # Check debouncing before logging SIGNAL_CONFIRMED
-                if self._should_log_signal(signal.strategy_id, signal.symbol, signal_type, bar_timestamp):
-                    logger.info(f"SELL signal ignored for {signal.symbol}: no position (no shorting)")
-                    log_activity(
-                        activity_type="SIGNAL_CONFIRMED",
-                        message=f"SELL signal confirmed for {signal.symbol} [{strategy_name}] - no position (no shorting)",
-                        details={
-                            "reason": "no_shorting",
-                            "symbol": signal.symbol,
-                            "signal_type": signal_type,
-                            "confidence": confidence,
-                            "strategy": strategy_name,
-                        },
-                    )
-                    self._record_signal_logged(signal.strategy_id, signal.symbol, signal_type, bar_timestamp)
+                logger.info(f"SELL signal ignored for {signal.symbol}: no position (no shorting)")
+                log_activity(
+                    activity_type="signal",
+                    message=f"SELL signal ignored for {signal.symbol} [{strategy_name}] - no position",
+                    details={
+                        "reason": "no_shorting",
+                        "symbol": signal.symbol,
+                        "signal_type": signal_type,
+                        "confidence": confidence,
+                        "strategy": strategy_name,
+                    },
+                )
                 return
             
             # T72: Ownership enforcement for SELL signals
@@ -1104,10 +1087,9 @@ class ScreenerService:
                     f"BUY signal skipped for {signal.symbol}: position already exists "
                     f"(strategy={signal.strategy_id})"
                 )
-                # Log SIGNAL_CONFIRMED (signal met threshold but position exists)
                 log_activity(
-                    activity_type="SIGNAL_CONFIRMED",
-                    message=f"BUY signal confirmed for {signal.symbol} [{strategy_name}] - position exists",
+                    activity_type="signal",
+                    message=f"BUY signal skipped for {signal.symbol} [{strategy_name}] - position exists",
                     details={
                         "reason": "position_exists",
                         "symbol": signal.symbol,
@@ -1118,48 +1100,49 @@ class ScreenerService:
                 )
                 return
             
-            # Cooldown check: skip if signal was recently executed FOR THIS CANDLE
-            # Cooldown is per-candle (includes bar_timestamp) so new candles can execute
+            # Cooldown check: skip if signal was recently executed
             client = get_redis_client()
+            # Get bar_timestamp from signal data for per-candle cooldown
+            signal_data = getattr(signal, 'indicators', None) or getattr(signal, 'metadata', {})
+            bar_timestamp = signal_data.get("bar_timestamp") or signal_data.get("timestamp") or ""
+            
+            # Use per-candle cooldown key if bar_timestamp is available, otherwise use legacy key
             if bar_timestamp:
-                # Per-candle cooldown: expires when new candle opens
                 cooldown_key = SIGNAL_EXECUTED_KEY.format(
-                    strategy_id=signal.strategy_id, 
-                    symbol=signal.symbol,
-                    bar_timestamp=bar_timestamp
+                    strategy_id=signal.strategy_id, symbol=signal.symbol, bar_timestamp=bar_timestamp
                 )
             else:
-                # Fallback to legacy key if no bar_timestamp (shouldn't happen in normal flow)
+                # Fallback to legacy key format if bar_timestamp is missing
+                from backend.redis.keys import SIGNAL_EXECUTED_KEY_LEGACY
                 cooldown_key = SIGNAL_EXECUTED_KEY_LEGACY.format(
-                    strategy_id=signal.strategy_id, 
-                    symbol=signal.symbol
+                    strategy_id=signal.strategy_id, symbol=signal.symbol
+                )
+                logger.warning(
+                    f"Missing bar_timestamp for {signal.symbol}, using legacy cooldown key"
                 )
             
             if client.exists(cooldown_key):
-                # Check debouncing before logging SIGNAL_CONFIRMED
-                if self._should_log_signal(signal.strategy_id, signal.symbol, signal_type, bar_timestamp):
-                    logger.info(
-                        f"BUY signal skipped for {signal.symbol}: cooldown active for candle {bar_timestamp} "
-                        f"(strategy={signal.strategy_id})"
-                    )
-                    log_activity(
-                        activity_type="SIGNAL_CONFIRMED",
-                        message=f"BUY signal confirmed for {signal.symbol} [{strategy_name}] - cooldown active",
-                        details={
-                            "reason": "cooldown_active",
-                            "symbol": signal.symbol,
-                            "signal_type": signal_type,
-                            "confidence": confidence,
-                            "strategy": strategy_name,
-                            "bar_timestamp": bar_timestamp,
-                        },
-                    )
-                    self._record_signal_logged(signal.strategy_id, signal.symbol, signal_type, bar_timestamp)
+                logger.info(
+                    f"BUY signal skipped for {signal.symbol}: cooldown active "
+                    f"(strategy={signal.strategy_id})"
+                )
+                log_activity(
+                    activity_type="signal",
+                    message=f"BUY signal skipped for {signal.symbol} [{strategy_name}] - cooldown active",
+                    details={
+                        "reason": "cooldown_active",
+                        "symbol": signal.symbol,
+                        "signal_type": signal_type,
+                        "confidence": confidence,
+                        "strategy": strategy_name,
+                    },
+                )
                 return
         
         # Confidence meets threshold and trading is enabled - attempt execution
         logger.info(
-            f"Signal approved: {signal.symbol} {signal_type} confidence={confidence:.1f}%"
+            f"Signal approved: {signal.symbol} {signal_type} confidence={confidence:.1f}% "
+            f"threshold={threshold:.1f}% strategy={signal.strategy_id}"
         )
         
         try:
@@ -1167,18 +1150,6 @@ class ScreenerService:
             side = signal_type.lower()  # "buy" or "sell"
             # Get metadata/indicators (handle both attribute names)
             signal_data = getattr(signal, 'indicators', None) or getattr(signal, 'metadata', {})
-            
-            # Get strategy interval for metadata
-            strategy_interval = "15m"  # Default
-            try:
-                session = get_session()
-                strategy = session.query(Strategy).filter(Strategy.id == signal.strategy_id).first()
-                if strategy:
-                    config = strategy.config or {}
-                    strategy_interval = config.get("interval") or config.get("parameters", {}).get("interval", "15m")
-                session.close()
-            except Exception:
-                pass
             
             trade_intent = TradeIntent(
                 strategy_id=signal.strategy_id,
@@ -1189,9 +1160,6 @@ class ScreenerService:
                 metadata={
                     "confidence": confidence,
                     "source": "screener_auto_execute",
-                    "bar_timestamp": bar_timestamp,
-                    "timeframe": strategy_interval,
-                    "interval": strategy_interval,
                     **signal_data,
                 },
             )
@@ -1200,183 +1168,45 @@ class ScreenerService:
             decision = evaluate_intent(trade_intent)
             
             if not decision.approved:
-                # Handle live slots overflow routing to Shadow Mode
-                if decision.rejection_reason == "live_slots_full_routed_to_shadow":
-                    # Get live slots status for logging
-                    try:
-                        from backend.risk.micro_mode import get_live_slots_status
-                        from backend.risk.portfolio import get_current_equity
-                        from backend.db import get_session
-                        
-                        session = get_session()
-                        try:
-                            current_equity = get_current_equity(session)
-                        finally:
-                            session.close()
-                        
-                        slots_status = get_live_slots_status(current_equity)
-                        current_slots = slots_status["current_slots"]
-                        max_slots = slots_status["max_slots"]
-                    except Exception as e:
-                        logger.warning(f"Failed to get live slots status: {e}")
-                        current_slots = 0
-                        max_slots = 0
-                    
-                    logger.info(
-                        f"Signal routed to Shadow Mode: Live slots full ({current_slots}/{max_slots})"
-                    )
-                    
-                    # Get current price for simulated execution
-                    current_price = signal_data.get("current_price") or signal_data.get("price")
-                    if current_price is None:
-                        logger.error(
-                            f"LIVE_SLOTS_ROUTING FAILED: No current_price in signal data "
-                            f"for {signal.symbol}"
-                        )
-                        # Still log SIGNAL_CONFIRMED
-                        if self._should_log_signal(signal.strategy_id, signal.symbol, signal_type, bar_timestamp):
-                            log_activity(
-                                activity_type="SIGNAL_CONFIRMED",
-                                message=f"{signal_type} signal confirmed for {signal.symbol} [{strategy_name}] - live_slots_full_routed_to_shadow (no price)",
-                                details={
-                                    "reason": "live_slots_full_routed_to_shadow",
-                                    "symbol": signal.symbol,
-                                    "signal_type": signal_type,
-                                    "confidence": confidence,
-                                    "strategy": strategy_name,
-                                    "rejection_reason": "live_slots_full_routed_to_shadow",
-                                },
-                            )
-                            self._record_signal_logged(signal.strategy_id, signal.symbol, signal_type, bar_timestamp)
-                        return
-                    
-                    # Calculate position sizing (same as normal execution)
-                    try:
-                        from backend.risk.sizing import PositionSizer
-                        from backend.risk.portfolio import get_current_equity
-                        from backend.db import get_session
-                        # RISK_PCT_PER_TRADE already imported at module level (line 18)
-                        
-                        session = get_session()
-                        try:
-                            current_equity = get_current_equity(session)
-                        finally:
-                            session.close()
-                        
-                        position_sizer = PositionSizer()
-                        # Get ATR and stop loss from metadata if available
-                        metadata = trade_intent.metadata or {}
-                        atr_value = metadata.get("atr")
-                        explicit_stop_loss_price = metadata.get("stop_loss_price")
-                        stop_loss_pct = metadata.get("stop_loss_pct")
-                        
-                        # Check if equity < $50: Use Scout sizing
-                        use_scout_sizing = current_equity < 50.0
-                        
-                        sizing = position_sizer.calculate(
-                            account_equity=float(current_equity),
-                            risk_pct=RISK_PCT_PER_TRADE,
-                            entry_price=current_price,
-                            stop_loss_pct=stop_loss_pct,
-                            strategy_id=trade_intent.strategy_id,
-                            atr=atr_value,
-                            stop_loss_price=explicit_stop_loss_price,
-                            use_scout_sizing=use_scout_sizing,
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to calculate position size for shadow routing: {e}", exc_info=True)
-                        sizing = None
-                    
-                    if sizing and sizing.quantity > 0:
-                        # Log ORDER_INTENT to Shadow Mode
-                        log_activity(
-                            activity_type="ORDER_INTENT",
-                            message=f"Order intent (shadow): {signal_type} {sizing.quantity} {signal.symbol} @ ${current_price:.2f} [{strategy_name}]",
-                            details={
-                                "symbol": signal.symbol,
-                                "side": side,
-                                "quantity": sizing.quantity,
-                                "price": current_price,
-                                "notional": sizing.quantity * current_price,
-                                "risk_pct": trade_intent.notional_risk_pct,
-                                "strategy": strategy_name,
-                                "strategy_id": signal.strategy_id,
-                                "mode": "shadow_live",
-                                "reason": "live_slots_full_routed_to_shadow",
-                                "live_slots": f"{current_slots}/{max_slots}",
-                            },
-                        )
-                        
-                        # Create simulated Fill and position (shadow position)
-                        try:
-                            from backend.execution.models import Fill
-                            from datetime import datetime, timezone
-                            
-                            simulated_fill = Fill(
-                                order_id=f"shadow_slots_{trade_intent.symbol}_{trade_intent.side}_{datetime.now(timezone.utc).timestamp()}",
-                                symbol=trade_intent.symbol,
-                                side=trade_intent.side,
-                                executed_price=current_price,
-                                quantity=sizing.quantity,
-                                fees=0.0,  # No fees in shadow mode
-                                slippage=0.0,  # No slippage in shadow mode
-                                exchange_order_id=None,  # No exchange order in shadow mode
-                                timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            )
-                            
-                            # Record fill to position tracker (creates shadow position)
-                            tracker = get_position_tracker()
-                            strategy_id = trade_intent.strategy_id if trade_intent.side == "buy" else None
-                            tracker.record_fill(simulated_fill, strategy_id=strategy_id)
-                            
-                            logger.info(
-                                f"[SHADOW-LIVE] Simulated position created (live slots overflow): "
-                                f"{trade_intent.side} {sizing.quantity} {trade_intent.symbol} @ ${current_price:.2f}"
-                            )
-                        except Exception as e:
-                            logger.error(f"[SHADOW-LIVE] Failed to create simulated position: {e}", exc_info=True)
-                    
-                    # Log SIGNAL_CONFIRMED with routing info
-                    if self._should_log_signal(signal.strategy_id, signal.symbol, signal_type, bar_timestamp):
-                        log_activity(
-                            activity_type="SIGNAL_CONFIRMED",
-                            message=f"{signal_type} signal confirmed for {signal.symbol} [{strategy_name}] - routed to Shadow Mode (live slots full)",
-                            details={
-                                "reason": "live_slots_full_routed_to_shadow",
-                                "symbol": signal.symbol,
-                                "signal_type": signal_type,
-                                "confidence": confidence,
-                                "strategy": strategy_name,
-                                "rejection_reason": "live_slots_full_routed_to_shadow",
-                                "live_slots": f"{current_slots}/{max_slots}",
-                            },
-                        )
-                        self._record_signal_logged(signal.strategy_id, signal.symbol, signal_type, bar_timestamp)
-                    
-                    return
-                
-                # Other rejection reasons - log SIGNAL_CONFIRMED and return
                 logger.warning(
                     f"AUTO-EXECUTE REJECTED: {side} {signal.symbol} "
-                    f"reason={decision.rejection_reason} strategy={signal.strategy_id}"
+                    f"reason={decision.rejection_reason} strategy={signal.strategy_id} "
+                    f"confidence={confidence:.1f}%"
                 )
-                # Log SIGNAL_CONFIRMED even if rejected by risk evaluator (shows why it didn't execute)
-                if self._should_log_signal(signal.strategy_id, signal.symbol, signal_type, bar_timestamp):
-                    rejection_reason = decision.rejection_reason or "risk_rejected"
-                    log_activity(
-                        activity_type="SIGNAL_CONFIRMED",
-                        message=f"{signal_type} signal confirmed for {signal.symbol} [{strategy_name}] - {rejection_reason}",
-                        details={
-                            "reason": rejection_reason,
-                            "symbol": signal.symbol,
-                            "signal_type": signal_type,
-                            "confidence": confidence,
-                            "strategy": strategy_name,
-                            "rejection_reason": rejection_reason,
-                        },
-                    )
-                    self._record_signal_logged(signal.strategy_id, signal.symbol, signal_type, bar_timestamp)
+                # Log rejection to activity feed for visibility
+                log_activity(
+                    activity_type="signal",
+                    message=f"{side.upper()} signal rejected for {signal.symbol} [{strategy_name}] - {decision.rejection_reason}",
+                    details={
+                        "symbol": signal.symbol,
+                        "signal_type": signal_type,
+                        "confidence": confidence,
+                        "strategy": strategy_name,
+                        "auto_execute": False,
+                        "reason": decision.rejection_reason,
+                    },
+                )
                 return
+            
+            # TICKET-705: Log EXECUTION_ALLOWED before calling execute_trade()
+            bar_timestamp = signal_data.get("bar_timestamp") or signal_data.get("timestamp")
+            strategy_interval = signal_data.get("timeframe") or signal_data.get("interval") or "15m"
+            candle_tag = f"candle={bar_timestamp} tf={strategy_interval}" if bar_timestamp else ""
+            
+            log_activity(
+                activity_type="EXECUTION_ALLOWED",
+                message=f"Execution allowed: {side.upper()} {signal.symbol} [{signal.strategy_id}] - passed all gates {candle_tag}".strip(),
+                details={
+                    "symbol": signal.symbol,
+                    "side": side,
+                    "strategy": signal.strategy_id,
+                    "strategy_id": signal.strategy_id,
+                    "confidence": confidence,
+                    "bar_timestamp": bar_timestamp,
+                    "timeframe": strategy_interval,
+                    "intent_id": decision.intent_id,
+                },
+            )
             
             # Get current price from signal data
             current_price = signal_data.get("current_price") or signal_data.get("price")
@@ -1388,90 +1218,6 @@ class ScreenerService:
                 )
                 return
             
-            # EXECUTION_ALLOWED is a stateful latch: one-and-only gate that is candle-idempotent
-            # Check if EXECUTION_ALLOWED was already logged for this candle BEFORE proceeding
-            client = get_redis_client()
-            if bar_timestamp:
-                execution_allowed_key = EXECUTION_ALLOWED_LOGGED_KEY.format(
-                    strategy_id=signal.strategy_id,
-                    symbol=signal.symbol,
-                    bar_timestamp=bar_timestamp
-                )
-                if client.exists(execution_allowed_key):
-                    # EXECUTION_ALLOWED already logged for this candle - gate is closed
-                    logger.info(
-                        f"EXECUTION_ALLOWED gate closed for {signal.symbol} "
-                        f"(candle={bar_timestamp}, strategy={signal.strategy_id}). "
-                        f"One execution opportunity per candle max - skipping."
-                    )
-                    return  # Gate closed - do not proceed to execution
-            
-            # Get strategy interval for candle tagging
-            strategy_interval = "15m"  # Default
-            try:
-                session = get_session()
-                strategy = session.query(Strategy).filter(Strategy.id == signal.strategy_id).first()
-                if strategy:
-                    config = strategy.config or {}
-                    strategy_interval = config.get("interval") or config.get("parameters", {}).get("interval", "15m")
-                session.close()
-            except Exception:
-                pass
-            
-            # Log EXECUTION_ALLOWED (passed all gates: risk, cooldown, position checks)
-            # This is the ONE-AND-ONLY gate that enforces candle-idempotency
-            candle_tag = f"candle={bar_timestamp} tf={strategy_interval}" if bar_timestamp else ""
-            log_activity(
-                activity_type="EXECUTION_ALLOWED",
-                message=f"Execution allowed: {signal_type} {signal.symbol} [{strategy_name}] - passed all gates {candle_tag}".strip(),
-                details={
-                    "symbol": signal.symbol,
-                    "signal_type": signal_type,
-                    "confidence": confidence,
-                    "strategy": strategy_name,
-                    "strategy_id": signal.strategy_id,
-                    "bar_timestamp": bar_timestamp,
-                    "timeframe": strategy_interval,
-                    "risk_approved": True,
-                    "mode": "shadow_live" if shadow_mode else "live",
-                },
-            )
-            # Set the latch: mark this candle as having passed EXECUTION_ALLOWED gate
-            # This prevents any further execution attempts for this candle
-            if bar_timestamp:
-                client.setex(execution_allowed_key, EXECUTION_ALLOWED_TTL, "1")
-            
-            # Set execution cooldown BEFORE attempting execution (prevents duplicate orders)
-            # Cooldown is per-candle: expires when new candle opens (TTL based on timeframe)
-            if side == "buy" and bar_timestamp:
-                # Per-candle cooldown: key includes bar_timestamp
-                cooldown_key = SIGNAL_EXECUTED_KEY.format(
-                    strategy_id=signal.strategy_id, 
-                    symbol=signal.symbol,
-                    bar_timestamp=bar_timestamp
-                )
-                # Check if cooldown already exists (another execution in progress)
-                if client.exists(cooldown_key):
-                    logger.warning(
-                        f"Execution cooldown already active for {signal.symbol} "
-                        f"(strategy={signal.strategy_id}, candle={bar_timestamp}). Skipping duplicate execution."
-                    )
-                    return
-                
-                # Calculate TTL based on timeframe (cooldown expires when new candle opens)
-                # Use timeframe duration + buffer to ensure it expires cleanly
-                from backend.screener.aggregator import INTERVAL_MINUTES
-                timeframe_minutes = INTERVAL_MINUTES.get(strategy_interval, 15)
-                # TTL = timeframe duration + 60s buffer (ensures cleanup after candle close)
-                cooldown_ttl = (timeframe_minutes * 60) + 60
-                
-                # Set cooldown immediately (before execution) to prevent race conditions
-                client.setex(cooldown_key, cooldown_ttl, "1")
-                logger.info(
-                    f"Execution cooldown set for {signal.symbol} (strategy={signal.strategy_id}, "
-                    f"candle={bar_timestamp}, TTL={cooldown_ttl}s) - prevents duplicate orders per candle"
-                )
-            
             # Execute the trade
             fill = await execute_trade(trade_intent, float(current_price))
             
@@ -1481,7 +1227,18 @@ class ScreenerService:
                     f"qty={fill.quantity} price=${fill.executed_price:.2f} "
                     f"confidence={confidence:.1f}% strategy={signal.strategy_id}"
                 )
-                # Cooldown already set above (before execution) to prevent duplicates
+                
+                # Set cooldown key after successful BUY to prevent repeated buys
+                if side == "buy":
+                    client = get_redis_client()
+                    cooldown_key = SIGNAL_EXECUTED_KEY.format(
+                        strategy_id=signal.strategy_id, symbol=signal.symbol
+                    )
+                    client.setex(cooldown_key, SIGNAL_COOLDOWN_SECONDS, "1")
+                    logger.info(
+                        f"Cooldown set for {signal.symbol} (strategy={signal.strategy_id}, "
+                        f"TTL={SIGNAL_COOLDOWN_SECONDS}s)"
+                    )
             else:
                 logger.warning(
                     f"AUTO-EXECUTE FAILED: {side} {signal.symbol} "
@@ -1495,119 +1252,6 @@ class ScreenerService:
                 exc_info=True,
             )
     
-    def _should_log_signal(
-        self,
-        strategy_id: str,
-        symbol: str,
-        signal_type: str,
-        current_bar_timestamp: Optional[str] = None,
-    ) -> bool:
-        """
-        Check if an actionable signal should be logged to activity log.
-        
-        Debouncing logic:
-        - Log once per candle close (when bar timestamp changes)
-        - Cooldown after logging (don't log again until cooldown expires OR new candle)
-        - This prevents duplicate activity log entries while allowing:
-          * Screener to refresh every minute (informational confidence updates)
-          * Actionable signals to be logged once per candle close
-        
-        Args:
-            strategy_id: Strategy identifier
-            symbol: Trading pair symbol
-            signal_type: Signal type ("BUY" or "SELL")
-            current_bar_timestamp: Timestamp of current bar (for candle close detection)
-            
-        Returns:
-            True if signal should be logged (new candle OR cooldown expired), False otherwise
-        """
-        client = get_redis_client()
-        key = SIGNAL_LAST_LOGGED_KEY.format(
-            strategy_id=strategy_id,
-            symbol=symbol,
-            signal_type=signal_type.upper()
-        )
-        
-        # Get last logged timestamp and bar timestamp
-        last_logged_data = client.get(key)
-        
-        if last_logged_data is None:
-            # Never logged before - allow logging
-            return True
-        
-        try:
-            data = json.loads(last_logged_data)
-            last_logged_ts = data.get("timestamp")
-            last_bar_ts = data.get("bar_timestamp")
-        except (json.JSONDecodeError, KeyError):
-            # Invalid data - allow logging
-            return True
-        
-        # Check if this is a new candle close (bar timestamp changed)
-        if current_bar_timestamp and current_bar_timestamp != last_bar_ts:
-            logger.debug(
-                f"[DEBOUNCE] New candle detected for {symbol} {signal_type} "
-                f"(last_bar={last_bar_ts}, current_bar={current_bar_timestamp})"
-            )
-            return True
-        
-        # Check if cooldown has expired
-        if last_logged_ts:
-            try:
-                last_logged_dt = datetime.fromisoformat(last_logged_ts.replace("Z", "+00:00"))
-                now = datetime.now(timezone.utc)
-                elapsed = (now - last_logged_dt).total_seconds()
-                
-                if elapsed >= SIGNAL_LOG_COOLDOWN_SECONDS:
-                    logger.debug(
-                        f"[DEBOUNCE] Cooldown expired for {symbol} {signal_type} "
-                        f"(elapsed={elapsed:.0f}s, cooldown={SIGNAL_LOG_COOLDOWN_SECONDS}s)"
-                    )
-                    return True
-            except (ValueError, AttributeError):
-                # Invalid timestamp - allow logging
-                return True
-        
-        # Signal was logged recently and no new candle - skip logging
-        logger.debug(
-            f"[DEBOUNCE] Skipping log for {symbol} {signal_type} "
-            f"(last_logged={last_logged_ts}, bar_unchanged={current_bar_timestamp == last_bar_ts if current_bar_timestamp else 'unknown'})"
-        )
-        return False
-    
-    def _record_signal_logged(
-        self,
-        strategy_id: str,
-        symbol: str,
-        signal_type: str,
-        bar_timestamp: Optional[str] = None,
-    ) -> None:
-        """
-        Record that a signal was logged to activity log.
-        
-        Stores timestamp and bar timestamp for debouncing checks.
-        
-        Args:
-            strategy_id: Strategy identifier
-            symbol: Trading pair symbol
-            signal_type: Signal type ("BUY" or "SELL")
-            bar_timestamp: Timestamp of bar that triggered the signal
-        """
-        client = get_redis_client()
-        key = SIGNAL_LAST_LOGGED_KEY.format(
-            strategy_id=strategy_id,
-            symbol=symbol,
-            signal_type=signal_type.upper()
-        )
-        
-        data = {
-            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "bar_timestamp": bar_timestamp,
-        }
-        
-        # Store with TTL slightly longer than cooldown to ensure cleanup
-        client.setex(key, SIGNAL_LOG_COOLDOWN_SECONDS + 300, json.dumps(data))
-    
     def _should_evaluate(
         self,
         strategy_id: str,
@@ -1618,28 +1262,18 @@ class ScreenerService:
         """
         Check if we should evaluate this symbol for this strategy.
         
-        This implements interval-based evaluation (debouncing per candle close):
-        - Screener ticks every 60s for status + previews
-        - But strategies only evaluate on candle close boundaries
-        - Prevents signal spam: actionable signals emitted once per candle close
-        
         Returns True if:
         - No previous evaluation recorded (first time)
-        - Latest bar timestamp is newer than last evaluation (new candle closed)
-        
-        This ensures:
-        - SETUP signals (informational) can be emitted anytime
-        - ACTIONABLE SIGNALS (BUY/SELL) only emitted once per candle close
-        - Cooldown prevents duplicate orders until trade placed or invalidation
+        - Latest bar timestamp is newer than last evaluation
         
         Args:
             strategy_id: Strategy identifier
             symbol: Trading pair symbol
             bars: List of OHLCV bar dictionaries
-            interval: Strategy interval (e.g., '15m', '1h', '4h')
+            interval: Strategy interval (e.g., '5m', '1h', '4h')
             
         Returns:
-            True if evaluation should proceed (new candle closed), False if bar data unchanged
+            True if evaluation should proceed, False if bar data unchanged
         """
         if not bars:
             return False
@@ -1737,22 +1371,12 @@ class ScreenerService:
             else:
                 skipped_count += 1
         
-        # Build candles per symbol info
-        candles_per_symbol = {}
-        for symbol, bars in symbols_bars.items():
-            candles_per_symbol[symbol] = len(bars) if bars else 0
-        
-        # Determine if evaluation is on candle close
-        evaluated_on_close = len(symbols_to_evaluate) > 0
-        
-        if skipped_count > 0 or evaluated_on_close:
+        if skipped_count > 0:
             logger.info(
                 f"[EVAL] Strategy {strategy_id} ({interval}): "
-                f"evaluated_on_close={evaluated_on_close}, "
-                f"evaluating={len(symbols_to_evaluate)} symbols, "
-                f"skipped={skipped_count} (no new bar data), "
-                f"no_data={len(no_data_symbols)}, "
-                f"candles_per_symbol={candles_per_symbol}"
+                f"Evaluating {len(symbols_to_evaluate)} symbols, "
+                f"skipped {skipped_count} (no new bar data), "
+                f"no_data={len(no_data_symbols)}"
             )
         
         # Scan symbols with new bar data
@@ -1768,14 +1392,7 @@ class ScreenerService:
                 signal_type="NONE",
                 confidence=0.0,
                 strategy_id=strategy_id,
-                indicators={
-                    "note": "waiting_for_data", 
-                    "interval": interval,
-                    # Include frontend indicators as None for consistency
-                    "bb_position": None,
-                    "adx": None,
-                    "atr_ratio": None,
-                },
+                indicators={"note": "waiting_for_data", "interval": interval},
                 timestamp=timestamp,
             )
             results.append(placeholder)
@@ -1788,8 +1405,7 @@ class ScreenerService:
                     self._record_evaluation(strategy_id, symbol, bar_timestamp)
         
         # Store results in Redis (includes placeholders for symbols without data)
-        # Also returns any signals restored by threshold changes for auto-execution
-        restored_signals = self._store_strategy_results(
+        self._store_strategy_results(
             strategy_id,
             results or [],
             total_scanned=len(symbols_bars),
@@ -1797,45 +1413,54 @@ class ScreenerService:
             confidence_sell=confidence_sell,
         )
         
-        # Log strategy scan completion with all requested fields
-        logger.info(
-            f"[SCREENER-EVAL] Strategy {strategy_id} ({interval}): "
-            f"evaluated_on_close={evaluated_on_close}, "
-            f"candles_per_symbol={candles_per_symbol}, "
-            f"symbols_evaluated={len(symbols_to_evaluate)}, "
-            f"symbols_skipped={skipped_count}, "
-            f"signals_generated={len([r for r in results if getattr(r, 'signal_type', 'NONE') in ('BUY', 'SELL')])}"
-        )
-        
         # Filter out placeholders before processing for execution
         actionable_results = [r for r in results if r.indicators.get("note") != "waiting_for_data"]
         
-        # Combine new actionable results with restored signals
-        all_signals_to_execute = actionable_results + restored_signals
+        # Log actionable signals for debugging
+        buy_signals = [r for r in actionable_results if getattr(r, 'signal_type', None) == 'BUY' or getattr(r, 'signal', None) == 'BUY']
+        sell_signals = [r for r in actionable_results if getattr(r, 'signal_type', None) == 'SELL' or getattr(r, 'signal', None) == 'SELL']
+        none_signals = [r for r in actionable_results if getattr(r, 'signal_type', None) == 'NONE' or (getattr(r, 'signal_type', None) is None and getattr(r, 'signal', None) == 'NONE')]
         
-        if not all_signals_to_execute:
-            return results  # Return all results (including placeholders) for frontend
+        logger.info(
+            f"[EVAL] Strategy {strategy_id} ({interval}): "
+            f"Results breakdown: {len(buy_signals)} BUY, {len(sell_signals)} SELL, {len(none_signals)} NONE "
+            f"(total actionable: {len(actionable_results)}, total results: {len(results)})"
+        )
         
-        # Sort signals by confidence (descending) before processing
-        # This ensures higher-confidence signals are processed first, which is important
-        # when position limits (e.g., micro mode max 1 position) are active
-        all_signals_to_execute.sort(key=lambda s: getattr(s, 'confidence', 0.0), reverse=True)
+        if buy_signals or sell_signals:
+            for sig in buy_signals + sell_signals:
+                sig_type = getattr(sig, 'signal_type', None) or getattr(sig, 'signal', 'UNKNOWN')
+                conf = getattr(sig, 'confidence', 0.0)
+                logger.info(
+                    f"[EVAL] Actionable signal: {sig_type} {sig.symbol} "
+                    f"confidence={conf:.1f}% (threshold: {confidence_buy if sig_type == 'BUY' else confidence_sell}%)"
+                )
         
-        # Log signals being processed for auto-execution (now sorted by confidence)
-        if all_signals_to_execute:
-            signal_summary = ", ".join([f"{s.symbol} {getattr(s, 'signal_type', getattr(s, 'signal', 'NONE'))} ({getattr(s, 'confidence', 0.0):.1f}%)" 
-                                       for s in all_signals_to_execute[:5]])
-            logger.info(
-                f"[AUTO-EXECUTE] Processing {len(all_signals_to_execute)} signal(s) for strategy {strategy_id} (sorted by confidence): {signal_summary}"
+        if not actionable_results:
+            logger.debug(
+                f"[EVAL] Strategy {strategy_id}: No actionable results "
+                f"(total results: {len(results)}, filtered: {len([r for r in results if r.indicators.get('note') == 'waiting_for_data'])})"
             )
+            return results  # Return all results (including placeholders) for frontend
         
         # Check trading status
         trading_enabled = get_trading_enabled()
         
-        # Process actionable signals and restored signals for potential auto-execution
-        # Signals are now processed in confidence order (highest first)
-        for signal in all_signals_to_execute:
-            await self._process_auto_execution(signal, trading_enabled)
+        if not trading_enabled:
+            logger.info(
+                f"[EVAL] Strategy {strategy_id}: Trading disabled, skipping auto-execution "
+                f"({len(buy_signals)} BUY, {len(sell_signals)} SELL actionable signals)"
+            )
+        else:
+            logger.info(
+                f"[EVAL] Strategy {strategy_id}: Trading enabled, processing "
+                f"{len(buy_signals)} BUY and {len(sell_signals)} SELL signals for auto-execution"
+            )
+        
+        # Process only actionable signals for potential auto-execution
+        # (skip placeholders and waiting_for_data results)
+        for signal in actionable_results:
+            await self._process_auto_execution(signal, trading_enabled, confidence_buy, confidence_sell)
         
         return results
     
@@ -1859,8 +1484,12 @@ class ScreenerService:
         logger.info(f"[SCAN] Starting screener scan (interval={self.interval})")
         logger.info("=" * 60)
         
+        # Debug: Log that scan is starting
+        logger.info(f"[SCAN] run_scan() called at {datetime.now(timezone.utc).isoformat()}")
+        
         # Fetch bars for all symbols
         symbols_bars = await self._get_all_symbols_bars()
+        logger.info(f"[SCAN] Fetched bars for {len(symbols_bars)} symbols")
         
         # Run the default indicator-based scan
         results = await self.engine.scan_all(symbols_bars)
@@ -1877,7 +1506,12 @@ class ScreenerService:
         self._log_and_store_signals(results)
         
         # Run strategy-based scans with auto-execution
-        await self._run_strategy_scans(symbols_bars)
+        logger.info("[SCAN] Starting strategy-based scans...")
+        try:
+            await self._run_strategy_scans(symbols_bars)
+            logger.info("[SCAN] Strategy-based scans completed")
+        except Exception as e:
+            logger.error(f"[SCAN] Error in strategy-based scans: {e}", exc_info=True)
         
         elapsed = time.monotonic() - start_time
         
@@ -1914,15 +1548,25 @@ class ScreenerService:
             return
         
         logger.info(f"Running strategy scans for {len(db_strategies)} enabled strategies")
+        logger.info(f"Strategy names: {[s.name for s in db_strategies]}")
         
         # Import strategy implementations dynamically
-        # Production strategies
+        logger.info("[STRATEGY_SCANS] Importing strategy classes...")
+        # Production strategies (new)
         from research.strategies.vwap_meanrev.strategy import VWAPMeanReversionStrategy
         from research.strategies.vwap_meanrev.config import VWAPMeanReversionConfig
-        from research.strategies.volatility_breakout.strategy import VolatilityBreakoutStrategy
-        from research.strategies.volatility_breakout.config import VolatilityBreakoutConfig
         from research.strategies.htf_trend.strategy import HTFTrendStrategy
         from research.strategies.htf_trend.config import HTFTrendConfig
+        from research.strategies.volatility_breakout.strategy import VolatilityBreakoutStrategy
+        from research.strategies.volatility_breakout.config import VolatilityBreakoutConfig
+        logger.info("[STRATEGY_SCANS] Strategy classes imported successfully")
+        # Legacy strategies
+        from research.strategies.meanrev.strategy import MeanReversionStrategy
+        from research.strategies.meanrev.config import MeanReversionConfig
+        from research.strategies.momentum.strategy import MomentumStrategy
+        from research.strategies.momentum.config import MomentumConfig
+        from research.strategies.macd.strategy import MACDStrategy
+        from research.strategies.macd.config import MACDConfig
         
         # Get symbols to scan (use keys from symbols_bars)
         symbols = list(symbols_bars.keys())
@@ -1935,68 +1579,70 @@ class ScreenerService:
                 # Create strategy instance based on name
                 config_data = db_strategy.config or {}
                 strategy = None
-                strategy_wrapper = None  # Some strategies use specialized wrappers
                 
                 # Get strategy's configured interval (default to 5m)
                 strategy_interval = config_data.get("interval", "5m")
                 
-                # Strategy 1: VWAP Mean Reversion
-                if "vwap" in strategy_name and "mean" in strategy_name:
-                    params = config_data.get("parameters", {})
-                    config = VWAPMeanReversionConfig(
-                        strategy_id=strategy_id,
-                        symbol=config_data.get("symbol", "BTC/USD"),
-                        interval=config_data.get("interval", "15m"),
-                        htf_interval=config_data.get("htf_interval", "1h"),
-                        notional_risk_pct=config_data.get("max_risk_pct", 1.0),
-                        dev_threshold_ATR=params.get("dev_threshold_ATR", 0.5),
-                        rsi_oversold=params.get("rsi_oversold", 30.0),
-                        rsi_overbought=params.get("rsi_overbought", 70.0),
-                        atr_stop_mult=params.get("atr_stop_mult", 1.5),
-                        tp1_R=params.get("tp1_R", 1.2),
-                        tp2_R=params.get("tp2_R", 2.5),
-                    )
+                # Production strategies (check most specific first)
+                if "vwap_meanrev" in strategy_name or "vwap_meanreversion" in strategy_name:
+                    # Flatten config_data: merge parameters dict into top level, exclude filters, strategy_id, name, and other non-config fields
+                    excluded_top_level = ("filters", "parameters", "strategy_id", "name", "max_risk_pct", "volume_threshold")
+                    flat_config = {k: v for k, v in config_data.items() if k not in excluded_top_level}
+                    if "parameters" in config_data:
+                        flat_config.update({k: v for k, v in config_data["parameters"].items() if k != "strategy_id"})
+                    config = VWAPMeanReversionConfig(strategy_id=strategy_id, **flat_config)
                     strategy = VWAPMeanReversionStrategy(config)
-                
-                # Strategy 2: Volatility Breakout
-                elif "volatility" in strategy_name and "breakout" in strategy_name:
-                    params = config_data.get("parameters", {})
-                    config = VolatilityBreakoutConfig(
-                        strategy_id=strategy_id,
-                        symbol=config_data.get("symbol", "BTC/USD"),
-                        interval=config_data.get("interval", "15m"),
-                        htf_interval=config_data.get("htf_interval", "1h"),
-                        notional_risk_pct=config_data.get("max_risk_pct", 1.0),
-                        squeeze_percentile=params.get("squeeze_percentile", 10.0),
-                        vol_breakout_mult=params.get("vol_breakout_mult", 1.5),
-                        retest_window_bars=params.get("retest_window_bars", 6),
-                        atr_stop_mult=params.get("atr_stop_mult", 1.8),
-                        atr_target1_mult=params.get("atr_target1_mult", 2.0),
-                        atr_target2_mult=params.get("atr_target2_mult", 3.5),
-                    )
+                    
+                elif "htf_trend" in strategy_name or "htf_trend_pullback" in strategy_name:
+                    # Flatten config_data: merge parameters dict into top level, exclude filters, strategy_id, name, and other non-config fields
+                    # Valid HTFTrendConfig fields: strategy_id, symbol, interval, htf_interval, notional_risk_pct, and all parameters
+                    excluded_top_level = ("filters", "parameters", "strategy_id", "name", "max_risk_pct", "volume_threshold")
+                    flat_config = {k: v for k, v in config_data.items() if k not in excluded_top_level}
+                    if "parameters" in config_data:
+                        flat_config.update({k: v for k, v in config_data["parameters"].items() if k != "strategy_id"})
+                    config = HTFTrendConfig(strategy_id=strategy_id, **flat_config)
+                    strategy = HTFTrendStrategy(config)
+                    
+                elif "volatility_breakout" in strategy_name:
+                    # Flatten config_data: merge parameters dict into top level, exclude filters, strategy_id, name, and other non-config fields
+                    excluded_top_level = ("filters", "parameters", "strategy_id", "name", "max_risk_pct", "volume_threshold")
+                    flat_config = {k: v for k, v in config_data.items() if k not in excluded_top_level}
+                    if "parameters" in config_data:
+                        flat_config.update({k: v for k, v in config_data["parameters"].items() if k != "strategy_id"})
+                    config = VolatilityBreakoutConfig(strategy_id=strategy_id, **flat_config)
                     strategy = VolatilityBreakoutStrategy(config)
                 
-                # Strategy 3: HTF Trend Pullback
-                elif "htf" in strategy_name and "trend" in strategy_name:
-                    params = config_data.get("parameters", {})
-                    config = HTFTrendConfig(
+                # Legacy strategies
+                elif "meanrev" in strategy_name or "mean-rev" in strategy_name or "mean_rev" in strategy_name or "mean_reversion" in strategy_name:
+                    config = MeanReversionConfig(
+                        strategy_id=strategy_id,
+                        symbol=config_data.get("symbol", "ETH/USD"),
+                        lookback_period=config_data.get("lookback_period", 20),
+                        rsi_period=config_data.get("rsi_period", 14),
+                    )
+                    strategy = MeanReversionStrategy(config)
+                    
+                elif "momentum" in strategy_name or "trend_follow" in strategy_name or "trend-follow" in strategy_name:
+                    config = MomentumConfig(
                         strategy_id=strategy_id,
                         symbol=config_data.get("symbol", "BTC/USD"),
-                        interval=config_data.get("interval", "1h"),
-                        htf_interval=config_data.get("htf_interval", "4h"),
-                        notional_risk_pct=config_data.get("max_risk_pct", 1.0),
-                        pullback_max_ATR=params.get("pullback_max_ATR", 1.5),
-                        atr_stop_mult=params.get("atr_stop_mult", 1.5),
-                        tp1_R=params.get("tp1_R", 1.5),
-                        tp2_R=params.get("tp2_R", 3.0),
-                        max_hours_in_trade=params.get("max_hours_in_trade", 24),
+                        lookback_period=config_data.get("lookback_period", 14),
                     )
-                    strategy = HTFTrendStrategy(config)
+                    strategy = MomentumStrategy(config)
+                
+                elif "macd" in strategy_name:
+                    params = config_data.get("parameters", {})
+                    config = MACDConfig(
+                        strategy_id=strategy_id,
+                        fast_period=params.get("fast_period", 12),
+                        slow_period=params.get("slow_period", 26),
+                        signal_period=params.get("signal_period", 9),
+                    )
+                    strategy = MACDStrategy(config)
                 
                 if strategy is not None:
                     # Wrap the strategy with an evaluate adapter
-                    if strategy_wrapper is None:
-                        strategy_wrapper = _StrategyEvaluateAdapter(strategy, strategy_id)
+                    strategy_wrapper = _StrategyEvaluateAdapter(strategy, strategy_id)
                     
                     # Get confidence thresholds from strategy filters (default: 90)
                     filters = config_data.get("filters", {})
@@ -2015,9 +1661,14 @@ class ScreenerService:
                     confidence_buy = clamp_threshold(confidence_buy, "confidence_buy")
                     confidence_sell = clamp_threshold(confidence_sell, "confidence_sell")
                     
-                    # Fetch bars at strategy's configured interval
+                    # Apply global filters before fetching bars (whitelist → liquidity → spread)
+                    filtered_symbols, skip_reasons = await self._apply_global_filters(
+                        symbols, strategy_id
+                    )
+                    
+                    # Fetch bars at strategy's configured interval (only for filtered symbols)
                     strategy_symbols_bars = {}
-                    for symbol in symbols:
+                    for symbol in filtered_symbols:
                         bars = await self._get_recent_bars(
                             symbol, self.bars_to_fetch, target_interval=strategy_interval
                         )
@@ -2043,14 +1694,20 @@ class ScreenerService:
     async def _run_loop(self) -> None:
         """Main scan loop."""
         logger.info("Screener service started")
+        logger.info(f"[SCAN-LOOP] Starting scan loop (interval={self.scan_interval}s)")
         
+        scan_count = 0
         while self._running:
             try:
+                scan_count += 1
+                logger.info(f"[SCAN-LOOP] Starting scan #{scan_count} at {datetime.now(timezone.utc).isoformat()}")
                 await self.run_scan()
+                logger.info(f"[SCAN-LOOP] Completed scan #{scan_count}")
             except Exception as e:
                 logger.error(f"Scan error: {e}", exc_info=True)
             
             # Wait for next scan interval
+            logger.debug(f"[SCAN-LOOP] Sleeping for {self.scan_interval}s until next scan")
             await asyncio.sleep(self.scan_interval)
         
         logger.info("Screener service stopped")
@@ -2062,8 +1719,17 @@ class ScreenerService:
             return
         
         self._running = True
-        self._task = asyncio.create_task(self._run_loop())
         logger.info("Screener service starting...")
+        logger.info(f"[SCAN-START] Creating scan loop task (interval={self.scan_interval}s)")
+        self._task = asyncio.create_task(self._run_loop())
+        logger.info(f"[SCAN-START] Scan loop task created: {self._task}")
+        
+        # Log task state after a brief delay to see if it's running
+        async def check_task():
+            await asyncio.sleep(1)
+            if self._task:
+                logger.info(f"[SCAN-START] Task state after 1s: done={self._task.done()}, cancelled={self._task.cancelled()}")
+        asyncio.create_task(check_task())
     
     async def stop(self) -> None:
         """Stop the background scan loop."""
@@ -2134,17 +1800,6 @@ class ScreenerService:
             data = client.get(key)
             if data:
                 result = json.loads(data)
-                # Ensure frontend indicators are present in all results (even if None)
-                # This handles cases where cached results were created before indicators were added
-                if "results" in result:
-                    for res in result["results"]:
-                        indicators = res.get("indicators", {})
-                        if "bb_position" not in indicators:
-                            indicators["bb_position"] = None
-                        if "adx" not in indicators:
-                            indicators["adx"] = None
-                        if "atr_ratio" not in indicators:
-                            indicators["atr_ratio"] = None
                 # Add trading_enabled status
                 result["trading_enabled"] = get_trading_enabled()
                 return result
