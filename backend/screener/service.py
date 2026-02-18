@@ -46,6 +46,7 @@ from backend.redis.keys import (
     TRADING_ENABLED_KEY,
 )
 from backend.api.routes.events import log_activity
+from backend.api.routes.trading import get_shadow_live_mode
 from backend.risk.evaluator import evaluate_intent, TradeIntent
 from backend.execution.executor import execute_trade
 from backend.positions.tracker import get_position_tracker
@@ -353,12 +354,9 @@ class ScreenerService:
             Tuple of (filtered_symbols, skip_reasons_dict) where skip_reasons_dict
             maps symbol -> reason string for filtered symbols
         """
-        client = get_redis_client()
-        
-        # Check if in shadow mode
+        # Check if in shadow mode (use helper function for consistency)
         try:
-            shadow_mode_value = client.get(SHADOW_LIVE_MODE_KEY)
-            shadow_mode = shadow_mode_value == b"shadow" if shadow_mode_value else False
+            shadow_mode = get_shadow_live_mode()
         except Exception as e:
             logger.debug(f"Failed to check shadow mode: {e}, defaulting to False")
             shadow_mode = False
