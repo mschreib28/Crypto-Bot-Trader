@@ -380,7 +380,7 @@ class ScreenerService:
                 if not is_in_live_universe(symbol):
                     skip_reason = "not in whitelist"
                     skip_counts["whitelist"] += 1
-                    logger.debug(
+                    logger.info(
                         f"[FILTER] SKIP: {symbol} [whitelist_filter] - not in live universe"
                     )
                     log_activity(
@@ -400,7 +400,7 @@ class ScreenerService:
                 if volume is not None and volume < min_volume_usd:
                     skip_reason = f"volume ${volume:,.0f} < threshold ${min_volume_usd:,.0f}"
                     skip_counts["liquidity"] += 1
-                    logger.debug(
+                    logger.info(
                         f"[FILTER] SKIP: {symbol} [liquidity_filter] - volume ${volume:,.0f} < threshold ${min_volume_usd:,.0f}"
                     )
                     log_activity(
@@ -422,7 +422,7 @@ class ScreenerService:
                 if spread_bps is not None and spread_bps > max_spread_bps:
                     skip_reason = f"spread {spread_bps:.1f} bps > threshold {max_spread_bps:.1f} bps"
                     skip_counts["spread"] += 1
-                    logger.debug(
+                    logger.info(
                         f"[FILTER] SKIP: {symbol} [spread_filter] - spread {spread_bps:.1f} bps > threshold {max_spread_bps:.1f} bps"
                     )
                     log_activity(
