@@ -1,9 +1,10 @@
+import { useState } from 'react';
 import { useAccount } from '../hooks/useAccount';
 import { useMetrics } from '../hooks/useMetrics';
 import { useShadowLive } from '../hooks/useShadowLive';
 import { useTrading } from '../hooks/useTrading';
-
-const WALLET_BASE_AMOUNT = 31.80;
+import { useShadowBalance } from '../hooks/useShadowBalance';
+import { ShadowBalanceModal } from './ShadowBalanceModal';
 
 const formatPnL = (pnl: number) => {
   const sign = pnl >= 0 ? '+' : '';
@@ -11,10 +12,12 @@ const formatPnL = (pnl: number) => {
 };
 
 export function AccountPanel() {
-  const { account, loading, error } = useAccount();
+  const { account, loading, error, refetch } = useAccount();
   const { metrics } = useMetrics();
   const { shadowLive } = useShadowLive();
   const { trading } = useTrading();
+  const { setShadowBalance, loading: settingBalance } = useShadowBalance();
+  const [showModal, setShowModal] = useState(false);
   
   const isShadowMode = shadowLive?.enabled && !trading?.enabled;
 
@@ -33,26 +36,7 @@ export function AccountPanel() {
   const calculatedPnl = currentEquity - initialEquity;
   const pnlPercent = initialEquity > 0 ? (calculatedPnl / initialEquity) * 100 : 0;
   
-  // Calculate profit % of wallet base amount ($31.80)
-  const profitPctOfWallet = ((currentEquity - WALLET_BASE_AMOUNT) / WALLET_BASE_AMOUNT) * 100;
-  
-  // Debug: Log calculation to console (temporary - remove after verification)
-  // Version: 2026-01-30-17:15 - Force cache bust
-  if (typeof window !== 'undefined') {
-    console.log('[AccountPanel] P&L Calculation Debug:', {
-      current_equity_raw: account.current_equity,
-      initial_equity_raw: account.initial_equity,
-      current_equity_parsed: currentEquity,
-      initial_equity_parsed: initialEquity,
-      calculated_pnl: calculatedPnl,
-      pnl_percent: pnlPercent,
-      account_total_pnl: account.total_pnl,
-      account_realized_pnl: account.realized_pnl,
-      account_object: account
-    });
-  }
   const totalPnlColor = calculatedPnl >= 0 ? 'text-green-400' : 'text-red-400';
-  const profitPctOfWalletColor = profitPctOfWallet >= 0 ? 'text-green-400' : profitPctOfWallet < 0 ? 'text-red-400' : 'text-gray-400';
   const dailyPnlColor = account.daily_pnl >= 0 ? 'text-green-400' : 'text-red-400';
   const lossProgress = Math.min(100, (Math.abs(Math.min(0, account.daily_pnl)) / account.daily_loss_limit) * 100);
   const progressColor = lossProgress > 80 ? 'bg-red-500' : lossProgress > 50 ? 'bg-yellow-500' : 'bg-green-500';
@@ -76,16 +60,27 @@ export function AccountPanel() {
       
       <div className="flex justify-between items-baseline mb-1">
         <span className="text-gray-500 text-xs">Equity</span>
-        <span className="font-mono text-base text-white">${(account.current_equity ?? 0).toFixed(2)}</span>
+        <span className="font-mono text-base text-white">${account.current_equity.toFixed(2)}</span>
       </div>
       
-      <div className="text-xs text-gray-500 mb-2">
-        Init: ${(account.initial_equity ?? 0).toFixed(2)}
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-xs text-gray-500">
+          Init: ${account.initial_equity.toFixed(2)}
+        </div>
+        {isShadowMode && (
+          <button
+            onClick={() => setShowModal(true)}
+            className="text-xs px-2 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1 focus:ring-offset-gray-800"
+            title="Set shadow balance"
+          >
+            Set $
+          </button>
+        )}
       </div>
       
       {/* Overall P&L Section - Prominent */}
       <div className="border-t border-gray-700 pt-2 pb-2 mb-2 bg-gray-900/50 rounded px-2 -mx-2">
-        <div className="flex justify-between items-baseline mb-1">
+        <div className="flex justify-between items-baseline">
           <span className="text-gray-400 text-xs font-medium">Overall P&L</span>
           <div className="flex items-baseline gap-2">
             <span className={`font-mono text-base font-bold ${totalPnlColor}`}>
@@ -96,25 +91,19 @@ export function AccountPanel() {
             </span>
           </div>
         </div>
-        <div className="flex justify-between items-baseline">
-          <span className="text-gray-400 text-xs font-medium">Growth</span>
-          <span className={`text-xs font-mono font-semibold ${profitPctOfWalletColor}`}>
-            {profitPctOfWallet >= 0 ? '+' : ''}{profitPctOfWallet.toFixed(2)}% of $31.80 base
-          </span>
-        </div>
       </div>
       
       <div className="border-t border-gray-700 pt-2 space-y-1">
         <div className="flex justify-between text-xs">
           <span className="text-gray-500">Win Rate</span>
           <span className="font-mono text-gray-300">
-            {metrics && metrics.overall_accuracy_pct != null ? `${metrics.overall_accuracy_pct.toFixed(1)}%` : '—'}
+            {metrics ? `${metrics.overall_accuracy_pct.toFixed(1)}%` : '—'}
           </span>
         </div>
         
         <div className="flex justify-between text-xs">
-          <span className="text-gray-500">Risk ({account.risk_pct ?? 0}%)</span>
-          <span className="font-mono text-gray-300">${(account.max_risk_per_trade ?? 0).toFixed(2)}/trade</span>
+          <span className="text-gray-500">Risk ({account.risk_pct}%)</span>
+          <span className="font-mono text-gray-300">${account.max_risk_per_trade.toFixed(2)}/trade</span>
         </div>
       </div>
       
@@ -122,7 +111,7 @@ export function AccountPanel() {
         <div className="flex justify-between text-xs mb-1">
           <span className="text-gray-500">Today</span>
           <span className={`font-mono ${dailyPnlColor}`}>
-            {(account.daily_pnl ?? 0) >= 0 ? '+' : ''}${(account.daily_pnl ?? 0).toFixed(2)}
+            {account.daily_pnl >= 0 ? '+' : ''}${account.daily_pnl.toFixed(2)}
           </span>
         </div>
         <div className="w-full bg-gray-700 rounded-full h-1.5">
@@ -132,9 +121,23 @@ export function AccountPanel() {
           />
         </div>
         <div className="text-[10px] text-gray-500 text-right mt-0.5">
-          Limit: -${(account.daily_loss_limit ?? 0).toFixed(2)}
+          Limit: -${account.daily_loss_limit.toFixed(2)}
         </div>
       </div>
+
+      <ShadowBalanceModal
+        isOpen={showModal}
+        currentBalance={account.current_equity}
+        onConfirm={async (amount) => {
+          const success = await setShadowBalance(amount);
+          if (success) {
+            refetch(); // Refresh account data
+          }
+          return success;
+        }}
+        onCancel={() => setShowModal(false)}
+        loading={settingBalance}
+      />
     </div>
   );
 }
