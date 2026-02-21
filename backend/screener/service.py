@@ -54,6 +54,10 @@ from backend.ingestor.historical import backfill_historical_bars
 from backend.screener.aggregator import aggregate_bars, INTERVAL_MINUTES
 from backend.screener.engine import ScreenerEngine, scan_with_strategy
 from backend.screener.models import ScreenerResult, SignalResult
+from backend.screener.data_collector import fetch_market_data
+from backend.screener.scoring import calculate_aplus_score, calculate_granular_rvol, score_to_grade
+from backend.ingestor.symbols import fetch_usd_pairs, is_stablecoin_pair
+from backend.redis.keys import TOP_10_OBVIOUS_KEY, TOP_10_OBVIOUS_TTL, APLUS_SCORES_KEY, APLUS_SCORES_TTL
 
 logger = logging.getLogger(__name__)
 
@@ -441,13 +445,20 @@ class ScreenerService:
             else:
                 filtered.append(symbol)
         
-        # Log filter summary
+        # Log filter summary (always log for diagnostics, even when no skips)
         total_skipped = len(skip_reasons)
+        logger.info(
+            f"[FILTER] Strategy {strategy_id}: Filtered {len(symbols)} → {len(filtered)} symbols "
+            f"(skipped: {total_skipped})"
+        )
+        
+        # Log detailed breakdown if any symbols were skipped
         if total_skipped > 0:
             logger.info(
-                f"[FILTER] Strategy {strategy_id}: Filtered {len(symbols)} → {len(filtered)} symbols "
-                f"(skipped: {total_skipped}, whitelist={skip_counts['whitelist']}, "
-                f"liquidity={skip_counts['liquidity']}, spread={skip_counts['spread']})"
+                f"[FILTER] Strategy {strategy_id}: Skip breakdown - "
+                f"whitelist={skip_counts['whitelist']}, "
+                f"liquidity={skip_counts['liquidity']}, "
+                f"spread={skip_counts['spread']}"
             )
         
         return filtered, skip_reasons
@@ -1226,17 +1237,8 @@ class ScreenerService:
                     f"confidence={confidence:.1f}% strategy={signal.strategy_id}"
                 )
                 
-                # Set cooldown key after successful BUY to prevent repeated buys
-                if side == "buy":
-                    client = get_redis_client()
-                    cooldown_key = SIGNAL_EXECUTED_KEY.format(
-                        strategy_id=signal.strategy_id, symbol=signal.symbol
-                    )
-                    client.setex(cooldown_key, SIGNAL_COOLDOWN_SECONDS, "1")
-                    logger.info(
-                        f"Cooldown set for {signal.symbol} (strategy={signal.strategy_id}, "
-                        f"TTL={SIGNAL_COOLDOWN_SECONDS}s)"
-                    )
+                # Note: Cooldown is now only set after losses (Ross Cameron spec)
+                # Removed automatic cooldown after BUY - cooldown only applies after position closes at a loss
             else:
                 logger.warning(
                     f"AUTO-EXECUTE FAILED: {side} {signal.symbol} "
@@ -1485,6 +1487,12 @@ class ScreenerService:
         # Debug: Log that scan is starting
         logger.info(f"[SCAN] run_scan() called at {datetime.now(timezone.utc).isoformat()}")
         
+        # Calculate A+ scores and update top 10 obvious cache
+        try:
+            await self._calculate_aplus_scores()
+        except Exception as e:
+            logger.error(f"[SCAN] Error in A+ scoring: {e}", exc_info=True)
+        
         # Fetch bars for all symbols
         symbols_bars = await self._get_all_symbols_bars()
         logger.info(f"[SCAN] Fetched bars for {len(symbols_bars)} symbols")
@@ -1521,6 +1529,437 @@ class ScreenerService:
         logger.info("=" * 60)
         
         return results
+    
+    async def _calculate_aplus_scores(self) -> None:
+        """
+        Calculate A+ scores for all Kraken pairs and store top 10 in Redis.
+        
+        This method:
+        1. Fetches all USD pairs from Kraken
+        2. Filters out blacklisted pairs (stablecoins)
+        3. Collects market data for each pair
+        4. Calculates A+ scores
+        5. Ranks pairs by score
+        6. Stores top 10 pairs with score > 0.85 in Redis
+        """
+        # Prevent concurrent execution using a lock
+        if not hasattr(self, '_aplus_scoring_lock'):
+            self._aplus_scoring_lock = asyncio.Lock()
+        
+        # Try to acquire lock, but don't wait - skip if already running
+        lock_acquired = False
+        try:
+            lock_acquired = await asyncio.wait_for(self._aplus_scoring_lock.acquire(), timeout=0.1)
+        except asyncio.TimeoutError:
+            logger.warning("[A+] A+ scoring already in progress, skipping this cycle")
+            return
+        
+        try:
+            logger.info("[A+] Starting A+ scoring calculation...")
+            
+            # Get all Kraken USD pairs
+            try:
+                all_pairs = await fetch_usd_pairs()
+            except Exception as e:
+                logger.error(f"[A+] Failed to fetch USD pairs: {e}")
+                return
+            
+            # Also get symbols from screener to ensure coverage
+            screener_symbols = self._get_scan_symbols()
+            
+            # Merge and deduplicate
+            all_symbols = list(set(all_pairs + screener_symbols))
+            
+            logger.info(f"[A+] Evaluating {len(all_symbols)} pairs for A+ scoring (Kraken: {len(all_pairs)}, Screener: {len(screener_symbols)})")
+            
+            # Filter out low-quality pairs using comprehensive filtering
+            # BUT: Calculate RVOL for ALL pairs, only filter for "top 10 obvious" selection
+            try:
+                from backend.screener.filters import filter_symbols_for_scoring
+                
+                filtered_pairs, filter_reasons = filter_symbols_for_scoring(all_symbols)
+                filtered_count = len(all_symbols) - len(filtered_pairs)
+                
+                if filtered_count > 0:
+                    # Log filter reasons breakdown
+                    reason_counts = {}
+                    for reason in filter_reasons.values():
+                        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                    
+                    reason_summary = ", ".join([f"{reason}: {count}" for reason, count in reason_counts.items()])
+                    logger.info(f"[A+] Filtered out {filtered_count} pairs for top-10 selection ({reason_summary})")
+            except ImportError as e:
+                logger.warning(f"[A+] Filtering module not available, using basic stablecoin filter: {e}")
+                # Fallback to basic stablecoin filtering
+                from backend.ingestor.symbols import is_stablecoin_pair
+                filtered_pairs = [pair for pair in all_symbols if not is_stablecoin_pair(pair)]
+                filtered_count = len(all_symbols) - len(filtered_pairs)
+                if filtered_count > 0:
+                    logger.info(f"[A+] Filtered out {filtered_count} stablecoin pairs for top-10 selection (fallback)")
+            except Exception as e:
+                logger.error(f"[A+] Error in filtering, using all symbols: {e}", exc_info=True)
+                filtered_pairs = all_symbols
+            
+            # Score ALL pairs (not just filtered) so RVOL is available for frontend
+            # Filtered pairs are only used for "top 10 obvious" selection
+            pairs_to_score = all_symbols  # Score all pairs for RVOL display
+            scored_pairs = []
+            
+            logger.info(f"[A+] Calculating RVOL and scores for {len(pairs_to_score)} pairs (filtered {len(filtered_pairs)} for top-10)")
+            
+            for symbol in pairs_to_score:
+                try:
+                    # Fetch market data
+                    market_data = fetch_market_data(symbol)
+                    
+                    # Calculate granular RVOL using pro-rata multiplier
+                    # Use fallback values from market_data if available
+                    current_1h_volume = market_data.get("current_1h_volume")
+                    current_hour_progress = market_data.get("current_hour_progress")
+                    hourly_sma_50d = market_data.get("hourly_sma_50d")
+                    
+                    # Try to preserve previous RVOL if current calculation fails (e.g., at top of hour)
+                    # Look up BEFORE calculating to ensure we have the previous value
+                    previous_rvol = None
+                    try:
+                        existing_data = self._get_aplus_score(symbol)
+                        if existing_data:
+                            previous_rvol = existing_data.get("rvol")
+                    except Exception as e:
+                        pass
+                    
+                    rvol = None
+                    
+                    if current_1h_volume is not None and current_hour_progress is not None and hourly_sma_50d is not None:
+                        if current_hour_progress > 0:
+                            rvol = calculate_granular_rvol(
+                                current_1h_volume,
+                                current_hour_progress,
+                                hourly_sma_50d,
+                            )
+                        else:
+                            # At top of hour (progress = 0), calculate simple RVOL without projection
+                            # Use current volume directly divided by SMA (assume we're at start of hour)
+                            if hourly_sma_50d > 0:
+                                rvol = current_1h_volume / hourly_sma_50d
+                            else:
+                                # Fallback to previous RVOL if SMA is invalid
+                                rvol = previous_rvol
+                    else:
+                        # Missing inputs - calculate simple RVOL if we have volume and SMA
+                        # This handles cases where progress is None but we have volume data
+                        if current_1h_volume is not None and hourly_sma_50d is not None and hourly_sma_50d > 0:
+                            rvol = current_1h_volume / hourly_sma_50d
+                        else:
+                            # Try to preserve previous RVOL - CRITICAL: Only use previous if it's not None
+                            # If previous is None, we'll store None, but the storage logic will try to preserve again
+                            if previous_rvol is not None:
+                                rvol = previous_rvol
+                            else:
+                                rvol = None
+                    
+                    # Calculate A+ score
+                    score = calculate_aplus_score(
+                        rvol=rvol,
+                        supply_ratio=market_data.get("supply_ratio"),
+                        market_cap=market_data.get("market_cap"),
+                        spread_bps=market_data.get("spread_bps"),
+                    )
+                    
+                    # Store all pairs with any data, regardless of score
+                    # Check if we have at least one piece of market data
+                    has_data = any([
+                        rvol is not None,
+                        market_data.get("market_cap") is not None,
+                        market_data.get("supply_ratio") is not None,
+                        market_data.get("spread_bps") is not None,
+                        market_data.get("change_24h_pct") is not None,
+                    ])
+                    
+                    if has_data:
+                        scored_pairs.append({
+                            "symbol": symbol,
+                            "score": score,
+                            "rvol": rvol,
+                            "market_cap": market_data.get("market_cap"),
+                            "supply_ratio": market_data.get("supply_ratio"),
+                            "spread_bps": market_data.get("spread_bps"),
+                            "change_24h_pct": market_data.get("change_24h_pct"),
+                        })
+                        
+                        # #region agent log
+                        if symbol == "MYX/USD":
+                            import time
+                            try:
+                                with open("/home/kevin/Documents/Projects/Personal/Crypto Bot Trading/.cursor/debug-d22363.log", "a") as f:
+                                    log_entry = {
+                                        "sessionId": "d22363",
+                                        "runId": "initial",
+                                        "hypothesisId": "D",
+                                        "location": "service.py:1680",
+                                        "message": "Storing MYX/USD data in scored_pairs",
+                                        "data": {
+                                            "symbol": symbol,
+                                            "market_cap": market_data.get("market_cap"),
+                                            "supply_ratio": market_data.get("supply_ratio"),
+                                            "rvol": rvol,
+                                            "score": score
+                                        },
+                                        "timestamp": int(time.time() * 1000)
+                                    }
+                                    f.write(json.dumps(log_entry) + "\n")
+                            except Exception:
+                                pass
+                        # #endregion
+                        
+                except Exception as e:
+                    logger.debug(f"[A+] Error scoring {symbol}: {e}")
+                    continue
+            
+            # Rank by score (descending)
+            scored_pairs.sort(key=lambda x: x["score"], reverse=True)
+            
+            # Store ALL pairs in Redis hash for enrichment
+            try:
+                client = get_redis_client()
+                pipe = client.pipeline()
+                
+                # Store each pair's score data in hash
+                for pair in scored_pairs:
+                    # Preserve previous RVOL if current is None (prevents flickering)
+                    # CRITICAL: Never overwrite a valid RVOL with None - always preserve previous if current is None
+                    current_rvol = pair["rvol"]
+                    if current_rvol is None:
+                        try:
+                            existing_data = self._get_aplus_score(pair["symbol"])
+                            if existing_data and existing_data.get("rvol") is not None:
+                                current_rvol = existing_data.get("rvol")
+                        except Exception as e:
+                            pass
+                    
+                    # CRITICAL FIX: Never overwrite valid RVOL with None
+                    # Final preservation attempt - if current is None, preserve from existing
+                    if current_rvol is None:
+                        try:
+                            existing_data = self._get_aplus_score(pair["symbol"])
+                            if existing_data and existing_data.get("rvol") is not None:
+                                current_rvol = existing_data.get("rvol")
+                        except Exception as e:
+                            pass
+                    
+                    # Build score_data - if RVOL is still None, fetch existing and merge to preserve RVOL
+                    if current_rvol is None:
+                        # Don't overwrite with None - fetch existing and merge, preserving RVOL
+                        try:
+                            existing_data = self._get_aplus_score(pair["symbol"])
+                            if existing_data:
+                                # Merge: use existing RVOL, update other fields
+                                score_data = {
+                                    "score": pair["score"],
+                                    "grade": score_to_grade(pair["score"]),
+                                    "rvol": existing_data.get("rvol"),  # Preserve existing RVOL
+                                    "market_cap": pair["market_cap"] if pair["market_cap"] is not None else existing_data.get("market_cap"),
+                                    "supply_ratio": pair["supply_ratio"] if pair["supply_ratio"] is not None else existing_data.get("supply_ratio"),
+                                    "spread_bps": pair["spread_bps"] if pair["spread_bps"] is not None else existing_data.get("spread_bps"),
+                                    "change_24h_pct": pair["change_24h_pct"] if pair["change_24h_pct"] is not None else existing_data.get("change_24h_pct"),
+                                }
+                            else:
+                                # No existing data - store with None (first time)
+                                score_data = {
+                                    "score": pair["score"],
+                                    "grade": score_to_grade(pair["score"]),
+                                    "rvol": None,
+                                    "market_cap": pair["market_cap"],
+                                    "supply_ratio": pair["supply_ratio"],
+                                    "spread_bps": pair["spread_bps"],
+                                    "change_24h_pct": pair["change_24h_pct"],
+                                }
+                        except Exception as e:
+                            # Fallback: store with None if merge fails
+                            score_data = {
+                                "score": pair["score"],
+                                "grade": score_to_grade(pair["score"]),
+                                "rvol": None,
+                                "market_cap": pair["market_cap"],
+                                "supply_ratio": pair["supply_ratio"],
+                                "spread_bps": pair["spread_bps"],
+                                "change_24h_pct": pair["change_24h_pct"],
+                            }
+                    else:
+                        # RVOL is valid - store normally
+                        score_data = {
+                            "score": pair["score"],
+                            "grade": score_to_grade(pair["score"]),
+                            "rvol": current_rvol,
+                            "market_cap": pair["market_cap"],
+                            "supply_ratio": pair["supply_ratio"],
+                            "spread_bps": pair["spread_bps"],
+                            "change_24h_pct": pair["change_24h_pct"],
+                        }
+                    
+                    pipe.hset(APLUS_SCORES_KEY, pair["symbol"], json.dumps(score_data))
+                    
+                    # #region agent log
+                    if pair["symbol"] == "MYX/USD":
+                        import time
+                        try:
+                            with open("/home/kevin/Documents/Projects/Personal/Crypto Bot Trading/.cursor/debug-d22363.log", "a") as f:
+                                log_entry = {
+                                    "sessionId": "d22363",
+                                    "runId": "initial",
+                                    "hypothesisId": "E",
+                                    "location": "service.py:1775",
+                                    "message": "Storing MYX/USD in Redis hash",
+                                    "data": {
+                                        "symbol": pair["symbol"],
+                                        "score_data": score_data
+                                    },
+                                    "timestamp": int(time.time() * 1000)
+                                }
+                                f.write(json.dumps(log_entry) + "\n")
+                        except Exception:
+                            pass
+                    # #endregion
+                
+                # Set TTL on hash (expires entire hash after TTL)
+                pipe.expire(APLUS_SCORES_KEY, APLUS_SCORES_TTL)
+                pipe.execute()
+                
+                logger.info(f"[A+] Stored A+ scores for {len(scored_pairs)} pairs in Redis hash")
+            except Exception as e:
+                logger.error(f"[A+] Failed to store A+ scores in Redis hash: {e}", exc_info=True)
+            
+            # Filter pairs with score > 0.85 and take top 10 (for backward compatibility)
+            top_pairs = [pair for pair in scored_pairs if pair["score"] > 0.85][:10]
+            
+            logger.info(
+                f"[A+] Scored {len(scored_pairs)} pairs, "
+                f"{len([p for p in scored_pairs if p['score'] > 0.85])} with score > 0.85, "
+                f"storing top {len(top_pairs)}"
+            )
+            
+            if top_pairs:
+                # Log top pairs
+                top_symbols = [p["symbol"] for p in top_pairs]
+                logger.info(f"[A+] Top 10 Obvious pairs: {top_symbols}")
+                
+                # Store in Redis (backward compatibility)
+                try:
+                    client = get_redis_client()
+                    client.setex(
+                        TOP_10_OBVIOUS_KEY,
+                        TOP_10_OBVIOUS_TTL,
+                        json.dumps(top_pairs),
+                    )
+                    logger.info(f"[A+] Stored top {len(top_pairs)} pairs in Redis cache")
+                except Exception as e:
+                    logger.error(f"[A+] Failed to store top pairs in Redis: {e}")
+            else:
+                logger.warning("[A+] No pairs met the score threshold (> 0.85)")
+                # Store empty list to clear cache
+                try:
+                    client = get_redis_client()
+                    client.setex(
+                        TOP_10_OBVIOUS_KEY,
+                        TOP_10_OBVIOUS_TTL,
+                        json.dumps([]),
+                    )
+                except Exception as e:
+                    logger.debug(f"[A+] Failed to clear cache: {e}")
+                    
+        except Exception as e:
+            logger.error(f"[A+] Error in A+ scoring calculation: {e}", exc_info=True)
+        finally:
+            if lock_acquired:
+                self._aplus_scoring_lock.release()
+    
+    def _get_aplus_score(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Get A+ score data for a specific symbol from Redis.
+        
+        Args:
+            symbol: Trading pair symbol (e.g., "BTC/USD")
+            
+        Returns:
+            Dictionary with score, grade, rvol, market_cap, supply_ratio, spread_bps, change_24h_pct,
+            or None if score not available
+        """
+        try:
+            client = get_redis_client()
+            score_data_json = client.hget(APLUS_SCORES_KEY, symbol)
+            
+            if not score_data_json:
+                return None
+            
+            if isinstance(score_data_json, bytes):
+                score_data_json = score_data_json.decode()
+            
+            score_data = json.loads(score_data_json)
+            return score_data
+        except Exception as e:
+            logger.debug(f"[A+] Error fetching A+ score for {symbol}: {e}")
+            return None
+    
+    def _get_signal_lead(self, symbol: str) -> Optional[str]:
+        """
+        Get the highest confidence strategy signal for a symbol (Signal Lead).
+        
+        Queries all strategy results from Redis and finds the highest confidence signal.
+        
+        Args:
+            symbol: Trading pair symbol (e.g., "BTC/USD")
+            
+        Returns:
+            String in format "{strategy_name} {confidence}%" (e.g., "VWAP 92%") or None
+        """
+        try:
+            from backend.db import get_session
+            from backend.db.models import Strategy
+            
+            # Get all enabled strategies
+            session = get_session()
+            try:
+                strategies = session.query(Strategy).filter(Strategy.status == 'active').all()
+                strategy_map = {str(s.id): s.name for s in strategies}
+            finally:
+                session.close()
+            
+            client = get_redis_client()
+            best_signal = None
+            best_confidence = 0.0
+            
+            # Check each strategy's results
+            for strategy_id, strategy_name in strategy_map.items():
+                try:
+                    key = SCREENER_STRATEGY_RESULTS_KEY.format(strategy_id=strategy_id)
+                    data = client.get(key)
+                    if not data:
+                        continue
+                    
+                    result = json.loads(data)
+                    results = result.get("results", [])
+                    
+                    # Find this symbol in the results
+                    for r in results:
+                        if r.get("symbol") == symbol:
+                            confidence = r.get("confidence", 0.0)
+                            signal_type = r.get("signal_type", "NONE")
+                            
+                            # Only consider BUY/SELL signals, not NONE
+                            if signal_type != "NONE" and confidence > best_confidence:
+                                best_confidence = confidence
+                                # Map strategy ID to readable name
+                                display_name = strategy_name.replace("_", " ").title()
+                                best_signal = f"{display_name} {int(confidence)}%"
+                            break
+                except Exception as e:
+                    logger.debug(f"Error checking strategy {strategy_id} for signal lead: {e}")
+                    continue
+            
+            return best_signal
+        except Exception as e:
+            logger.debug(f"Error getting signal lead for {symbol}: {e}")
+            return None
     
     async def _run_strategy_scans(
         self,
