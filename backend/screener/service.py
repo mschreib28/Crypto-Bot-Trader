@@ -385,16 +385,6 @@ class ScreenerService:
                     logger.info(
                         f"[FILTER] SKIP: {symbol} [whitelist_filter] - not in live universe"
                     )
-                    log_activity(
-                        activity_type="signal",
-                        message=f"SKIP: {symbol} [whitelist_filter] - not in live universe",
-                        details={
-                            "symbol": symbol,
-                            "filter": "whitelist",
-                            "strategy": strategy_id,
-                            "reason": skip_reason,
-                        },
-                    )
             
             # Filter 2: Liquidity threshold
             if not skip_reason:
@@ -405,18 +395,6 @@ class ScreenerService:
                     logger.info(
                         f"[FILTER] SKIP: {symbol} [liquidity_filter] - volume ${volume:,.0f} < threshold ${min_volume_usd:,.0f}"
                     )
-                    log_activity(
-                        activity_type="signal",
-                        message=f"SKIP: {symbol} [liquidity_filter] - volume ${volume:,.0f}",
-                        details={
-                            "symbol": symbol,
-                            "filter": "liquidity",
-                            "volume": volume,
-                            "threshold": min_volume_usd,
-                            "strategy": strategy_id,
-                            "reason": skip_reason,
-                        },
-                    )
             
             # Filter 3: Spread threshold
             if not skip_reason:
@@ -426,18 +404,6 @@ class ScreenerService:
                     skip_counts["spread"] += 1
                     logger.info(
                         f"[FILTER] SKIP: {symbol} [spread_filter] - spread {spread_bps:.1f} bps > threshold {max_spread_bps:.1f} bps"
-                    )
-                    log_activity(
-                        activity_type="signal",
-                        message=f"SKIP: {symbol} [spread_filter] - spread {spread_bps:.1f} bps",
-                        details={
-                            "symbol": symbol,
-                            "filter": "spread",
-                            "spread_bps": spread_bps,
-                            "threshold": max_spread_bps,
-                            "strategy": strategy_id,
-                            "reason": skip_reason,
-                        },
                     )
             
             if skip_reason:
@@ -1465,17 +1431,18 @@ class ScreenerService:
             )
             return results  # Return all results (including placeholders) for frontend
         
-        # Check trading status
-        trading_enabled = get_trading_enabled()
-        
+        # Execution allowed when live trading OR shadow (sim) mode is on
+        trading_enabled = get_trading_enabled() or get_shadow_live_mode()
+
         if not trading_enabled:
             logger.info(
-                f"[EVAL] Strategy {strategy_id}: Trading disabled, skipping auto-execution "
+                f"[EVAL] Strategy {strategy_id}: Execution disabled (trading and shadow both off), skipping auto-execution "
                 f"({len(buy_signals)} BUY, {len(sell_signals)} SELL actionable signals)"
             )
         else:
+            mode = "shadow" if get_shadow_live_mode() and not get_trading_enabled() else "live"
             logger.info(
-                f"[EVAL] Strategy {strategy_id}: Trading enabled, processing "
+                f"[EVAL] Strategy {strategy_id}: {mode.capitalize()} mode, processing "
                 f"{len(buy_signals)} BUY and {len(sell_signals)} SELL signals for auto-execution"
             )
         
@@ -1509,29 +1476,9 @@ class ScreenerService:
         # Debug: Log that scan is starting
         logger.info(f"[SCAN] run_scan() called at {datetime.now(timezone.utc).isoformat()}")
         
-        # #region agent log
-        import json as json_module
-        import time as time_module
-        aplus_start_time = time_module.time()
-        try:
-            with open("/tmp/debug-c433ce.log", "a") as f:
-                f.write(json_module.dumps({"sessionId":"c433ce","id":"log_aplus_start","timestamp":int(time_module.time()*1000),"location":"service.py:1492","message":"About to call _calculate_aplus_scores()","data":{"aplus_start_time":aplus_start_time},"runId":"run1","hypothesisId":"B"}) + "\n")
-        except Exception:
-            pass
-        # #endregion
-        
         # Calculate A+ scores and update top 10 obvious cache
         try:
             await self._calculate_aplus_scores()
-            
-            # #region agent log
-            aplus_end_time = time_module.time()
-            try:
-                with open("/tmp/debug-c433ce.log", "a") as f:
-                    f.write(json_module.dumps({"sessionId":"c433ce","id":"log_aplus_end","timestamp":int(time_module.time()*1000),"location":"service.py:1494","message":"_calculate_aplus_scores() completed","data":{"aplus_end_time":aplus_end_time,"aplus_duration":aplus_end_time-aplus_start_time},"runId":"run1","hypothesisId":"B"}) + "\n")
-            except Exception:
-                pass
-            # #endregion
         except Exception as e:
             logger.error(f"[SCAN] Error in A+ scoring: {e}", exc_info=True)
         
@@ -2063,47 +2010,23 @@ class ScreenerService:
         """
         try:
             from backend.db import get_session
-            from backend.db.models import Strategy
+            from backend.db.models import Strategy, get_strategy_display_name
             
-            # #region agent log
-            import json as json_module
-            log_data = {
-                "sessionId": "c433ce",
-                "location": "service.py:_get_signal_lead:entry",
-                "message": "Getting signal lead",
-                "data": {"symbol": symbol},
-                "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-                "hypothesisId": "A",
-            }
-            with open("/tmp/debug-c433ce.log", "a") as f:
-                f.write(json_module.dumps(log_data) + "\n")
-            # #endregion
-            
-            # Get all enabled strategies
+            # Get all enabled strategies (use display name for UI consistency)
             session = get_session()
             try:
                 strategies = session.query(Strategy).filter(Strategy.status == 'active').all()
-                strategy_map = {str(s.id): s.name for s in strategies}
+                strategy_map = {str(s.id): get_strategy_display_name(s) for s in strategies}
             finally:
                 session.close()
-            
-            # #region agent log
-            log_data = {
-                "sessionId": "c433ce",
-                "location": "service.py:_get_signal_lead:strategies",
-                "message": "Active strategies",
-                "data": {"symbol": symbol, "strategy_count": len(strategy_map), "strategies": list(strategy_map.values())},
-                "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-                "hypothesisId": "A",
-            }
-            with open("/tmp/debug-c433ce.log", "a") as f:
-                f.write(json_module.dumps(log_data) + "\n")
-            # #endregion
             
             client = get_redis_client()
             best_confidence = 0.0
             best_signal_type = None
             best_strategy_name = None
+            # Fallback: when no BUY/SELL, use highest-confidence NONE so UI shows strongest strategy
+            best_none_confidence = 0.0
+            best_none_strategy_name = None
             all_signals_found = []  # Debug: track all signals found
             
             # Check each strategy's results
@@ -2112,35 +2035,10 @@ class ScreenerService:
                     key = SCREENER_STRATEGY_RESULTS_KEY.format(strategy_id=strategy_id)
                     data = client.get(key)
                     if not data:
-                        # #region agent log
-                        log_data = {
-                            "sessionId": "c433ce",
-                            "location": "service.py:_get_signal_lead:no_data",
-                            "message": "No Redis data for strategy",
-                            "data": {"symbol": symbol, "strategy": strategy_name, "key": key},
-                            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-                            "hypothesisId": "B",
-                        }
-                        with open("/tmp/debug-c433ce.log", "a") as f:
-                            f.write(json_module.dumps(log_data) + "\n")
-                        # #endregion
                         continue
                     
                     result = json.loads(data)
                     results = result.get("results", [])
-                    
-                    # #region agent log
-                    log_data = {
-                        "sessionId": "c433ce",
-                        "location": "service.py:_get_signal_lead:results",
-                        "message": "Strategy results",
-                        "data": {"symbol": symbol, "strategy": strategy_name, "result_count": len(results)},
-                        "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-                        "hypothesisId": "B",
-                    }
-                    with open("/tmp/debug-c433ce.log", "a") as f:
-                        f.write(json_module.dumps(log_data) + "\n")
-                    # #endregion
                     
                     # Find this symbol in the results
                     symbol_found = False
@@ -2150,19 +2048,6 @@ class ScreenerService:
                             confidence = r.get("confidence", 0.0)
                             signal_type = r.get("signal_type", "NONE")
                             
-                            # #region agent log
-                            log_data = {
-                                "sessionId": "c433ce",
-                                "location": "service.py:_get_signal_lead:signal",
-                                "message": "Found signal",
-                                "data": {"symbol": symbol, "strategy": strategy_name, "signal_type": signal_type, "confidence": confidence},
-                                "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-                                "hypothesisId": "C",
-                            }
-                            with open("/tmp/debug-c433ce.log", "a") as f:
-                                f.write(json_module.dumps(log_data) + "\n")
-                            # #endregion
-                            
                             # Debug: track all signals
                             all_signals_found.append({
                                 "strategy": strategy_name,
@@ -2170,55 +2055,19 @@ class ScreenerService:
                                 "confidence": confidence
                             })
                             
-                            # Only consider BUY and SELL signals (exclude NONE)
-                            # Find the highest confidence signal across all strategies
+                            # Prefer BUY and SELL; fallback to highest-confidence NONE for UI display
                             if signal_type in ("BUY", "SELL") and confidence > best_confidence:
                                 best_confidence = confidence
                                 best_signal_type = signal_type
                                 best_strategy_name = strategy_name
+                            elif signal_type == "NONE" and confidence > best_none_confidence:
+                                best_none_confidence = confidence
+                                best_none_strategy_name = strategy_name
                             break
                     
-                    if not symbol_found:
-                        # #region agent log
-                        log_data = {
-                            "sessionId": "c433ce",
-                            "location": "service.py:_get_signal_lead:symbol_not_found",
-                            "message": "Symbol not in strategy results",
-                            "data": {"symbol": symbol, "strategy": strategy_name, "result_count": len(results)},
-                            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-                            "hypothesisId": "B",
-                        }
-                        with open("/tmp/debug-c433ce.log", "a") as f:
-                            f.write(json_module.dumps(log_data) + "\n")
-                        # #endregion
                 except Exception as e:
                     logger.debug(f"Error checking strategy {strategy_id} for signal lead: {e}")
-                    # #region agent log
-                    log_data = {
-                        "sessionId": "c433ce",
-                        "location": "service.py:_get_signal_lead:error",
-                        "message": "Error reading strategy",
-                        "data": {"symbol": symbol, "strategy": strategy_name, "error": str(e)},
-                        "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-                        "hypothesisId": "B",
-                    }
-                    with open("/tmp/debug-c433ce.log", "a") as f:
-                        f.write(json_module.dumps(log_data) + "\n")
-                    # #endregion
                     continue
-            
-            # #region agent log
-            log_data = {
-                "sessionId": "c433ce",
-                "location": "service.py:_get_signal_lead:final",
-                "message": "Final result",
-                "data": {"symbol": symbol, "best_confidence": best_confidence, "best_signal_type": best_signal_type, "all_signals_count": len(all_signals_found)},
-                "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-                "hypothesisId": "A",
-            }
-            with open("/tmp/debug-c433ce.log", "a") as f:
-                f.write(json_module.dumps(log_data) + "\n")
-            # #endregion
             
             # Debug logging for A+ pairs
             if symbol in ["OP/USD", "ASTER/USD", "SCRT/USD", "AZTEC/USD", "SENT/USD", "XPL/USD"]:
@@ -2230,36 +2079,43 @@ class ScreenerService:
                     for sig in all_signals_found:
                         logger.info(f"[SIGNAL_LEAD]   {sig['strategy']}: {sig['signal_type']} {sig['confidence']}%")
             
-            # Return dict with confidence, signal_type, and strategy_name, or None if no BUY/SELL signals found
+            # Return dict with confidence, signal_type, and strategy_name
+            # Prefer BUY/SELL; if none, fall back to highest-confidence NONE so UI always shows strongest strategy
             if best_signal_type is not None:
-                # Check confidence thresholds
-                # If confidence < 50%, mark as "Low Conviction"
-                if best_confidence < 50.0:
-                    return {
-                        "confidence": best_confidence,
-                        "signal_type": "NONE",
-                        "strategy_name": "Low Conviction",
-                        "meets_execution_threshold": False,
-                        "original_signal_type": best_signal_type,
-                        "original_strategy_name": best_strategy_name
-                    }
-                # If confidence >= 50% but < MIN_EXECUTION_CONFIDENCE, return signal but mark as below threshold
-                elif best_confidence < MIN_EXECUTION_CONFIDENCE:
-                    return {
-                        "confidence": best_confidence,
-                        "signal_type": best_signal_type,
-                        "strategy_name": best_strategy_name,
-                        "meets_execution_threshold": False
-                    }
-                # If confidence >= MIN_EXECUTION_CONFIDENCE, return signal normally
-                else:
-                    return {
-                        "confidence": best_confidence,
-                        "signal_type": best_signal_type,
-                        "strategy_name": best_strategy_name,
-                        "meets_execution_threshold": True
-                    }
-            return None
+                conf, sig_type, strat = best_confidence, best_signal_type, best_strategy_name
+            elif best_none_strategy_name is not None:
+                conf, sig_type, strat = best_none_confidence, "NONE", best_none_strategy_name
+            else:
+                # No strategy results for this symbol at all
+                return None
+            
+            # Build result - always use actual strategy name (never "Low Conviction" in strategy_name)
+            is_low_conviction = conf < 50.0
+            if is_low_conviction:
+                result = {
+                    "confidence": conf,
+                    "signal_type": "NONE",
+                    "strategy_name": strat,  # Actual strategy e.g. "VWAP Mean Reversion"
+                    "is_low_conviction": True,
+                    "meets_execution_threshold": False,
+                    "original_signal_type": sig_type,
+                    "original_strategy_name": strat
+                }
+            elif sig_type == "NONE" or conf < MIN_EXECUTION_CONFIDENCE:
+                result = {
+                    "confidence": conf,
+                    "signal_type": sig_type,
+                    "strategy_name": strat,
+                    "meets_execution_threshold": False
+                }
+            else:
+                result = {
+                    "confidence": conf,
+                    "signal_type": sig_type,
+                    "strategy_name": strat,
+                    "meets_execution_threshold": True
+                }
+            return result
         except Exception as e:
             logger.debug(f"Error getting signal lead for {symbol}: {e}")
             return None
@@ -2331,37 +2187,36 @@ class ScreenerService:
         except Exception as e:
             logger.warning(f"[STRATEGY_SCANS] Failed to get Top 10 Obvious from Redis: {e}, falling back to A+ pairs", exc_info=True)
         
-        # Fallback to A+ and A pairs if Top 10 Obvious unavailable or empty
-        if not top_10_symbols:
-            try:
-                aplus_scores = client.hgetall(APLUS_SCORES_KEY)
-                for symbol_bytes, score_data_json in aplus_scores.items():
-                    symbol = symbol_bytes.decode() if isinstance(symbol_bytes, bytes) else str(symbol_bytes)
-                    try:
-                        if isinstance(score_data_json, bytes):
-                            score_data_json = score_data_json.decode()
-                        score_data = json.loads(score_data_json)
-                        score = score_data.get("score")
-                        if score is not None and float(score) >= 0.70:  # A+ and A grades
-                            aplus_symbols.append(symbol)
-                    except Exception as e:
-                        logger.debug(f"Error parsing A+ score for {symbol}: {e}")
-                        continue
-                logger.info(f"[STRATEGY_SCANS] Fallback: Found {len(aplus_symbols)} A+ and A pairs (score >= 0.70)")
-                if len(aplus_symbols) > 0:
-                    logger.info(f"[STRATEGY_SCANS] A+ and A pairs: {', '.join(sorted(aplus_symbols))}")
-            except Exception as e:
-                logger.warning(f"[STRATEGY_SCANS] Failed to get A+ pairs from Redis: {e}, using ingestor symbols only", exc_info=True)
-                aplus_symbols = []
+        # Always fetch A+ and A pairs (score >= 0.70) for strategy evaluation
+        try:
+            aplus_scores = client.hgetall(APLUS_SCORES_KEY)
+            for symbol_bytes, score_data_json in aplus_scores.items():
+                symbol = symbol_bytes.decode() if isinstance(symbol_bytes, bytes) else str(symbol_bytes)
+                try:
+                    if isinstance(score_data_json, bytes):
+                        score_data_json = score_data_json.decode()
+                    score_data = json.loads(score_data_json)
+                    score = score_data.get("score")
+                    if score is not None and float(score) >= 0.70:  # A+ and A grades
+                        aplus_symbols.append(symbol)
+                except Exception as e:
+                    logger.debug(f"Error parsing A+ score for {symbol}: {e}")
+                    continue
+            logger.info(f"[STRATEGY_SCANS] Found {len(aplus_symbols)} A+ and A pairs (score >= 0.70)")
+            if len(aplus_symbols) > 0:
+                logger.info(f"[STRATEGY_SCANS] A+ and A pairs: {', '.join(sorted(aplus_symbols)[:20])}{'...' if len(aplus_symbols) > 20 else ''}")
+        except Exception as e:
+            logger.warning(f"[STRATEGY_SCANS] Failed to get A+ pairs from Redis: {e}, using Top 10 only", exc_info=True)
+            aplus_symbols = []
         
-        # Use Top 10 Obvious if available, otherwise fallback to A+ pairs
-        symbols_to_evaluate = top_10_symbols if top_10_symbols else aplus_symbols
+        # Evaluate both Top 10 Obvious and all A+ and A symbols
+        symbols_to_evaluate = list(set(top_10_symbols + aplus_symbols))
         
         # Combine with ingestor symbols and deduplicate
         ingestor_symbols = list(symbols_bars.keys())
         all_symbols = list(set(ingestor_symbols + symbols_to_evaluate))
         
-        source_name = "Top 10 Obvious" if top_10_symbols else ("A+ pairs" if aplus_symbols else "ingestor only")
+        source_name = "Top 10 + A+/A" if (top_10_symbols and aplus_symbols) else ("Top 10 Obvious" if top_10_symbols else ("A+ and A" if aplus_symbols else "ingestor only"))
         logger.info(f"[STRATEGY_SCANS] Evaluating strategies for {len(all_symbols)} total symbols ({len(ingestor_symbols)} from ingestor + {len(symbols_to_evaluate)} from {source_name})")
         logger.info(f"[STRATEGY_SCANS] All symbols to evaluate: {', '.join(sorted(all_symbols))}")
         
@@ -2523,17 +2378,6 @@ class ScreenerService:
     
     async def _run_loop(self) -> None:
         """Main scan loop."""
-        # #region agent log
-        import json as json_module
-        import time as time_module
-        loop_start_time = time_module.time()
-        try:
-            with open("/tmp/debug-c433ce.log", "a") as f:
-                f.write(json_module.dumps({"sessionId":"c433ce","id":"log_run_loop_start","timestamp":int(time_module.time()*1000),"location":"service.py:2219","message":"_run_loop() started","data":{"loop_start_time":loop_start_time},"runId":"run1","hypothesisId":"A,B"}) + "\n")
-        except Exception:
-            pass
-        # #endregion
-        
         logger.info("Screener service started")
         logger.info(f"[SCAN-LOOP] Starting scan loop (interval={self.scan_interval}s)")
         
@@ -2549,26 +2393,8 @@ class ScreenerService:
             try:
                 scan_count += 1
                 
-                # #region agent log
-                scan_start_time = time_module.time()
-                try:
-                    with open("/tmp/debug-c433ce.log", "a") as f:
-                        f.write(json_module.dumps({"sessionId":"c433ce","id":"log_run_scan_call","timestamp":int(time_module.time()*1000),"location":"service.py:2227","message":"About to call run_scan()","data":{"scan_count":scan_count,"scan_start_time":scan_start_time,"elapsed_since_loop_start":scan_start_time-loop_start_time},"runId":"run1","hypothesisId":"A,B"}) + "\n")
-                except Exception:
-                    pass
-                # #endregion
-                
                 logger.info(f"[SCAN-LOOP] Starting scan #{scan_count} at {datetime.now(timezone.utc).isoformat()}")
                 await self.run_scan()
-                
-                # #region agent log
-                scan_end_time = time_module.time()
-                try:
-                    with open("/tmp/debug-c433ce.log", "a") as f:
-                        f.write(json_module.dumps({"sessionId":"c433ce","id":"log_run_scan_complete","timestamp":int(time_module.time()*1000),"location":"service.py:2229","message":"run_scan() completed","data":{"scan_count":scan_count,"scan_end_time":scan_end_time,"scan_duration":scan_end_time-scan_start_time},"runId":"run1","hypothesisId":"A,B"}) + "\n")
-                except Exception:
-                    pass
-                # #endregion
                 
                 logger.info(f"[SCAN-LOOP] Completed scan #{scan_count}")
             except Exception as e:
