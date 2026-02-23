@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.config import ACCOUNT_EQUITY, RISK_PCT_PER_TRADE, CONFIDENCE_THRESHOLD_PCT
+from backend.config import ACCOUNT_EQUITY, RISK_PCT_PER_TRADE, CONFIDENCE_THRESHOLD_PCT, MIN_EXECUTION_CONFIDENCE
 from backend.db import get_session
 from backend.db.models import Strategy
 from backend.ingestor.config import (
@@ -1030,10 +1030,11 @@ class ScreenerService:
                 )
             return
         
+        # Check against strategy-specific threshold
         if confidence < threshold:
             # Below threshold - log rejection (INFO level - this is normal behavior)
             logger.info(
-                f"Signal rejected: {signal.symbol} confidence {confidence:.1f}% < threshold {threshold}%"
+                f"Signal rejected: {signal.symbol} confidence {confidence:.1f}% < strategy threshold {threshold}%"
             )
             # Log to activity feed for below-threshold signals (only log non-NONE signals)
             if signal_type.upper() != "NONE":
@@ -1046,7 +1047,28 @@ class ScreenerService:
                         "confidence": confidence,
                         "strategy": strategy_name,
                         "auto_execute": False,
-                        "reason": f"below_threshold ({confidence:.1f}% < {threshold}%)",
+                        "reason": f"below_strategy_threshold ({confidence:.1f}% < {threshold}%)",
+                    },
+                )
+            return
+        
+        # Additional check: Must also meet global MIN_EXECUTION_CONFIDENCE threshold
+        if confidence < MIN_EXECUTION_CONFIDENCE:
+            logger.info(
+                f"Signal rejected: {signal.symbol} confidence {confidence:.1f}% < MIN_EXECUTION_CONFIDENCE {MIN_EXECUTION_CONFIDENCE}%"
+            )
+            # Log to activity feed for below-execution-threshold signals
+            if signal_type.upper() != "NONE":
+                log_activity(
+                    activity_type="signal",
+                    message=f"{signal_type} signal for {signal.symbol} [{strategy_name}]",
+                    details={
+                        "symbol": signal.symbol,
+                        "signal_type": signal_type,
+                        "confidence": confidence,
+                        "strategy": strategy_name,
+                        "auto_execute": False,
+                        "reason": f"below_execution_threshold ({confidence:.1f}% < {MIN_EXECUTION_CONFIDENCE}%)",
                     },
                 )
             return
@@ -2026,17 +2048,18 @@ class ScreenerService:
             logger.debug(f"[A+] Error fetching A+ score for {symbol}: {e}")
             return None
     
-    def _get_signal_lead(self, symbol: str) -> Optional[str]:
+    def _get_signal_lead(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
         Get the highest confidence strategy signal for a symbol (Signal Lead).
         
         Queries all strategy results from Redis and finds the highest confidence signal.
+        Only considers BUY and SELL signals (excludes NONE).
         
         Args:
             symbol: Trading pair symbol (e.g., "BTC/USD")
             
         Returns:
-            String in format "{strategy_name} {confidence}%" (e.g., "VWAP 92%") or None
+            Dict with format {"confidence": float, "signal_type": str} (e.g., {"confidence": 92.0, "signal_type": "BUY"}) or None
         """
         try:
             from backend.db import get_session
@@ -2052,7 +2075,7 @@ class ScreenerService:
                 "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
                 "hypothesisId": "A",
             }
-            with open("/home/kevin/Documents/Projects/Personal/Crypto Bot Trading/.cursor/debug-c433ce.log", "a") as f:
+            with open("/tmp/debug-c433ce.log", "a") as f:
                 f.write(json_module.dumps(log_data) + "\n")
             # #endregion
             
@@ -2073,13 +2096,14 @@ class ScreenerService:
                 "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
                 "hypothesisId": "A",
             }
-            with open("/home/kevin/Documents/Projects/Personal/Crypto Bot Trading/.cursor/debug-c433ce.log", "a") as f:
+            with open("/tmp/debug-c433ce.log", "a") as f:
                 f.write(json_module.dumps(log_data) + "\n")
             # #endregion
             
             client = get_redis_client()
-            best_signal = None
             best_confidence = 0.0
+            best_signal_type = None
+            best_strategy_name = None
             all_signals_found = []  # Debug: track all signals found
             
             # Check each strategy's results
@@ -2097,7 +2121,7 @@ class ScreenerService:
                             "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
                             "hypothesisId": "B",
                         }
-                        with open("/home/kevin/Documents/Projects/Personal/Crypto Bot Trading/.cursor/debug-c433ce.log", "a") as f:
+                        with open("/tmp/debug-c433ce.log", "a") as f:
                             f.write(json_module.dumps(log_data) + "\n")
                         # #endregion
                         continue
@@ -2114,7 +2138,7 @@ class ScreenerService:
                         "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
                         "hypothesisId": "B",
                     }
-                    with open("/home/kevin/Documents/Projects/Personal/Crypto Bot Trading/.cursor/debug-c433ce.log", "a") as f:
+                    with open("/tmp/debug-c433ce.log", "a") as f:
                         f.write(json_module.dumps(log_data) + "\n")
                     # #endregion
                     
@@ -2135,7 +2159,7 @@ class ScreenerService:
                                 "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
                                 "hypothesisId": "C",
                             }
-                            with open("/home/kevin/Documents/Projects/Personal/Crypto Bot Trading/.cursor/debug-c433ce.log", "a") as f:
+                            with open("/tmp/debug-c433ce.log", "a") as f:
                                 f.write(json_module.dumps(log_data) + "\n")
                             # #endregion
                             
@@ -2146,22 +2170,12 @@ class ScreenerService:
                                 "confidence": confidence
                             })
                             
-                            # Consider ALL signals (BUY/SELL/NONE) and find the highest confidence
-                            # This ensures Signal Lead shows the best strategy even if signals are below threshold
-                            # IMPORTANT: Include NONE signals with confidence > 0, as they represent strategies
-                            # that evaluated the symbol but didn't meet the confidence threshold
-                            if confidence > best_confidence:
+                            # Only consider BUY and SELL signals (exclude NONE)
+                            # Find the highest confidence signal across all strategies
+                            if signal_type in ("BUY", "SELL") and confidence > best_confidence:
                                 best_confidence = confidence
-                                # Map strategy ID to readable name
-                                display_name = strategy_name.replace("_", " ").title()
-                                # Show the signal with its confidence, even if it's NONE
-                                # This gives users visibility into which strategy is most confident
-                                if signal_type == "NONE":
-                                    # NONE signal - show confidence but indicate it's below threshold
-                                    best_signal = f"{display_name} {int(confidence)}%"
-                                else:
-                                    # BUY/SELL signal - show normally
-                                    best_signal = f"{display_name} {int(confidence)}%"
+                                best_signal_type = signal_type
+                                best_strategy_name = strategy_name
                             break
                     
                     if not symbol_found:
@@ -2174,7 +2188,7 @@ class ScreenerService:
                             "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
                             "hypothesisId": "B",
                         }
-                        with open("/home/kevin/Documents/Projects/Personal/Crypto Bot Trading/.cursor/debug-c433ce.log", "a") as f:
+                        with open("/tmp/debug-c433ce.log", "a") as f:
                             f.write(json_module.dumps(log_data) + "\n")
                         # #endregion
                 except Exception as e:
@@ -2188,7 +2202,7 @@ class ScreenerService:
                         "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
                         "hypothesisId": "B",
                     }
-                    with open("/home/kevin/Documents/Projects/Personal/Crypto Bot Trading/.cursor/debug-c433ce.log", "a") as f:
+                    with open("/tmp/debug-c433ce.log", "a") as f:
                         f.write(json_module.dumps(log_data) + "\n")
                     # #endregion
                     continue
@@ -2198,24 +2212,54 @@ class ScreenerService:
                 "sessionId": "c433ce",
                 "location": "service.py:_get_signal_lead:final",
                 "message": "Final result",
-                "data": {"symbol": symbol, "best_signal": best_signal, "best_confidence": best_confidence, "all_signals_count": len(all_signals_found)},
+                "data": {"symbol": symbol, "best_confidence": best_confidence, "best_signal_type": best_signal_type, "all_signals_count": len(all_signals_found)},
                 "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
                 "hypothesisId": "A",
             }
-            with open("/home/kevin/Documents/Projects/Personal/Crypto Bot Trading/.cursor/debug-c433ce.log", "a") as f:
+            with open("/tmp/debug-c433ce.log", "a") as f:
                 f.write(json_module.dumps(log_data) + "\n")
             # #endregion
             
             # Debug logging for A+ pairs
             if symbol in ["OP/USD", "ASTER/USD", "SCRT/USD", "AZTEC/USD", "SENT/USD", "XPL/USD"]:
-                logger.info(f"[SIGNAL_LEAD] {symbol}: Found {len(all_signals_found)} strategy results, best: {best_signal} (confidence: {best_confidence})")
+                best_signal_str = f"{best_signal_type} {best_confidence}%" if best_signal_type else "None"
+                logger.info(f"[SIGNAL_LEAD] {symbol}: Found {len(all_signals_found)} strategy results, best: {best_signal_str}")
                 if len(all_signals_found) == 0:
                     logger.warning(f"[SIGNAL_LEAD] {symbol}: NO strategy results found! Checked {len(strategy_map)} strategies")
                 else:
                     for sig in all_signals_found:
                         logger.info(f"[SIGNAL_LEAD]   {sig['strategy']}: {sig['signal_type']} {sig['confidence']}%")
             
-            return best_signal
+            # Return dict with confidence, signal_type, and strategy_name, or None if no BUY/SELL signals found
+            if best_signal_type is not None:
+                # Check confidence thresholds
+                # If confidence < 50%, mark as "Low Conviction"
+                if best_confidence < 50.0:
+                    return {
+                        "confidence": best_confidence,
+                        "signal_type": "NONE",
+                        "strategy_name": "Low Conviction",
+                        "meets_execution_threshold": False,
+                        "original_signal_type": best_signal_type,
+                        "original_strategy_name": best_strategy_name
+                    }
+                # If confidence >= 50% but < MIN_EXECUTION_CONFIDENCE, return signal but mark as below threshold
+                elif best_confidence < MIN_EXECUTION_CONFIDENCE:
+                    return {
+                        "confidence": best_confidence,
+                        "signal_type": best_signal_type,
+                        "strategy_name": best_strategy_name,
+                        "meets_execution_threshold": False
+                    }
+                # If confidence >= MIN_EXECUTION_CONFIDENCE, return signal normally
+                else:
+                    return {
+                        "confidence": best_confidence,
+                        "signal_type": best_signal_type,
+                        "strategy_name": best_strategy_name,
+                        "meets_execution_threshold": True
+                    }
+            return None
         except Exception as e:
             logger.debug(f"Error getting signal lead for {symbol}: {e}")
             return None
@@ -2264,35 +2308,61 @@ class ScreenerService:
         from research.strategies.macd.strategy import MACDStrategy
         from research.strategies.macd.config import MACDConfig
         
-        # Get symbols to scan: include all A+ and A pairs (score >= 0.70) in addition to ingestor symbols
-        # This ensures strategies are evaluated for all pairs shown in the unified screener
+        # Get symbols to scan: prioritize Top 10 Obvious pairs (optimization - reduces CPU usage)
+        # Fallback to A+ and A pairs if Top 10 Obvious unavailable
         client = get_redis_client()
-        aplus_symbols = []
-        try:
-            aplus_scores = client.hgetall(APLUS_SCORES_KEY)
-            for symbol_bytes, score_data_json in aplus_scores.items():
-                symbol = symbol_bytes.decode() if isinstance(symbol_bytes, bytes) else str(symbol_bytes)
-                try:
-                    if isinstance(score_data_json, bytes):
-                        score_data_json = score_data_json.decode()
-                    score_data = json.loads(score_data_json)
-                    score = score_data.get("score")
-                    if score is not None and float(score) >= 0.70:  # A+ and A grades
-                        aplus_symbols.append(symbol)
-                except Exception as e:
-                    logger.debug(f"Error parsing A+ score for {symbol}: {e}")
-                    continue
-            logger.info(f"[STRATEGY_SCANS] Found {len(aplus_symbols)} A+ and A pairs (score >= 0.70)")
-            if len(aplus_symbols) > 0:
-                logger.info(f"[STRATEGY_SCANS] A+ and A pairs: {', '.join(sorted(aplus_symbols))}")
-        except Exception as e:
-            logger.warning(f"[STRATEGY_SCANS] Failed to get A+ pairs from Redis: {e}, using ingestor symbols only", exc_info=True)
-            aplus_symbols = []
+        top_10_symbols = []
+        aplus_symbols = []  # Fallback list
         
-        # Combine ingestor symbols with A+ and A pairs, deduplicate
+        # Try to get Top 10 Obvious pairs first
+        try:
+            top_10_data = client.get(TOP_10_OBVIOUS_KEY)
+            if top_10_data:
+                if isinstance(top_10_data, bytes):
+                    top_10_data = top_10_data.decode()
+                top_10_list = json.loads(top_10_data)
+                if isinstance(top_10_list, list):
+                    top_10_symbols = [item.get('symbol') for item in top_10_list if item.get('symbol')]
+                    logger.info(f"[STRATEGY_SCANS] Found {len(top_10_symbols)} Top 10 Obvious pairs")
+                    if len(top_10_symbols) > 0:
+                        logger.info(f"[STRATEGY_SCANS] Top 10 Obvious pairs: {', '.join(sorted(top_10_symbols))}")
+                else:
+                    logger.warning(f"[STRATEGY_SCANS] Top 10 Obvious data is not a list: {type(top_10_list)}")
+        except Exception as e:
+            logger.warning(f"[STRATEGY_SCANS] Failed to get Top 10 Obvious from Redis: {e}, falling back to A+ pairs", exc_info=True)
+        
+        # Fallback to A+ and A pairs if Top 10 Obvious unavailable or empty
+        if not top_10_symbols:
+            try:
+                aplus_scores = client.hgetall(APLUS_SCORES_KEY)
+                for symbol_bytes, score_data_json in aplus_scores.items():
+                    symbol = symbol_bytes.decode() if isinstance(symbol_bytes, bytes) else str(symbol_bytes)
+                    try:
+                        if isinstance(score_data_json, bytes):
+                            score_data_json = score_data_json.decode()
+                        score_data = json.loads(score_data_json)
+                        score = score_data.get("score")
+                        if score is not None and float(score) >= 0.70:  # A+ and A grades
+                            aplus_symbols.append(symbol)
+                    except Exception as e:
+                        logger.debug(f"Error parsing A+ score for {symbol}: {e}")
+                        continue
+                logger.info(f"[STRATEGY_SCANS] Fallback: Found {len(aplus_symbols)} A+ and A pairs (score >= 0.70)")
+                if len(aplus_symbols) > 0:
+                    logger.info(f"[STRATEGY_SCANS] A+ and A pairs: {', '.join(sorted(aplus_symbols))}")
+            except Exception as e:
+                logger.warning(f"[STRATEGY_SCANS] Failed to get A+ pairs from Redis: {e}, using ingestor symbols only", exc_info=True)
+                aplus_symbols = []
+        
+        # Use Top 10 Obvious if available, otherwise fallback to A+ pairs
+        symbols_to_evaluate = top_10_symbols if top_10_symbols else aplus_symbols
+        
+        # Combine with ingestor symbols and deduplicate
         ingestor_symbols = list(symbols_bars.keys())
-        all_symbols = list(set(ingestor_symbols + aplus_symbols))
-        logger.info(f"[STRATEGY_SCANS] Evaluating strategies for {len(all_symbols)} total symbols ({len(ingestor_symbols)} from ingestor + {len(aplus_symbols)} A+/A pairs)")
+        all_symbols = list(set(ingestor_symbols + symbols_to_evaluate))
+        
+        source_name = "Top 10 Obvious" if top_10_symbols else ("A+ pairs" if aplus_symbols else "ingestor only")
+        logger.info(f"[STRATEGY_SCANS] Evaluating strategies for {len(all_symbols)} total symbols ({len(ingestor_symbols)} from ingestor + {len(symbols_to_evaluate)} from {source_name})")
         logger.info(f"[STRATEGY_SCANS] All symbols to evaluate: {', '.join(sorted(all_symbols))}")
         
         for db_strategy in db_strategies:
@@ -2385,10 +2455,10 @@ class ScreenerService:
                     confidence_buy = clamp_threshold(confidence_buy, "confidence_buy")
                     confidence_sell = clamp_threshold(confidence_sell, "confidence_sell")
                     
-                    # For A+ and A pairs, skip liquidity filter since they're already scored and shown in unified screener
-                    # Only apply filters to ingestor symbols that aren't A+ or A
-                    ingestor_only_symbols = [s for s in all_symbols if s not in aplus_symbols]
-                    aplus_only_symbols = [s for s in all_symbols if s in aplus_symbols]
+                    # For Top 10 Obvious / A+ pairs, skip liquidity filter since they're already scored and shown in unified screener
+                    # Only apply filters to ingestor symbols that aren't in the evaluated symbol list
+                    ingestor_only_symbols = [s for s in all_symbols if s not in symbols_to_evaluate]
+                    evaluated_only_symbols = [s for s in all_symbols if s in symbols_to_evaluate]
                     
                     # Apply filters only to non-A+ symbols
                     if ingestor_only_symbols:
@@ -2398,33 +2468,33 @@ class ScreenerService:
                     else:
                         filtered_ingestor, skip_reasons_ingestor = [], {}
                     
-                    # A+ and A pairs bypass liquidity filter (they're already scored)
+                    # Top 10 Obvious / A+ pairs bypass liquidity filter (they're already scored)
                     # Only apply whitelist filter if in shadow mode
-                    filtered_aplus = []
-                    skip_reasons_aplus = {}
-                    if aplus_only_symbols:
+                    filtered_evaluated = []
+                    skip_reasons_evaluated = {}
+                    if evaluated_only_symbols:
                         try:
                             shadow_mode = get_shadow_live_mode()
                             enforce_whitelist = get_enforce_whitelist_in_shadow()
                             if shadow_mode and enforce_whitelist:
                                 from backend.ingestor.symbols import is_in_live_universe
-                                for symbol in aplus_only_symbols:
+                                for symbol in evaluated_only_symbols:
                                     if is_in_live_universe(symbol):
-                                        filtered_aplus.append(symbol)
+                                        filtered_evaluated.append(symbol)
                                     else:
-                                        skip_reasons_aplus[symbol] = "not in whitelist"
+                                        skip_reasons_evaluated[symbol] = "not in whitelist"
                             else:
-                                filtered_aplus = aplus_only_symbols
+                                filtered_evaluated = evaluated_only_symbols
                         except Exception as e:
-                            logger.debug(f"Error filtering A+ pairs: {e}")
-                            filtered_aplus = aplus_only_symbols
+                            logger.debug(f"Error filtering evaluated pairs: {e}")
+                            filtered_evaluated = evaluated_only_symbols
                     
                     # Combine filtered symbols
-                    filtered_symbols = filtered_ingestor + filtered_aplus
-                    skip_reasons = {**skip_reasons_ingestor, **skip_reasons_aplus}
+                    filtered_symbols = filtered_ingestor + filtered_evaluated
+                    skip_reasons = {**skip_reasons_ingestor, **skip_reasons_evaluated}
                     
-                    if aplus_only_symbols:
-                        logger.info(f"[STRATEGY_SCANS] A+ and A pairs ({len(filtered_aplus)}/{len(aplus_only_symbols)}) bypass liquidity filter for strategy evaluation")
+                    if evaluated_only_symbols:
+                        logger.info(f"[STRATEGY_SCANS] Top 10 Obvious / A+ pairs ({len(filtered_evaluated)}/{len(evaluated_only_symbols)}) bypass liquidity filter for strategy evaluation")
                     
                     # Fetch bars at strategy's configured interval (only for filtered symbols)
                     strategy_symbols_bars = {}
