@@ -1,0 +1,96 @@
+# Experiment Queue
+# 
+# Define experiments here. The runner picks them up automatically.
+# Already-completed experiments (those with a results/{id}.json file)
+# are skipped on re-run.
+
+baseline:
+  description: "Current production config (no overrides)"
+  strategy: vwap_meanrev
+  days: 1826
+  interval: 4h
+  config_overrides: {}
+
+experiments:
+  # --- VOLUME FILTER EXPLORATION ---
+  - id: exp_001_volume_12
+    description: "Reversal candle volume >= 1.2x SMA"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 4h
+    config_overrides:
+      long_min_volume_ratio: 1.2
+
+  - id: exp_002_volume_15
+    description: "Reversal candle volume >= 1.5x SMA"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 4h
+    config_overrides:
+      long_min_volume_ratio: 1.5
+
+  - id: exp_003_volume_20
+    description: "Reversal candle volume >= 2.0x SMA"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 4h
+    config_overrides:
+      long_min_volume_ratio: 2.0
+
+  - id: exp_004_htf_rsi_40
+    description: "Require HTF RSI <= 40 for long entry"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 4h
+    config_overrides:
+      htf_rsi_long_max: 40
+
+  - id: exp_005_htf_rsi_35
+    description: "Require HTF RSI <= 35 (stricter)"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 4h
+    config_overrides:
+      htf_rsi_long_max: 35
+
+  - id: exp_006_breakeven_requires_tp1
+    description: "Breakeven only activates after TP1 hits (Ross Cameron pattern)"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 4h
+    config_overrides:
+      breakeven_requires_tp1: true
+
+  - id: exp_007_volume_15_htf_40
+    description: "Combine volume 1.5x + HTF RSI 40"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 4h
+    config_overrides:
+      long_min_volume_ratio: 1.5
+      htf_rsi_long_max: 40
+
+  - id: exp_008_volume_15_breakeven_tp1
+    description: "Combine volume 1.5x + breakeven_requires_tp1"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 4h
+    config_overrides:
+      long_min_volume_ratio: 1.5
+      breakeven_requires_tp1: true
+
+  - id: exp_009_atr_stop_2
+    description: "Wider stop (2.0 ATR)"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 4h
+    config_overrides:
+      atr_stop_mult: 2.0
+
+  - id: exp_010_atr_stop_1
+    description: "Tighter stop (1.0 ATR)"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 4h
+    config_overrides:
+      atr_stop_mult: 1.0
