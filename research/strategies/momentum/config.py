@@ -57,8 +57,15 @@ class MomentumConfig:
     symbol: str = "BTC/USD"
     
     # Bar interval for analysis (recommended: 4h or 1d for A+ setups)
-    interval: str = "5m"
+    interval: str = "4h"
     
+    # Stop-loss parameters
+    atr_stop_mult: float = 2.0  # Stop distance = ATR * this multiplier (wider stops for trend following)
+    atr_period: int = 14  # ATR calculation period
+    
+    # Direction constraint
+    long_only: bool = True  # Permanently disable short signals; bot is long-only by design
+
     # Strategy identifier
     strategy_id: str = "trend_following"
 
@@ -85,6 +92,8 @@ def get_config_schema() -> Dict[str, Any]:
             "volume_threshold": defaults.volume_threshold,
             "notional_risk_pct": defaults.notional_risk_pct,
             "interval": defaults.interval,
+            "atr_stop_mult": defaults.atr_stop_mult,
+            "atr_period": defaults.atr_period,
         },
         "filters": {
             "min_volume_24h": 1000000,

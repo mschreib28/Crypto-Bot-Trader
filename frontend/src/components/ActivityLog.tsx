@@ -7,7 +7,7 @@ import { useTrading } from '../hooks/useTrading';
 const formatTime = (iso: string): string =>
   new Date(iso).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
 
-const TRUNCATE_THRESHOLD = 50;
+const TRUNCATE_THRESHOLD = 80;
 
 // UUID pattern: 8-4-4-4-12 hex characters (full or partial with '...')
 const UUID_PATTERN = /\b([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b|\b([a-f0-9]{8}-\.{3})\b/gi;
@@ -97,6 +97,7 @@ export function ActivityLog() {
       'SETUP_DETECTED',
       'EXECUTION_ALLOWED',
       'EXIT_FORCED',
+      'TRADE_PLACED',
     ];
     
     if (shadowTypes.includes(type)) {
@@ -104,6 +105,35 @@ export function ActivityLog() {
     }
     
     return message;
+  };
+
+  const handleExportAll = async () => {
+    try {
+      const res = await fetch('/api/v1/events/export?limit=0');
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      const cd = res.headers.get('Content-Disposition');
+      let name = 'events_export.json';
+      if (cd) {
+        const m = cd.match(/filename="([^"]+)"/i);
+        if (m?.[1]) name = m[1];
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error('[ActivityLog] Export failed:', e);
+      alert(e instanceof Error ? e.message : 'Export failed');
+    }
   };
 
   const handleClear = async () => {
@@ -152,13 +182,24 @@ export function ActivityLog() {
           Activity Log
         </h2>
         {activities.length > 0 && (
-          <button
-            onClick={handleClear}
-            className="text-xs text-gray-400 hover:text-red-400 transition-colors"
-            title="Clear all activity"
-          >
-            Clear
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void handleExportAll()}
+              className="text-xs text-gray-400 hover:text-sky-400 transition-colors"
+              title="Download full events log as JSON"
+            >
+              Export All
+            </button>
+            <button
+              type="button"
+              onClick={handleClear}
+              className="text-xs text-gray-400 hover:text-red-400 transition-colors"
+              title="Clear all activity"
+            >
+              Clear
+            </button>
+          </div>
         )}
       </div>
 
@@ -182,7 +223,12 @@ export function ActivityLog() {
         <ul ref={listRef} className="overflow-y-auto flex-1 min-h-0 text-xs pr-1">
           {reversedActivities.map((activity, idx) => {
             const itemId = `${activity.timestamp}-${idx}`;
-            const rawMessage = replaceUuidsWithNames(activity.message, strategyMap);
+            let rawMessage = replaceUuidsWithNames(activity.message, strategyMap);
+            // Prepend reason from details when present (for signal rejections)
+            const reason = (activity.details as Record<string, unknown> | null)?.reason as string | undefined;
+            if (reason && activity.type === 'signal' && !rawMessage.startsWith('[')) {
+              rawMessage = `[${reason}] ${rawMessage}`;
+            }
             const displayMessage = formatActivityMessage(activity.type, rawMessage);
             const truncated = isTruncated(displayMessage);
             const isExpanded = expandedIds.has(itemId);

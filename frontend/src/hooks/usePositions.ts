@@ -13,7 +13,7 @@ interface UsePositionsReturn {
 
 // UI refresh interval: 10 seconds for near-real-time position/PnL updates
 // Matches backend POSITION_SYNC_INTERVAL_SECONDS and POSITION_MONITOR_INTERVAL_SECONDS
-const REFRESH_INTERVAL_MS = 10000;
+const REFRESH_INTERVAL_MS = 5000;
 
 /** Returns the value if it's a valid finite number, otherwise returns the fallback */
 function sanitizeNumber(value: unknown, fallback: number): number {
@@ -52,6 +52,7 @@ export function usePositions(): UsePositionsReturn {
       const sanitizedPositions = Array.isArray(data.positions)
         ? data.positions.map(sanitizePosition)
         : [];
+      
       setPositions(sanitizedPositions);
       setTotalBudget(sanitizeNumber(data.total_budget, 0));
       setBudgetUsed(sanitizeNumber(data.budget_used, 0));
@@ -59,6 +60,7 @@ export function usePositions(): UsePositionsReturn {
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to fetch positions';
       setError(message);
+      console.error('[Shadow Positions] Fetch error:', err);
     } finally {
       setLoading(false);
     }

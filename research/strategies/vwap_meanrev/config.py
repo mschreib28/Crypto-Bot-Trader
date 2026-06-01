@@ -1,6 +1,6 @@
 """Configuration for VWAP Mean Reversion Strategy."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -12,10 +12,12 @@ class VWAPMeanReversionConfig:
     symbol: str = "BTC/USD"
     interval: str = "15m"  # Entry timeframe
     htf_interval: str = "1h"  # Higher timeframe for regime filter
-    notional_risk_pct: float = 1.0  # Risk per trade
+    notional_risk_pct: float = 2.0  # Risk per trade (standardized to 2.0% for consistency with other strategies)
     
-    # Deviation parameters
-    dev_threshold_ATR: float = 0.5  # Price must deviate by this * ATR from VWAP
+    # Deviation parameters (Ross Cameron spec: Price > 2% below VWAP)
+    dev_threshold_pct: float = 2.0  # Price must deviate by this % from VWAP (Ross Cameron spec: >2%)
+    dev_threshold_ATR: float = 0.5  # Legacy ATR-based threshold (kept for backward compatibility)
+    use_percentage_deviation: bool = True  # Use percentage-based deviation instead of ATR-based
     rsi_oversold: float = 30.0  # RSI threshold for oversold (long entry)
     rsi_overbought: float = 70.0  # RSI threshold for overbought (short entry)
     
@@ -24,18 +26,23 @@ class VWAPMeanReversionConfig:
     swing_lookback_bars: int = 5  # Bars to look back for swing low/high
     stop_buffer_ATR: float = 0.15  # Buffer below swing low (in ATR units)
     
-    # Take-profit parameters
-    tp1_R: float = 1.2  # First target in R-multiples
-    tp2_R: float = 2.5  # Second target in R-multiples
+    # Take-profit parameters (Ross Cameron spec: 1:2 R/R = 1.5% stop, 3.0% take profit = 2.0 R)
+    tp1_R: float = 1.0  # First target in R-multiples (1.5% if stop is 1.5%)
+    tp2_R: float = 2.0  # Second target in R-multiples (3.0% if stop is 1.5%)
     tp1_partial_pct: float = 0.6  # Take 60% at TP1, move stop to breakeven
     
-    # Time management
-    max_bars_in_trade: int = 12  # Exit if TP1 not reached within this many bars
+    # Time management: Allow up to 6 candles (1.5h at 15m) for TP1/TP2 to be reached
+    max_bars_in_trade: int = 6  # Exit after 1.5 hours (6 bars × 15m) — must cover fees before exit
     
     # Volume filter
     volume_filter_mode: str = "conservative"  # 'conservative' or 'aggressive'
     volume_max_mult: float = 1.5  # Max volume relative to SMA (conservative)
     volume_breakout_mult: float = 2.0  # Allow higher volume if reversal confirmed (aggressive)
+    # When set (e.g. 2.0), long entries require volume >= this × volume SMA on the signal bar.
+    # If set with long_only=True, conservative volume_max_mult is not applied (spike confirmation).
+    long_min_volume_ratio: Optional[float] = 1.5
+    # When set (e.g. 40.0), long entries require latest HTF (htf_interval) RSI <= this (uses rsi_period).
+    htf_rsi_long_max: Optional[float] = None
     
     # Regime filter (HTF)
     regime_slope_threshold: float = 0.001  # EMA slope threshold (0.1% per bar)
@@ -74,3 +81,10 @@ class VWAPMeanReversionConfig:
     vwap_slope_threshold: float = 0.0005  # VWAP slope threshold (0.05% per bar)
     vwap_slope_confirmation_bars: int = 2  # Require N confirmation candles if slope is strong
     vwap_slope_guard_enabled: bool = True
+
+    # Direction constraint
+    long_only: bool = True  # Permanently disable short signals; bot is long-only by design
+
+    # Monitor-level config (read by position monitor, not used by strategy logic)
+    max_hold_candles: Optional[int] = None  # Overrides monitor default when set in DB config
+    invalidation_vwap_atr_mult: Optional[float] = None  # Overrides monitor default when set in DB config

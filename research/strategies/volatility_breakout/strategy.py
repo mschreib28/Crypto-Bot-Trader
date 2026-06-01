@@ -10,11 +10,12 @@ Strategy 2: Volatility Contraction → Expansion
 import logging
 from collections import deque
 from datetime import datetime, timezone
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from research.strategies.base import BaseStrategy
 from research.strategies.indicators import (
     calculate_atr,
+    calculate_ema,
     calculate_bb_width,
     calculate_bollinger_bands,
     calculate_volume_ratio,
@@ -24,6 +25,22 @@ from research.strategies.types import MarketDataEvent, SignalResult, TradeIntent
 from research.strategies.volatility_breakout.config import VolatilityBreakoutConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _btc_bull_market_ok(config: VolatilityBreakoutConfig) -> bool:
+    """True if filter off, or BTC daily close >= EMA(btc_ema_period) with sufficient data."""
+    if not config.require_btc_bull_market:
+        return True
+    from backend.screener.pipeline import fetch_btc_daily_closes
+
+    n = max(config.btc_ema_period + 10, 210)
+    closes = fetch_btc_daily_closes(limit=n)
+    if not closes or len(closes) < config.btc_ema_period:
+        return False
+    ema_val = calculate_ema(closes, config.btc_ema_period)
+    if ema_val is None:
+        return False
+    return closes[-1] >= ema_val
 
 
 class VolatilityBreakoutStrategy(BaseStrategy):
@@ -159,6 +176,44 @@ class VolatilityBreakoutStrategy(BaseStrategy):
         
         return (False, current_bb_width, percentile_rank)
     
+    def _check_pillar_filters(self, symbol: str) -> Tuple[bool, Optional[str]]:
+        """
+        Check Ross Cameron pillar filters: RVOL > 2.0 AND Spread < 0.1%.
+        
+        Args:
+            symbol: Trading pair symbol
+            
+        Returns:
+            Tuple of (passes_filters, reason_if_failed)
+        """
+        try:
+            from backend.ingestor.symbols import get_symbol_spread
+            from backend.screener.engine import _calculate_rvol
+            from backend.ingestor.symbols import get_symbol_volume
+            
+            # Check RVOL > 2.0
+            volume_24h = get_symbol_volume(symbol)
+            if volume_24h is None:
+                return (False, "RVOL data unavailable")
+            
+            # Calculate RVOL from recent bars (need to fetch bars for calculation)
+            # For now, use a simplified check - RVOL should be stored in Redis by screener
+            # We'll check RVOL in the main signal generation where we have bars
+            
+            # Check Spread < 0.1% (10 bps)
+            spread_bps = get_symbol_spread(symbol)
+            if spread_bps is None:
+                return (False, "Spread data unavailable")
+            
+            max_spread_bps = 10.0  # 0.1% = 10 bps
+            if spread_bps > max_spread_bps:
+                return (False, f"Spread {spread_bps:.1f} bps > {max_spread_bps} bps")
+            
+            return (True, None)
+        except Exception as e:
+            logger.warning(f"Failed to check pillar filters for {symbol}: {e}")
+            return (False, f"Filter check error: {e}")
+    
     def _detect_breakout(
         self,
         bar: MarketDataEvent,
@@ -166,43 +221,51 @@ class VolatilityBreakoutStrategy(BaseStrategy):
         bb: Dict[str, float]
     ) -> Tuple[bool, str]:
         """
-        Detect breakout above upper BB or below lower BB.
+        Detect breakout above High of Day (HOD) or previous 15m high (Ross Cameron spec).
+        
+        Changed from BB breakouts to HOD/15m high breaks.
         
         Returns:
             Tuple of (is_breakout, direction) where direction is 'long' or 'short'
         """
         closes = [b.close for b in bars]
+        highs = [b.high for b in bars]
         volumes = [b.volume for b in bars]
         
-        # Calculate volume SMA
-        volume_sma = sum(volumes[-self.config.volume_sma_period:]) / self.config.volume_sma_period
+        # Ross Cameron spec: Volume on breakout candle > 150% of 5-period average
+        volume_period = 5  # Use 5-period average (not volume_sma_period which may be different)
+        if len(volumes) < volume_period:
+            return (False, 'none')
+        
+        volume_sma = sum(volumes[-volume_period:]) / volume_period
         current_volume = bar.volume
         volume_ratio = current_volume / volume_sma if volume_sma > 0 else 1.0
         
-        # Check body strength
-        body_size = abs(bar.close - bar.open)
-        candle_range = bar.high - bar.low
-        body_pct = body_size / candle_range if candle_range > 0 else 0
+        # Ross Cameron spec: Volume > 150% of 5-period average
+        if volume_ratio < 1.5:
+            return (False, 'none')
         
-        # Check close position
-        close_position = (bar.close - bar.low) / candle_range if candle_range > 0 else 0.5
+        # Calculate High of Day (HOD) from all bars
+        hod = max(highs) if highs else bar.high
         
-        # LONG breakout: closes above upper BB with volume spike
-        if (
-            bar.close > bb['upper'] and
-            volume_ratio >= self.config.vol_breakout_mult and
-            body_pct >= self.config.breakout_body_pct and
-            close_position >= self.config.breakout_close_position
-        ):
+        # Calculate previous 15m high (if we have enough bars)
+        # Assuming bars are 15m intervals, get high from previous bar
+        prev_15m_high = highs[-2] if len(highs) >= 2 else bar.high
+        
+        # Breakout level is max of HOD and previous 15m high
+        breakout_level = max(hod, prev_15m_high)
+        
+        # LONG breakout: Price breaks HOD or previous 15m high
+        if bar.close > breakout_level:
             return (True, 'long')
         
-        # SHORT breakout: closes below lower BB with volume spike
-        if (
-            bar.close < bb['lower'] and
-            volume_ratio >= self.config.vol_breakout_mult and
-            body_pct >= self.config.breakout_body_pct and
-            close_position <= (1.0 - self.config.breakout_close_position)
-        ):
+        # SHORT breakout: Price breaks Low of Day (LOD) or previous 15m low
+        lows = [b.low for b in bars]
+        lod = min(lows) if lows else bar.low
+        prev_15m_low = lows[-2] if len(lows) >= 2 else bar.low
+        breakdown_level = min(lod, prev_15m_low)
+        
+        if bar.close < breakdown_level:
             return (True, 'short')
         
         return (False, 'none')
@@ -367,7 +430,34 @@ class VolatilityBreakoutStrategy(BaseStrategy):
         # Check for compression
         is_compressed, bb_width, bb_percentile = self._detect_compression(bars_list)
         
-        # Check for breakout
+        # Ross Cameron spec: Check pillar filters (RVOL > 2.0 AND Spread < 0.1%)
+        pillar_passes, pillar_reason = self._check_pillar_filters(bar.symbol)
+        if not pillar_passes:
+            logger.debug(f"Breakout blocked by pillar filters: {pillar_reason}")
+            return None
+        
+        # Check RVOL > 2.0 from bars (more accurate than Redis check)
+        volume_24h = None
+        try:
+            from backend.ingestor.symbols import get_symbol_volume
+            volume_24h = get_symbol_volume(bar.symbol)
+        except Exception as e:
+            logger.warning(f"Failed to get volume_24h for RVOL check: {e}")
+        
+        if volume_24h is not None:
+            # Calculate RVOL from bars
+            from backend.screener.engine import _calculate_rvol
+            rvol_data = _calculate_rvol(
+                [{"volume": b.volume, "interval": bar.interval} for b in bars_list],
+                volume_24h
+            )
+            rvol_pct = rvol_data.get("rvol_pct")
+            
+            if rvol_pct is not None and rvol_pct < 200.0:  # RVOL > 2.0 means > 200%
+                logger.debug(f"Breakout blocked: RVOL {rvol_pct:.1f}% < 200% (2.0x)")
+                return None
+        
+        # Check for breakout (HOD/15m high break, not BB break)
         is_breakout, direction = self._detect_breakout(bar, bars_list, bb)
         
         # If compression detected, wait for breakout
@@ -378,14 +468,27 @@ class VolatilityBreakoutStrategy(BaseStrategy):
         
         # If breakout detected, record it in Redis and wait for retest
         if is_breakout and direction != 'none':
+            # Calculate breakout level (HOD or previous 15m high for long, LOD or previous 15m low for short)
+            highs = [b.high for b in bars_list]
+            lows = [b.low for b in bars_list]
+            hod = max(highs) if highs else bar.high
+            lod = min(lows) if lows else bar.low
+            prev_15m_high = highs[-2] if len(highs) >= 2 else bar.high
+            prev_15m_low = lows[-2] if len(lows) >= 2 else bar.low
+            
+            if direction == 'long':
+                breakout_level = max(hod, prev_15m_high)
+            else:
+                breakout_level = min(lod, prev_15m_low)
+            
             logger.info(
                 f"Breakout detected: {direction.upper()} at {bar.close:.2f}, "
-                f"upper_bb={bb['upper']:.2f}, lower_bb={bb['lower']:.2f}"
+                f"breakout_level={breakout_level:.2f} (HOD={hod:.2f}, prev_15m={'high' if direction == 'long' else 'low'}={prev_15m_high if direction == 'long' else prev_15m_low:.2f})"
             )
             breakout_state = {
                 'bar_index': len(bars_list) - 1,
                 'breakout_timestamp': bar.timestamp,  # Store timestamp for restart recovery
-                'breakout_level': bb['upper'] if direction == 'long' else bb['lower'],
+                'breakout_level': breakout_level,  # HOD/15m high instead of BB level
                 'breakout_price': bar.close,
                 'direction': direction,
                 'symbol': bar.symbol,
@@ -412,7 +515,15 @@ class VolatilityBreakoutStrategy(BaseStrategy):
                 logger.info(
                     f"Retest confirmed: {breakout_direction.upper()} entry at {bar.close:.2f}"
                 )
-                
+
+                if breakout_direction == "long" and self.config.require_btc_bull_market:
+                    if not _btc_bull_market_ok(self.config):
+                        logger.debug(
+                            "Breakout blocked: BTC below daily EMA or insufficient BTC daily data"
+                        )
+                        self._clear_breakout_state(bar.symbol)
+                        return None
+
                 # Calculate ATR for stops/targets
                 atr = calculate_atr(highs, lows, closes, period=self.config.atr_period)
                 if atr is None or atr == 0:
@@ -571,13 +682,18 @@ class VolatilityBreakoutStrategy(BaseStrategy):
                 breakout_score = 40.0
                 confidence += breakout_score
                 signal_type = "BUY" if direction == 'long' else "SELL"
-            
+
             # Volume confirmation
             volume_sma = sum(volumes[-self.config.volume_sma_period:]) / self.config.volume_sma_period
             volume_ratio = volumes[-1] / volume_sma if volume_sma > 0 else 1.0
             if volume_ratio >= self.config.vol_breakout_mult:
                 confidence += 20.0
-            
+
+            if signal_type == "BUY" and self.config.require_btc_bull_market:
+                if not _btc_bull_market_ok(self.config):
+                    signal_type = "NONE"
+                    confidence = 0.0
+
             return SignalResult(
                 symbol=symbol,
                 signal_type=signal_type,

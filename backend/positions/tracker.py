@@ -1,6 +1,7 @@
 """Position tracking service."""
 
 import logging
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -8,7 +9,18 @@ from typing import Optional
 # from backend.execution.kraken_rest import KrakenClient
 from backend.positions.models import Position
 from backend.redis import get_redis_client
-from backend.redis.keys import POSITION_KEY
+from backend.redis.keys import (
+    POSITION_KEY,
+    POSITION_STATUS_KEY,
+    POSITION_COOLDOWN_KEY,
+    POSITION_PENDING_ORDER_KEY,
+    POSITION_EXIT_REASON_KEY,
+    POSITION_EXIT_ATTEMPT_KEY,
+    POSITION_EXIT_FAIL_COUNT_KEY,
+    POSITION_TP1_PRICE_KEY,
+    POSITION_TP1_HIT_KEY,
+)
+from backend.positions.quantity import floor_qty_8dp, is_valid_position_quantity
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +70,13 @@ class PositionTracker:
         """Get Redis key for a symbol's position."""
         return POSITION_KEY.format(symbol=symbol)
     
-    def record_fill(self, fill, strategy_id: Optional[str] = None) -> Position:
+    def record_fill(
+        self,
+        fill,
+        strategy_id: Optional[str] = None,
+        execution_live: bool = False,
+        strategy_canonical: Optional[str] = None,
+    ) -> Position:
         """
         Update position from a fill.
         
@@ -68,6 +86,8 @@ class PositionTracker:
         Args:
             fill: The executed fill to record (Fill object from backend.execution.models)
             strategy_id: ID of the strategy that initiated this trade (for new positions)
+            execution_live: True if this position was opened with Kraken live execution (Task 3).
+            strategy_canonical: If set on BUY open, per-strategy SIM balance is used (Task 3).
             
         Returns:
             The updated Position
@@ -90,21 +110,32 @@ class PositionTracker:
                 entry_time=fill.timestamp,
                 unrealized_pnl=0.0,
                 opened_by_strategy_id=strategy_id,
+                execution_live=bool(execution_live),
+                strategy_canonical=strategy_canonical,
             )
             
-            # TICKET-612: Update shadow balance when position opened (BUY)
+            # TICKET-612 / Task 3: shadow balance vs per-strategy SIM balance
             if fill.side == "buy":
                 try:
-                    from backend.api.routes.account import update_shadow_balance
                     position_cost = fill.quantity * fill.executed_price + fill.fees
-                    updated_balance = update_shadow_balance(position_cost, "deduct")
-                    if updated_balance:
+                    if strategy_canonical:
+                        from backend.supervisor.store import apply_strategy_sim_buy
+
+                        apply_strategy_sim_buy(strategy_canonical, position_cost)
                         logger.info(
-                            f"Shadow balance updated: BUY ${position_cost:.2f}, "
-                            f"new balance: ${updated_balance.get('total_usd', 0):.2f}"
+                            f"SIM balance updated: BUY ${position_cost:.2f} strategy={strategy_canonical}"
                         )
+                    else:
+                        from backend.api.routes.account import update_shadow_balance
+
+                        updated_balance = update_shadow_balance(position_cost, "deduct")
+                        if updated_balance:
+                            logger.info(
+                                f"Shadow balance updated: BUY ${position_cost:.2f}, "
+                                f"new balance: ${updated_balance.get('total_usd', 0):.2f}"
+                            )
                 except Exception as e:
-                    logger.warning(f"Failed to update shadow balance for BUY: {e}")
+                    logger.warning(f"Failed to update balance for BUY: {e}")
             
             # Record trade opening in metrics if strategy provided
             if strategy_id:
@@ -132,22 +163,37 @@ class PositionTracker:
                 # TICKET-612: Update shadow balance when position closed (SELL)
                 if fill.side == "sell":
                     try:
-                        from backend.api.routes.account import update_shadow_balance
-                        # Calculate realized P&L: (exit_price - entry_price) × quantity - fees
-                        if existing.side == "long":
-                            realized_pnl = (fill.executed_price - existing.entry_price) * existing.quantity - fill.fees
-                        else:  # short
-                            realized_pnl = (existing.entry_price - fill.executed_price) * existing.quantity - fill.fees
-                        
-                        # Add realized P&L to shadow balance
-                        updated_balance = update_shadow_balance(realized_pnl, "add")
-                        if updated_balance:
-                            logger.info(
-                                f"Shadow balance updated: SELL ${realized_pnl:.2f}, "
-                                f"new balance: ${updated_balance.get('total_usd', 0):.2f}"
+                        exit_proceeds = fill.executed_price * existing.quantity - fill.fees
+                        realized_pnl = (
+                            (fill.executed_price - existing.entry_price) * existing.quantity
+                            if existing.side == "long"
+                            else (existing.entry_price - fill.executed_price) * existing.quantity
+                        )
+                        if existing.strategy_canonical:
+                            from backend.supervisor.store import apply_strategy_sim_sell
+
+                            apply_strategy_sim_sell(
+                                existing.strategy_canonical,
+                                exit_proceeds,
+                                realized_pnl,
+                                r_multiple=None,
                             )
+                            logger.info(
+                                f"SIM balance updated: SELL proceeds=${exit_proceeds:.2f} "
+                                f"(P&L=${realized_pnl:.2f}) strategy={existing.strategy_canonical}"
+                            )
+                        else:
+                            from backend.api.routes.account import update_shadow_balance
+
+                            updated_balance = update_shadow_balance(exit_proceeds, "add")
+                            if updated_balance:
+                                logger.info(
+                                    f"Shadow balance updated: SELL proceeds=${exit_proceeds:.2f} "
+                                    f"(P&L=${realized_pnl:.2f}), "
+                                    f"new balance: ${updated_balance.get('total_usd', 0):.2f}"
+                                )
                     except Exception as e:
-                        logger.warning(f"Failed to update shadow balance for SELL: {e}")
+                        logger.warning(f"Failed to update balance for SELL: {e}")
                 
                 try:
                     # Lazy import to avoid circular dependency
@@ -181,20 +227,75 @@ class PositionTracker:
                         if existing.stop_loss_price:
                             # Check if exit was near stop-loss
                             if abs(fill.executed_price - existing.stop_loss_price) / existing.stop_loss_price < 0.01:
-                                exit_reason = "stop_loss"
+                                exit_reason = existing.stop_exit_reason()
                             else:
                                 exit_reason = "manual"  # Default to manual if unknown
                         else:
                             exit_reason = "unknown"
                     
-                    metrics.close_trade(
+                    pnl_result = metrics.close_trade(
                         trade_id=fill.symbol,  # Use symbol as trade ID
                         exit_price=fill.executed_price,
                         exit_reason=exit_reason,
                         stop_loss_price=stop_loss_price,
                     )
+                    
+                    # Ross Cameron spec: Blacklist symbol for 30 minutes after a loss
+                    if pnl_result is not None and pnl_result < 0:
+                        # Position closed at a loss - set cooldown
+                        from backend.redis.keys import SIGNAL_EXECUTED_KEY_LEGACY, SIGNAL_COOLDOWN_SECONDS
+                        cooldown_key = SIGNAL_EXECUTED_KEY_LEGACY.format(
+                            strategy_id=existing.opened_by_strategy_id or "unknown",
+                            symbol=fill.symbol
+                        )
+                        self._redis.setex(cooldown_key, SIGNAL_COOLDOWN_SECONDS, "1")
+                        logger.info(
+                            f"Loss cooldown set for {fill.symbol} after loss of ${abs(pnl_result):.2f} "
+                            f"(strategy={existing.opened_by_strategy_id}, TTL={SIGNAL_COOLDOWN_SECONDS}s)"
+                        )
+
+                        # BUG5: Accumulate per-symbol losses; block symbol for 48h if > $1.50
+                        try:
+                            from backend.redis.keys import (
+                                SYMBOL_CUMULATIVE_LOSS_KEY,
+                                SYMBOL_BLOCKED_KEY,
+                                SYMBOL_BLOCKED_TTL,
+                            )
+                            loss_key = SYMBOL_CUMULATIVE_LOSS_KEY.format(symbol=fill.symbol)
+                            current_loss = float(self._redis.get(loss_key) or 0.0)
+                            new_loss = current_loss + abs(pnl_result)
+                            self._redis.set(loss_key, str(new_loss))
+                            if new_loss >= 1.50:
+                                blocked_key = SYMBOL_BLOCKED_KEY.format(symbol=fill.symbol)
+                                self._redis.setex(blocked_key, SYMBOL_BLOCKED_TTL, f"cumulative_loss=${new_loss:.2f}")
+                                logger.warning(
+                                    f"Symbol {fill.symbol} blocked for 48h: cumulative loss ${new_loss:.2f}"
+                                )
+                        except Exception as _loss_err:
+                            logger.warning(f"Failed to update symbol loss tracking: {_loss_err}")
+
                 except Exception as e:
                     logger.warning(f"Failed to close trade in metrics: {e}")
+
+                # BUG2: Always set FORCED_EXIT_COOLDOWN_KEY (15 min) on ANY position close so
+                # that stop-loss fills and manual closes also enforce the re-entry cooldown.
+                # _force_exit_position sets this too (45 min), so this acts as the minimum floor.
+                try:
+                    from backend.redis.keys import FORCED_EXIT_COOLDOWN_KEY
+                    _strategy_id_cd = existing.opened_by_strategy_id or "unknown"
+                    _forced_key = FORCED_EXIT_COOLDOWN_KEY.format(
+                        symbol=fill.symbol, strategy_id=_strategy_id_cd
+                    )
+                    # Only set if no longer cooldown active (don't shorten a 45-min forced-exit cooldown)
+                    existing_ttl = self._redis.ttl(_forced_key)
+                    if existing_ttl < 900:  # 15 minutes minimum
+                        self._redis.setex(_forced_key, 900, "1")
+                        logger.info(
+                            f"Post-exit cooldown set for {fill.symbol} "
+                            f"(strategy={_strategy_id_cd}, TTL=900s)"
+                        )
+                except Exception as _cd_err:
+                    logger.warning(f"Failed to set post-exit cooldown: {_cd_err}")
         
         # Store in Redis
         if position.quantity > 0:
@@ -235,53 +336,42 @@ class PositionTracker:
             total_cost = (existing.quantity * existing.entry_price) + (fill.quantity * fill.executed_price)
             new_quantity = existing.quantity + fill.quantity
             new_entry_price = total_cost / new_quantity if new_quantity > 0 else 0
-            
-            return Position(
-                symbol=existing.symbol,
-                side=existing.side,
+
+            return replace(
+                existing,
                 quantity=new_quantity,
                 entry_price=new_entry_price,
-                entry_time=existing.entry_time,
                 unrealized_pnl=0.0,
-                opened_by_strategy_id=existing.opened_by_strategy_id,
             )
         else:
             # Reducing or flipping position
             if fill.quantity < existing.quantity:
                 # Partial close - keep original strategy_id
                 new_quantity = existing.quantity - fill.quantity
-                return Position(
-                    symbol=existing.symbol,
-                    side=existing.side,
+                return replace(
+                    existing,
                     quantity=new_quantity,
-                    entry_price=existing.entry_price,
-                    entry_time=existing.entry_time,
                     unrealized_pnl=0.0,
-                    opened_by_strategy_id=existing.opened_by_strategy_id,
                 )
             elif fill.quantity == existing.quantity:
                 # Full close - return zero quantity position
-                return Position(
-                    symbol=existing.symbol,
-                    side=existing.side,
+                return replace(
+                    existing,
                     quantity=0.0,
-                    entry_price=existing.entry_price,
-                    entry_time=existing.entry_time,
                     unrealized_pnl=0.0,
-                    opened_by_strategy_id=existing.opened_by_strategy_id,
                 )
             else:
                 # Flip position - this is a new position, use new strategy_id
                 new_quantity = fill.quantity - existing.quantity
                 new_side = "long" if fill.side == "buy" else "short"
-                return Position(
-                    symbol=existing.symbol,
+                return replace(
+                    existing,
                     side=new_side,
                     quantity=new_quantity,
                     entry_price=fill.executed_price,
                     entry_time=fill.timestamp,
-                    unrealized_pnl=0.0,
                     opened_by_strategy_id=strategy_id,
+                    unrealized_pnl=0.0,
                 )
     
     def get_position(self, symbol: str) -> Optional[Position]:
@@ -382,6 +472,99 @@ class PositionTracker:
         )
         
         return live_count
+    
+    def get_position_status(self, symbol: str) -> str:
+        """
+        Get position status for a symbol.
+        
+        Status values:
+        - SCANNING: No position, no pending orders
+        - PENDING: Strategy signal fired, limit order sent but not filled
+        - LIVE: Order filled, position active
+        - EXITING: TP/SL hit or 20m time-exit triggered, sell order live
+        - COOLDOWN: Trade closed, banned from symbol for 30m
+        - ERROR: Order rejected or API timeout
+        
+        Args:
+            symbol: Trading pair symbol
+            
+        Returns:
+            Status string
+        """
+        try:
+            # Check for explicit status override (set by executor)
+            status_key = POSITION_STATUS_KEY.format(symbol=symbol)
+            explicit_status = self._redis.get(status_key)
+            if explicit_status:
+                status = explicit_status.decode() if isinstance(explicit_status, bytes) else str(explicit_status)
+                if status in ("SCANNING", "PENDING", "LIVE", "EXITING", "COOLDOWN", "ERROR"):
+                    return status
+            
+            # Check for cooldown
+            cooldown_key = POSITION_COOLDOWN_KEY.format(symbol=symbol)
+            cooldown_end = self._redis.get(cooldown_key)
+            if cooldown_end:
+                try:
+                    from datetime import datetime, timezone
+                    cooldown_timestamp = cooldown_end.decode() if isinstance(cooldown_end, bytes) else str(cooldown_end)
+                    cooldown_time = datetime.fromisoformat(cooldown_timestamp.replace('Z', '+00:00'))
+                    if datetime.now(timezone.utc) < cooldown_time:
+                        return "COOLDOWN"
+                except (ValueError, TypeError):
+                    pass
+            
+            # Check for pending order
+            pending_key = POSITION_PENDING_ORDER_KEY.format(symbol=symbol)
+            pending_order = self._redis.get(pending_key)
+            if pending_order:
+                return "PENDING"
+            
+            # Check for active position
+            position = self.get_position(symbol)
+            if position and position.quantity > 0:
+                # Check if position is in exiting state (would be set by executor)
+                # For now, assume LIVE if position exists
+                return "LIVE"
+            
+            # Default: SCANNING
+            return "SCANNING"
+        except Exception as e:
+            logger.debug(f"Error getting position status for {symbol}: {e}")
+            return "SCANNING"
+    
+    def set_position_status(self, symbol: str, status: str) -> None:
+        """
+        Set explicit position status.
+        
+        Args:
+            symbol: Trading pair symbol
+            status: Status string (SCANNING, PENDING, LIVE, EXITING, COOLDOWN, ERROR)
+        """
+        try:
+            status_key = POSITION_STATUS_KEY.format(symbol=symbol)
+            if status in ("SCANNING", "PENDING", "LIVE", "EXITING", "COOLDOWN", "ERROR"):
+                self._redis.set(status_key, status)
+            else:
+                logger.warning(f"Invalid status value: {status}")
+        except Exception as e:
+            logger.debug(f"Error setting position status for {symbol}: {e}")
+    
+    def set_cooldown(self, symbol: str, duration_seconds: int = 1800) -> None:
+        """
+        Set cooldown period for a symbol (30 minutes default).
+        
+        Args:
+            symbol: Trading pair symbol
+            duration_seconds: Cooldown duration in seconds (default: 1800 = 30 minutes)
+        """
+        try:
+            from datetime import datetime, timezone, timedelta
+            cooldown_end = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
+            cooldown_key = POSITION_COOLDOWN_KEY.format(symbol=symbol)
+            self._redis.set(cooldown_key, cooldown_end.isoformat())
+            logger.info(f"Cooldown set for {symbol} until {cooldown_end.isoformat()}")
+        except Exception as e:
+            logger.debug(f"Error setting cooldown for {symbol}: {e}")
     
     def close_position(self, symbol: str) -> bool:
         """
@@ -496,7 +679,7 @@ class PositionTracker:
         
         return position
     
-    def sync_from_kraken(self) -> dict:
+    async def sync_from_kraken(self) -> dict:
         """
         Fetch actual holdings from Kraken and update local state.
         
@@ -531,12 +714,10 @@ class PositionTracker:
         
         logger.info("Starting Kraken position sync...")
         
-        # Get balance from Kraken
+        # Get balance from Kraken CLI
         try:
-            # Lazy import to avoid circular dependency
-            from backend.execution.kraken_rest import KrakenClient
-            kraken_client = KrakenClient()
-            balance = kraken_client.get_balance()
+            from backend.execution.kraken_cli import get_balance as cli_get_balance
+            balance = await cli_get_balance()
         except Exception as e:
             error_msg = f"Failed to fetch Kraken balance: {e}"
             logger.error(error_msg)
@@ -652,6 +833,80 @@ class PositionTracker:
         )
         
         return position
+
+    def purge_corrupted_position(self, symbol: str, reason: str) -> bool:
+        """
+        Remove a position and related Redis keys when quantity is invalid or unsellable.
+
+        Returns True if keys were deleted.
+        """
+        keys = [
+            self._get_key(symbol),
+            POSITION_STATUS_KEY.format(symbol=symbol),
+            POSITION_COOLDOWN_KEY.format(symbol=symbol),
+            POSITION_PENDING_ORDER_KEY.format(symbol=symbol),
+            POSITION_EXIT_REASON_KEY.format(symbol=symbol),
+            POSITION_EXIT_ATTEMPT_KEY.format(symbol=symbol),
+            POSITION_EXIT_FAIL_COUNT_KEY.format(symbol=symbol),
+            POSITION_TP1_PRICE_KEY.format(symbol=symbol),
+            POSITION_TP1_HIT_KEY.format(symbol=symbol),
+        ]
+        deleted = int(self._redis.delete(*keys))
+        if deleted:
+            logger.warning(
+                "CORRUPTED_POSITION_PURGED symbol=%s reason=%s keys_deleted=%d",
+                symbol,
+                reason,
+                deleted,
+            )
+            try:
+                from backend.api.routes.events import log_activity
+
+                log_activity(
+                    activity_type="warning",
+                    message=f"Corrupted position purged: {symbol} ({reason})",
+                    details={"symbol": symbol, "reason": reason},
+                )
+            except Exception:
+                pass
+        return deleted > 0
+
+    def list_all_position_symbols(self) -> list[str]:
+        """Return symbols with a position hash key."""
+        symbols: list[str] = []
+        prefix = "position:"
+        for raw in self._redis.scan_iter(match="position:*"):
+            key = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            if key.startswith(prefix) and ":status:" not in key and ":cooldown:" not in key:
+                if key.count(":") == 1:
+                    sym = key[len(prefix):]
+                    if sym:
+                        symbols.append(sym)
+        return symbols
+
+
+def purge_all_position_redis_keys(redis) -> int:
+    """
+    Delete every Redis key under the position:* namespace (hashes, status,
+    cooldown, TP1, exit_reason, pending_order, etc.). Used on shadow account reset.
+    """
+    batch: list[str] = []
+    total_deleted = 0
+    batch_size = 500
+
+    for raw in redis.scan_iter(match="position:*"):
+        key = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        batch.append(key)
+        if len(batch) >= batch_size:
+            total_deleted += int(redis.delete(*batch))
+            batch.clear()
+
+    if batch:
+        total_deleted += int(redis.delete(*batch))
+
+    if total_deleted:
+        logger.info(f"purge_all_position_redis_keys: deleted {total_deleted} key(s)")
+    return total_deleted
 
 
 # Global tracker instance

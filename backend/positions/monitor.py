@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +16,72 @@ UPDATE_INTERVAL_SECONDS = POSITION_MONITOR_INTERVAL_SECONDS
 
 # Rate limit: max 1 Kraken API call per second
 KRAKEN_RATE_LIMIT_SECONDS = 1.0
+
+# Hybrid exit: cross-strategy close when opener is silent or override confidence (see plan)
+HYBRID_SILENT_MIN = 10
+HYBRID_SECONDARY_SELL_PCT = 50.0
+HYBRID_OVERRIDE_SELL_PCT = 75.0
+
+
+def hybrid_bearish_exit_confidence(result_row: Optional[Dict[str, Any]]) -> Optional[float]:
+    """
+    Effective bearish exit strength for hybrid valves.
+    Counts explicit SELL or threshold-downgraded NONE with original_signal SELL.
+    """
+    if not result_row:
+        return None
+    st = (result_row.get("signal_type") or "NONE").upper()
+    conf = float(result_row.get("confidence") or 0.0)
+    indicators = result_row.get("indicators") or {}
+    if st == "SELL":
+        return conf
+    if st == "NONE" and str(indicators.get("original_signal") or "").upper() == "SELL":
+        return conf
+    return None
+
+
+def bump_hybrid_silence_if_opener_missing_symbol(
+    redis_client,
+    opener_strategy_id: str,
+    symbol: str,
+    opener_screener_blob: Dict[str, Any],
+) -> None:
+    """
+    When the opener's Redis results omit this symbol but last_scan advanced,
+    increment opener silence once (orphan MACD / no row for SAHARA).
+    """
+    if not opener_strategy_id or not symbol or not opener_screener_blob:
+        return
+    from backend.redis.keys import (
+        STRATEGY_HYBRID_LAST_OPENER_SCAN_KEY,
+        STRATEGY_HYBRID_LAST_OPENER_SCAN_TTL,
+        STRATEGY_SILENCE_COUNT_KEY,
+        STRATEGY_SILENCE_COUNT_TTL,
+    )
+
+    results = opener_screener_blob.get("results") or []
+    present = {r.get("symbol") for r in results if r.get("symbol")}
+    if symbol in present:
+        return
+
+    last_scan = opener_screener_blob.get("last_scan") or ""
+    if not last_scan:
+        return
+
+    meta_key = STRATEGY_HYBRID_LAST_OPENER_SCAN_KEY.format(
+        strategy_id=opener_strategy_id, symbol=symbol
+    )
+    prev = redis_client.get(meta_key)
+    prev_s = prev.decode() if isinstance(prev, bytes) else (prev or "")
+    if last_scan == prev_s:
+        return
+
+    count_key = STRATEGY_SILENCE_COUNT_KEY.format(
+        strategy_id=opener_strategy_id, symbol=symbol
+    )
+    redis_client.incr(count_key)
+    redis_client.expire(count_key, STRATEGY_SILENCE_COUNT_TTL)
+    redis_client.setex(meta_key, STRATEGY_HYBRID_LAST_OPENER_SCAN_TTL, last_scan)
 
 
 class PositionMonitor:
@@ -35,7 +101,6 @@ class PositionMonitor:
         """
         self.update_interval = update_interval
         self.tracker = None  # Lazy-loaded to avoid circular import
-        self.kraken_client = None  # Lazy-loaded to avoid circular import
         self._running = False
         self._task: Optional[asyncio.Task] = None
         
@@ -47,13 +112,6 @@ class PositionMonitor:
             from backend.positions.tracker import get_position_tracker
             self.tracker = get_position_tracker()
         return self.tracker
-    
-    def _get_kraken_client(self):
-        """Lazy-load Kraken client to avoid circular imports."""
-        if self.kraken_client is None:
-            from backend.execution.kraken_rest import KrakenClient
-            self.kraken_client = KrakenClient()
-        return self.kraken_client
     
     async def start(self):
         """Start the position monitor service."""
@@ -145,6 +203,7 @@ class PositionMonitor:
                     
                     # Check for forced exits (max hold, invalidation) after P&L update
                     if updated.opened_by_strategy_id:
+                        await self._check_hybrid_exit(updated, current_price)
                         await self._check_forced_exits(updated, current_price)
                         
                         # Check 48-hour opportunity filter
@@ -200,43 +259,23 @@ class PositionMonitor:
     
     async def _get_current_price(self, symbol: str) -> Optional[float]:
         """
-        Get current market price for a symbol from Kraken ticker API.
-        
+        Get current market price for a symbol via Kraken CLI ticker.
+
         Args:
             symbol: Trading pair symbol (e.g., "ETH/USD")
-            
+
         Returns:
-            Current price as float, or None on error
+            Current price (last trade) as float, or None on error
         """
         try:
-            # Run ticker fetch in thread pool to avoid blocking
-            client = self._get_kraken_client()
-            loop = asyncio.get_event_loop()
-            ticker_data = await loop.run_in_executor(
-                None,
-                client.get_ticker,
-                symbol
+            from backend.execution.kraken_cli import (
+                get_ticker,
+                symbol_to_cli_pair,
+                KrakenCLIError,
             )
-            
-            if ticker_data is None:
-                return None
-            
-            # Parse ticker response
-            # Kraken returns ticker data with pair-specific keys
-            # Format: {"XEUTHZUSD": {"c": ["price", "volume"], ...}}
-            for pair_key, ticker_info in ticker_data.items():
-                if isinstance(ticker_info, dict) and "c" in ticker_info:
-                    # 'c' is last trade close [price, volume]
-                    price_str = ticker_info["c"][0]
-                    try:
-                        return float(price_str)
-                    except (ValueError, IndexError, TypeError):
-                        logger.warning(f"Invalid price format in ticker for {symbol}: {price_str}")
-                        continue
-            
-            logger.warning(f"No price data found in ticker response for {symbol}")
-            return None
-            
+            cli_pair = symbol_to_cli_pair(symbol)  # "BTC/USD" → "BTCUSD"
+            ticker = await get_ticker(cli_pair)
+            return ticker.last
         except Exception as e:
             logger.error(f"Failed to get current price for {symbol}: {e}")
             return None
@@ -284,7 +323,7 @@ class PositionMonitor:
             # Create TradeIntent for Soldier scale-in
             from backend.risk.evaluator import TradeIntent
             from backend.execution.executor import execute_trade
-            
+
             trade_intent = TradeIntent(
                 strategy_id=position.opened_by_strategy_id or "scout_soldier",
                 symbol=position.symbol,
@@ -295,11 +334,16 @@ class PositionMonitor:
                     "soldier_scale_in": True,
                     "scout_entry_price": position.scout_entry_price,
                     "scale_in_size_usd": soldier_scale_in_size_usd,
+                    "strategy_canonical": position.strategy_canonical,
                 },
             )
             
-            # Execute Soldier scale-in trade
-            fill = await execute_trade(trade_intent, current_price)
+            # Execute Soldier scale-in trade (live vs paper frozen at position open)
+            fill = await execute_trade(
+                trade_intent,
+                current_price,
+                live=position.execution_live,
+            )
             
             if fill is None:
                 logger.warning(f"Soldier scale-in failed for {position.symbol}: execute_trade returned None")
@@ -328,32 +372,28 @@ class PositionMonitor:
             # Update stop-loss order on Kraken to breakeven price
             if updated_position.stop_loss_order_id:
                 try:
-                    client = self._get_kraken_client()
-                    # Cancel old stop-loss order
-                    client.cancel_order(updated_position.stop_loss_order_id)
+                    from backend.execution import kraken_cli as _kraken_cli
+                    await _kraken_cli.cancel_order(updated_position.stop_loss_order_id)
                     logger.info(f"Cancelled old stop-loss order {updated_position.stop_loss_order_id}")
-                    
-                    # Place new stop-loss at breakeven
-                    from backend.execution.order_manager import _convert_symbol_to_kraken_pair
-                    kraken_pair = _convert_symbol_to_kraken_pair(position.symbol)
-                    
-                    # Round breakeven stop to 3 decimal places
+
+                    kraken_pair = _kraken_cli.symbol_to_cli_pair(position.symbol)
                     breakeven_stop_rounded = round(breakeven_stop_price, 3)
-                    
-                    stop_loss_response = client.add_order(
+
+                    sl_result = await _kraken_cli.place_order(
                         pair=kraken_pair,
-                        type="sell",
-                        ordertype="stop-loss",
-                        volume=float(updated_position.quantity),
+                        side="sell",
+                        quantity=float(updated_position.quantity),
+                        order_type="stop-loss",
                         price=breakeven_stop_rounded,
                     )
-                    
-                    updated_position.stop_loss_order_id = stop_loss_response.txid
+                    txid_raw = sl_result.get("txid", "")
+                    new_txid = txid_raw[0] if isinstance(txid_raw, list) else str(txid_raw)
+                    updated_position.stop_loss_order_id = new_txid
                     updated_position.stop_loss_price = breakeven_stop_rounded
-                    
+
                     logger.info(
                         f"Updated stop-loss to breakeven: ${breakeven_stop_rounded:.3f} "
-                        f"(new txid: {stop_loss_response.txid})"
+                        f"(new txid: {new_txid})"
                     )
                 except Exception as e:
                     logger.error(f"Failed to update stop-loss to breakeven: {e}")
@@ -407,12 +447,74 @@ class PositionMonitor:
         if not position.opened_by_strategy_id:
             return  # Only check strategy-owned positions
         
-        # Check max hold first (time-based exit)
+        # Check explicit stop-loss price breach first (hard floor)
+        await self._check_stop_loss_exit(position, current_price)
+
+        # Check max hold (time-based exit)
         await self._check_max_hold_exit(position, current_price)
-        
+
         # Check structural invalidation (VWAP, RSI, HTF regime)
         await self._check_invalidation_exit(position, current_price)
     
+    async def _check_stop_loss_exit(self, position, current_price: float):
+        """
+        Check if current price has breached the stop-loss price stored on the position.
+
+        Paper/shadow mode has no real stop-loss orders on the exchange, so the monitor
+        must enforce the stop level explicitly on every price tick.
+        """
+        if not position.stop_loss_price or position.stop_loss_price <= 0:
+            return
+
+        triggered = False
+        if position.side == "long" and current_price <= position.stop_loss_price:
+            triggered = True
+        elif position.side == "short" and current_price >= position.stop_loss_price:
+            triggered = True
+
+        if not triggered:
+            return
+
+        logger.warning(
+            f"Stop-loss triggered for {position.symbol}: "
+            f"price ${current_price:.4f} {'<=' if position.side == 'long' else '>='} "
+            f"stop ${position.stop_loss_price:.4f}"
+        )
+
+        # Resolve strategy name for the log entry
+        try:
+            from backend.db import get_session
+            from backend.db.models import Strategy
+            import uuid as uuid_module
+
+            session = get_session()
+            try:
+                strategy_id = position.opened_by_strategy_id
+                try:
+                    strategy_uuid = uuid_module.UUID(strategy_id)
+                    strategy = session.query(Strategy).filter(Strategy.id == strategy_uuid).first()
+                except ValueError:
+                    strategy = session.query(Strategy).filter(Strategy.name == strategy_id).first()
+                strategy_name = strategy.name if strategy else strategy_id
+            finally:
+                session.close()
+        except Exception:
+            strategy_name = position.opened_by_strategy_id or "unknown"
+
+        entry_time = datetime.fromisoformat(position.entry_time.replace("Z", "+00:00"))
+        time_diff_minutes = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60.0
+        candles_held = time_diff_minutes / 15.0  # approximate
+
+        reason = position.stop_exit_reason()
+
+        await self._force_exit_position(
+            position=position,
+            current_price=current_price,
+            reason=reason,
+            candles_held=candles_held,
+            strategy_name=strategy_name,
+        )
+
     async def _check_max_hold_exit(self, position, current_price: float):
         """
         Check if position has exceeded max hold duration and force exit if needed.
@@ -455,7 +557,7 @@ class PositionMonitor:
                     # Use defaults based on strategy name
                     strategy_name_lower = strategy_name.lower()
                     if "vwap" in strategy_name_lower or "mean" in strategy_name_lower:
-                        max_hold_candles = 6  # 30 min for 5m interval
+                        max_hold_candles = 12  # 3h at 15m (was 6 — too short to cover fees)
                     elif "volatility" in strategy_name_lower or "breakout" in strategy_name_lower:
                         max_hold_candles = 4  # 20 min for 5m interval
                     elif "htf" in strategy_name_lower or "trend" in strategy_name_lower or "pullback" in strategy_name_lower:
@@ -523,6 +625,192 @@ class PositionMonitor:
             except ValueError:
                 logger.warning(f"Unknown interval format: {interval_str}, defaulting to 5 minutes")
                 return 5.0
+
+    def _strategy_display_name(self, strategy_id: str) -> str:
+        """Resolve DB strategy name for logging (UUID or legacy name)."""
+        try:
+            from backend.db import get_session
+            from backend.db.models import Strategy
+            import uuid as uuid_module
+
+            session = get_session()
+            try:
+                try:
+                    strategy_uuid = uuid_module.UUID(strategy_id)
+                    strategy = session.query(Strategy).filter(Strategy.id == strategy_uuid).first()
+                except ValueError:
+                    strategy = session.query(Strategy).filter(Strategy.name == strategy_id).first()
+                return strategy.name if strategy else strategy_id
+            finally:
+                session.close()
+        except Exception:
+            return strategy_id
+
+    def _opener_strategy_interval_minutes(self, opener_id: str) -> float:
+        """Chart bar length in minutes for the opening strategy (default 5m if unknown)."""
+        try:
+            from backend.db import get_session
+            from backend.db.models import Strategy
+            import uuid as uuid_module
+
+            session = get_session()
+            try:
+                try:
+                    strategy_uuid = uuid_module.UUID(opener_id)
+                    strategy = session.query(Strategy).filter(Strategy.id == strategy_uuid).first()
+                except ValueError:
+                    strategy = session.query(Strategy).filter(Strategy.name == opener_id).first()
+                if not strategy:
+                    return 5.0
+                config = strategy.config or {}
+                interval_str = config.get("interval") or config.get("parameters", {}).get(
+                    "interval", "5m"
+                )
+                return self._parse_interval_to_minutes(str(interval_str))
+            finally:
+                session.close()
+        except Exception:
+            return 5.0
+
+    async def _check_hybrid_exit(self, position, current_price: float) -> None:
+        """
+        Cross-strategy exit when opener is silent (valve 1) or any strategy SELL >= 75% (valve 2).
+        """
+        from backend.supervisor.config import MIN_HYBRID_EXIT_HOLD_BARS
+
+        opener_id = position.opened_by_strategy_id
+        if not opener_id or position.quantity <= 0:
+            return
+
+        try:
+            from backend.redis import get_redis_client
+            from backend.redis.keys import SCREENER_STRATEGY_RESULTS_KEY, STRATEGY_SILENCE_COUNT_KEY
+
+            rc = get_redis_client()
+            opener_key = SCREENER_STRATEGY_RESULTS_KEY.format(strategy_id=opener_id)
+            raw = rc.get(opener_key)
+            opener_blob: Dict[str, Any] = {}
+            if raw:
+                try:
+                    opener_blob = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                except json.JSONDecodeError:
+                    opener_blob = {}
+
+            bump_hybrid_silence_if_opener_missing_symbol(rc, opener_id, position.symbol, opener_blob)
+
+            entry_dt = datetime.fromisoformat(position.entry_time.replace("Z", "+00:00"))
+            now_utc = datetime.now(timezone.utc)
+            interval_min = self._opener_strategy_interval_minutes(opener_id)
+            if interval_min <= 0:
+                interval_min = 5.0
+            bars_elapsed = (now_utc - entry_dt).total_seconds() / 60.0 / interval_min
+            if bars_elapsed < float(MIN_HYBRID_EXIT_HOLD_BARS):
+                logger.debug(
+                    "[HYBRID_EXIT] %s skipped — only %.2f bars since entry, minimum is %s",
+                    position.symbol,
+                    bars_elapsed,
+                    MIN_HYBRID_EXIT_HOLD_BARS,
+                )
+                return
+
+            silence_key = STRATEGY_SILENCE_COUNT_KEY.format(
+                strategy_id=opener_id, symbol=position.symbol
+            )
+            silence_raw = rc.get(silence_key)
+            try:
+                silence_n = int(silence_raw) if silence_raw is not None else 0
+            except (TypeError, ValueError):
+                silence_n = 0
+
+            from backend.db import get_session
+            from backend.db.models import Strategy
+
+            session = get_session()
+            try:
+                rows = session.query(Strategy).filter(Strategy.status == "active").all()
+                strategy_rows: List[Tuple[str, str]] = [(str(s.id), s.name) for s in rows]
+            finally:
+                session.close()
+
+            def _row_for_symbol(blob: Dict[str, Any], sym: str) -> Optional[Dict[str, Any]]:
+                for r in blob.get("results") or []:
+                    if r.get("symbol") == sym:
+                        return r
+                return None
+
+            valve2: List[Tuple[float, str, str]] = []
+            valve1: List[Tuple[float, str, str]] = []
+
+            for sid, sname in strategy_rows:
+                sk = SCREENER_STRATEGY_RESULTS_KEY.format(strategy_id=sid)
+                data = rc.get(sk)
+                if not data:
+                    continue
+                try:
+                    blob = json.loads(data.decode() if isinstance(data, bytes) else data)
+                except json.JSONDecodeError:
+                    continue
+                row = _row_for_symbol(blob, position.symbol)
+                if not row:
+                    continue
+                conf = hybrid_bearish_exit_confidence(row)
+                if conf is None:
+                    continue
+                if conf >= HYBRID_OVERRIDE_SELL_PCT:
+                    valve2.append((conf, sid, sname))
+                elif (
+                    conf >= HYBRID_SECONDARY_SELL_PCT
+                    and sid != opener_id
+                    and silence_n >= HYBRID_SILENT_MIN
+                ):
+                    valve1.append((conf, sid, sname))
+
+            pick: Optional[Tuple[float, str, str]] = None
+            hybrid_kind: Optional[str] = None
+            if valve2:
+                pick = max(valve2, key=lambda x: (x[0], x[1]))
+                hybrid_kind = "high_confidence"
+            elif valve1:
+                pick = max(valve1, key=lambda x: (x[0], x[1]))
+                hybrid_kind = "silent_opener"
+
+            if not pick or not hybrid_kind:
+                return
+
+            conf, closer_id, closer_name = pick
+            opener_dn = self._strategy_display_name(opener_id)
+
+            candles_held = bars_elapsed
+
+            if hybrid_kind == "high_confidence":
+                logger.info(
+                    f"[HYBRID_EXIT] {position.symbol} closed by {closer_name} — "
+                    f"high confidence override {conf:.1f}%"
+                )
+                reason = (
+                    f"hybrid_exit_high_confidence|closer={closer_name}|closer_id={closer_id}|conf={conf:.1f}"
+                )
+            else:
+                logger.info(
+                    f"[HYBRID_EXIT] {position.symbol} closed by {closer_name} — "
+                    f"opener {opener_dn} silent for {silence_n} bars"
+                )
+                reason = (
+                    f"hybrid_exit_silent_opener|closer={closer_name}|closer_id={closer_id}|n={silence_n}"
+                )
+
+            await self._force_exit_position(
+                position=position,
+                current_price=current_price,
+                reason=reason,
+                candles_held=candles_held,
+                strategy_name=opener_dn,
+                closing_strategy_id=closer_id,
+                closing_strategy_name=closer_name,
+                hybrid_kind=hybrid_kind,
+            )
+        except Exception as e:
+            logger.error(f"Error in hybrid exit check for {position.symbol}: {e}", exc_info=True)
     
     async def _force_exit_position(
         self,
@@ -531,6 +819,10 @@ class PositionMonitor:
         reason: str,
         candles_held: float,
         strategy_name: str,
+        *,
+        closing_strategy_id: Optional[str] = None,
+        closing_strategy_name: Optional[str] = None,
+        hybrid_kind: Optional[str] = None,
     ):
         """
         Force exit a position due to max hold or invalidation.
@@ -549,7 +841,34 @@ class PositionMonitor:
             if not current_position or current_position.quantity <= 0:
                 logger.debug(f"Position {position.symbol} already closed, skipping forced exit")
                 return
-            
+
+            from backend.positions.quantity import is_valid_position_quantity
+            from backend.redis.keys import (
+                POSITION_EXIT_FAIL_COUNT_KEY,
+                POSITION_EXIT_FAIL_MAX,
+            )
+
+            if not is_valid_position_quantity(current_position.quantity):
+                tracker.purge_corrupted_position(
+                    position.symbol, reason="invalid_quantity_before_force_exit"
+                )
+                return
+
+            # Debounce: skip if we already attempted an exit within the last 60s.
+            # This prevents the monitor from flooding the log with repeated sell
+            # failures when the paper CLI account temporarily lacks balance.
+            from backend.redis import get_redis_client as _get_redis_for_debounce
+            from backend.redis.keys import POSITION_EXIT_ATTEMPT_KEY, POSITION_EXIT_ATTEMPT_TTL
+            _rc_debounce = _get_redis_for_debounce()
+            _exit_attempt_key = POSITION_EXIT_ATTEMPT_KEY.format(symbol=position.symbol)
+            if _rc_debounce.exists(_exit_attempt_key):
+                logger.debug(
+                    f"[exit-debounce] Skipping forced exit for {position.symbol} "
+                    f"— attempted within last {POSITION_EXIT_ATTEMPT_TTL}s"
+                )
+                return
+            _rc_debounce.setex(_exit_attempt_key, POSITION_EXIT_ATTEMPT_TTL, "1")
+
             # Calculate P&L percentage
             pnl_pct = ((current_price - position.entry_price) / position.entry_price) * 100.0
             
@@ -561,21 +880,30 @@ class PositionMonitor:
             # Create TradeIntent for exit
             from backend.risk.evaluator import TradeIntent
             from backend.execution.executor import execute_trade
-            from backend.api.routes.trading import get_shadow_live_mode
-            
+
+            exit_metadata: Dict[str, Any] = {
+                "forced_exit": True,
+                "exit_reason": reason,
+                "candles_held": candles_held,
+                "entry_price": position.entry_price,
+                "entry_time": position.entry_time,
+                "strategy_canonical": position.strategy_canonical,
+            }
+            if hybrid_kind and closing_strategy_id:
+                exit_metadata["hybrid_exit"] = True
+                exit_metadata["hybrid_kind"] = hybrid_kind
+                exit_metadata["closing_strategy_id"] = closing_strategy_id
+                exit_metadata["closing_strategy_name"] = (
+                    closing_strategy_name or closing_strategy_id
+                )
+
             trade_intent = TradeIntent(
                 strategy_id=position.opened_by_strategy_id,
                 symbol=position.symbol,
                 side="sell",
                 intent_type="exit",
                 notional_risk_pct=2.0,  # Not used for exits, but required
-                metadata={
-                    "forced_exit": True,
-                    "exit_reason": reason,
-                    "candles_held": candles_held,
-                    "entry_price": position.entry_price,
-                    "entry_time": position.entry_time,
-                },
+                metadata=exit_metadata,
             )
             
             # Store exit reason temporarily for metrics tracking
@@ -583,51 +911,106 @@ class PositionMonitor:
             from backend.redis.keys import POSITION_EXIT_REASON_KEY, POSITION_EXIT_REASON_TTL
             redis_client = get_redis_client()
             exit_reason_key = POSITION_EXIT_REASON_KEY.format(symbol=position.symbol)
-            exit_reason_data = {
+            exit_reason_data: Dict[str, Any] = {
                 "reason": reason,
                 "candles_held": candles_held,
                 "stop_loss_price": position.stop_loss_price,
             }
+            if hybrid_kind and closing_strategy_id:
+                exit_reason_data["hybrid_kind"] = hybrid_kind
+                exit_reason_data["closing_strategy_id"] = closing_strategy_id
+                exit_reason_data["closing_strategy"] = (
+                    closing_strategy_name or closing_strategy_id
+                )
             redis_client.setex(exit_reason_key, POSITION_EXIT_REASON_TTL, json.dumps(exit_reason_data))
             
-            # Execute the exit trade
-            fill = await execute_trade(trade_intent, current_price)
-            
-            if fill is not None:
-                # Log EXIT_FORCED activity
-                from backend.api.routes.events import log_activity
-                shadow_mode = get_shadow_live_mode()
-                
-                log_activity(
-                    activity_type="EXIT_FORCED",
-                    message=(
-                        f"Forced exit: {position.symbol} [{strategy_name}] - {reason} "
-                        f"(hold: {candles_held:.1f} candles, P&L: {pnl_pct:.1f}%)"
-                    ),
-                    details={
-                        "symbol": position.symbol,
-                        "strategy": strategy_name,
-                        "strategy_id": position.opened_by_strategy_id,
-                        "reason": reason,
-                        "candles_held": candles_held,
-                        "pnl_pct": pnl_pct,
-                        "exit_price": current_price,
-                        "entry_price": position.entry_price,
-                        "entry_time": position.entry_time,
-                        "unrealized_pnl": position.unrealized_pnl,
-                        "mode": "shadow_live" if shadow_mode else "live",
-                    },
+            # Execute the exit trade (live vs paper frozen at position open)
+            fill = await execute_trade(
+                trade_intent,
+                current_price,
+                live=position.execution_live,
+            )
+
+            if fill is None:
+                _fail_key = POSITION_EXIT_FAIL_COUNT_KEY.format(symbol=position.symbol)
+                fails = int(redis_client.incr(_fail_key))
+                redis_client.expire(_fail_key, 86400)
+                if fails >= POSITION_EXIT_FAIL_MAX:
+                    tracker.purge_corrupted_position(
+                        position.symbol,
+                        reason=f"exit_failed_{fails}_times",
+                    )
+                    redis_client.delete(_fail_key)
+                return
+
+            redis_client.delete(
+                POSITION_EXIT_FAIL_COUNT_KEY.format(symbol=position.symbol)
+            )
+
+            # Log EXIT_FORCED activity
+            from backend.api.routes.events import log_activity
+            _paper = not position.execution_live
+
+            _details: Dict[str, Any] = {
+                "symbol": position.symbol,
+                "strategy": strategy_name,
+                "strategy_id": position.opened_by_strategy_id,
+                "reason": reason,
+                "candles_held": candles_held,
+                "pnl_pct": pnl_pct,
+                "exit_price": current_price,
+                "entry_price": position.entry_price,
+                "entry_time": position.entry_time,
+                "unrealized_pnl": position.unrealized_pnl,
+                "mode": "paper" if _paper else "live",
+            }
+            if hybrid_kind and closing_strategy_id:
+                _details["hybrid_exit"] = True
+                _details["hybrid_kind"] = hybrid_kind
+                _details["closing_strategy_id"] = closing_strategy_id
+                _details["closing_strategy_name"] = (
+                    closing_strategy_name or closing_strategy_id
                 )
-                
-                logger.info(
-                    f"Forced exit executed: {position.symbol} sold at ${current_price:.2f} "
-                    f"(reason: {reason}, candles: {candles_held:.1f})"
+
+            log_activity(
+                activity_type="EXIT_FORCED",
+                message=(
+                    f"Forced exit: {position.symbol} [{strategy_name}] - {reason} "
+                    f"(hold: {candles_held:.1f} candles, P&L: {pnl_pct:.1f}%)"
+                ),
+                details=_details,
+            )
+
+            logger.info(
+                f"Forced exit executed: {position.symbol} sold at ${current_price:.2f} "
+                f"(reason: {reason}, candles: {candles_held:.1f})"
+            )
+
+            from backend.redis.keys import (
+                SIGNAL_EXECUTED_KEY_LEGACY,
+                SIGNAL_COOLDOWN_SECONDS,
+                FORCED_EXIT_COOLDOWN_KEY,
+                FORCED_EXIT_COOLDOWN_TTL,
+            )
+            strategy_id = position.opened_by_strategy_id or "unknown"
+
+            forced_key = FORCED_EXIT_COOLDOWN_KEY.format(
+                symbol=position.symbol, strategy_id=strategy_id
+            )
+            redis_client.setex(forced_key, FORCED_EXIT_COOLDOWN_TTL, "1")
+            tracker.set_cooldown(position.symbol, FORCED_EXIT_COOLDOWN_TTL)
+
+            if reason.startswith("invalidation_"):
+                inv_cooldown_key = SIGNAL_EXECUTED_KEY_LEGACY.format(
+                    strategy_id=strategy_id, symbol=position.symbol
                 )
-            else:
-                logger.warning(
-                    f"Forced exit failed for {position.symbol}: execute_trade returned None"
-                )
-                
+                redis_client.setex(inv_cooldown_key, SIGNAL_COOLDOWN_SECONDS, "1")
+
+            logger.info(
+                f"Post-exit cooldown set for {position.symbol} "
+                f"(reason={reason}, duration={FORCED_EXIT_COOLDOWN_TTL}s)"
+            )
+
         except Exception as e:
             logger.error(
                 f"Error forcing exit for {position.symbol}: {e}",
@@ -701,26 +1084,74 @@ class PositionMonitor:
                 
                 # Check invalidation conditions based on strategy type
                 if "vwap" in strategy_name_lower or "mean" in strategy_name_lower:
-                    # VWAP Mean Reversion: Check if price > N ATR away from VWAP
+                    # VWAP Mean Reversion: Check if price > N ATR away from VWAP.
+                    # Minimum grace period: 1 full candle must elapse before this check
+                    # fires. This prevents stale pre-entry screener indicators (which
+                    # showed price far from VWAP — exactly the entry signal) from
+                    # immediately invalidating the position.
                     vwap = symbol_indicators.get("vwap")
                     atr = symbol_indicators.get("atr")
                     invalidation_atr_mult = config.get("invalidation_vwap_atr_mult") or config.get("parameters", {}).get("invalidation_vwap_atr_mult", 2.0)
-                    
-                    if vwap is not None and atr is not None and atr > 0:
+
+                    # Calculate actual candles held (same method as RSI block below)
+                    entry_time_vwap = datetime.fromisoformat(position.entry_time.replace('Z', '+00:00'))
+                    current_time_vwap = datetime.now(timezone.utc)
+                    interval_str_vwap = config.get("interval") or config.get("parameters", {}).get("interval", "5m")
+                    interval_minutes_vwap = self._parse_interval_to_minutes(interval_str_vwap)
+                    time_diff_vwap = (current_time_vwap - entry_time_vwap).total_seconds() / 60.0
+                    candles_held_vwap = time_diff_vwap / interval_minutes_vwap if interval_minutes_vwap > 0 else 0.0
+
+                    if candles_held_vwap < 2.0:
+                        logger.debug(
+                            f"VWAP invalidation skipped for {position.symbol}: "
+                            f"only {candles_held_vwap:.2f} candles elapsed (grace period: 2 candles)"
+                        )
+                    elif vwap is not None and atr is not None and atr > 0:
                         deviation = abs(current_price - vwap)
                         deviation_atr = deviation / atr
-                        
+
                         if deviation_atr > invalidation_atr_mult:
+                            # Min-profit gate: only suppress VWAP invalidation exit for near-flat winners.
+                            # A 0.1% gain exited via invalidation is a net loss after ~0.52% round-trip fees.
+                            # IMPORTANT: Only suppress when P&L is between 0% and the min threshold.
+                            # Losing positions (pnl_pct < 0) must still exit — stop-loss may be missing.
+                            if not position.entry_price or position.entry_price <= 0:
+                                logger.warning(
+                                    f"VWAP invalidation: invalid entry_price for {position.symbol}, "
+                                    f"skipping min-profit gate and proceeding with exit"
+                                )
+                            else:
+                                min_profit_pct = float(os.environ.get("MIN_PROFIT_FOR_INVALIDATION_PCT", "0.6"))
+                                if position.side == "long":
+                                    pnl_pct = ((current_price - position.entry_price) / position.entry_price) * 100.0
+                                else:
+                                    pnl_pct = ((position.entry_price - current_price) / position.entry_price) * 100.0
+
+                                # BUG4: Extend suppression to 1.5R (1.5 × stop_loss_pct).
+                                # A winner that hasn't reached 1.5R yet is being cut early by
+                                # invalidation, degrading R:R. Losers (pnl_pct < 0) still exit.
+                                _stop_pct = float(os.environ.get("STOP_LOSS_PCT", "5.0"))
+                                min_profit_threshold = max(min_profit_pct, _stop_pct * 1.5)
+                                if 0.0 < pnl_pct < min_profit_threshold:
+                                    logger.info(
+                                        f"VWAP invalidation suppressed for {position.symbol}: "
+                                        f"P&L {pnl_pct:.2f}% < 1.5R threshold {min_profit_threshold:.1f}% "
+                                        f"(stop={_stop_pct}%, deviation_atr={deviation_atr:.2f}). "
+                                        f"Stop-loss will protect downside."
+                                    )
+                                    return
+
                             logger.warning(
                                 f"VWAP invalidation for {position.symbol}: "
                                 f"price ${current_price:.2f} is {deviation_atr:.2f} ATR from VWAP ${vwap:.2f} "
-                                f"(threshold: {invalidation_atr_mult} ATR)"
+                                f"(threshold: {invalidation_atr_mult} ATR, held {candles_held_vwap:.1f} candles, "
+                                f"P&L {pnl_pct:.2f}%)"
                             )
                             await self._force_exit_position(
                                 position=position,
                                 current_price=current_price,
                                 reason="invalidation_vwap",
-                                candles_held=0.0,  # Not time-based
+                                candles_held=candles_held_vwap,
                                 strategy_name=strategy_name,
                             )
                             return
@@ -738,11 +1169,17 @@ class PositionMonitor:
                         interval_minutes = self._parse_interval_to_minutes(interval_str)
                         time_diff_minutes = (current_time - entry_time).total_seconds() / 60.0
                         candles_held = time_diff_minutes / interval_minutes
-                        
+
+                        # Minimum 2-candle hold before RSI invalidation can fire
+                        if candles_held < 2.0:
+                            logger.debug(
+                                f"RSI invalidation skipped for {position.symbol}: "
+                                f"only {candles_held:.2f} candles elapsed (grace period: 2 candles)"
+                            )
                         # Check if RSI still oversold/overbought after M candles
                         # For long positions: RSI should have reverted from oversold (< 30) to neutral (> 40)
                         # For short positions: RSI should have reverted from overbought (> 70) to neutral (< 60)
-                        if position.side == "long":
+                        elif position.side == "long":
                             # Long position: RSI should have reverted from oversold
                             if candles_held >= invalidation_rsi_candles and rsi < 40:
                                 logger.warning(
@@ -830,123 +1267,157 @@ class PositionMonitor:
                 tp1_hit_now = current_price <= tp1_price
             
             if tp1_hit_now:
-                # Mark TP1 as hit
                 redis_client.set(tp1_hit_key, "1")
                 logger.info(
                     f"TP1 hit: {position.symbol} @ ${current_price:.2f} >= ${tp1_price:.2f}"
                     if position.side == "long"
                     else f"TP1 hit: {position.symbol} @ ${current_price:.2f} <= ${tp1_price:.2f}"
                 )
+                from backend.config import BREAKEVEN_REQUIRES_TP1
+                if BREAKEVEN_REQUIRES_TP1:
+                    await self._activate_breakeven_guard(
+                        position, current_price, triggered_by="tp1"
+                    )
         except Exception as e:
             logger.error(f"Error checking TP1 hit for {position.symbol}: {e}", exc_info=True)
-    
-    async def _check_breakeven_guard(self, position, current_price: float):
+
+    def _breakeven_reference_price(self, position) -> float:
+        """Entry reference for breakeven (scout price when Scout+Soldier)."""
+        if position.scout_entry_price:
+            return position.scout_entry_price
+        return position.entry_price
+
+    def _profit_pct_vs_reference(self, position, current_price: float) -> float:
+        ref = self._breakeven_reference_price(position)
+        if position.side == "short":
+            return ((ref - current_price) / ref) * 100.0
+        return ((current_price - ref) / ref) * 100.0
+
+    def _is_tp1_hit(self, symbol: str) -> bool:
+        from backend.redis import get_redis_client
+        from backend.redis.keys import POSITION_TP1_HIT_KEY
+
+        redis_client = get_redis_client()
+        tp1_hit_key = POSITION_TP1_HIT_KEY.format(symbol=symbol)
+        return bool(redis_client.get(tp1_hit_key))
+
+    async def _activate_breakeven_guard(
+        self,
+        position,
+        current_price: float,
+        *,
+        triggered_by: str = "profit_pct",
+    ):
         """
-        Check and activate breakeven guard when position reaches +2% profit.
-        
-        Breakeven guard moves stop-loss to entry+fees to protect profits.
-        For Scout+Soldier positions, uses scout_entry_price as reference.
-        
-        Args:
-            position: Position object
-            current_price: Current market price
+        Move stop to entry+fees. Called on TP1 hit (default) or legacy +profit% trigger.
         """
         if position.breakeven_guard_active:
-            return  # Already activated
-        
-        try:
-            from backend.config import BREAKEVEN_GUARD_TRIGGER_PCT, KRAKEN_FEE_PCT
-            
-            # Determine entry price for breakeven calculation
-            # For Scout+Soldier positions: use scout_entry_price (first entry)
-            # For regular positions: use entry_price
-            if position.scout_entry_price:
-                breakeven_reference_price = position.scout_entry_price
+            return
+
+        from backend.config import KRAKEN_FEE_PCT
+
+        breakeven_reference_price = self._breakeven_reference_price(position)
+        profit_pct = self._profit_pct_vs_reference(position, current_price)
+
+        fee_pct = KRAKEN_FEE_PCT / 100.0
+        fees_per_unit = breakeven_reference_price * fee_pct
+        if position.side == "short":
+            breakeven_price = breakeven_reference_price - fees_per_unit
+        else:
+            breakeven_price = breakeven_reference_price + fees_per_unit
+
+        logger.info(
+            f"Breakeven guard activated ({triggered_by}): {position.symbol} "
+            f"stop moved to ${breakeven_price:.3f} "
+            f"(entry: ${breakeven_reference_price:.2f} + fees: ${fees_per_unit:.4f}, "
+            f"profit: {profit_pct:.2f}%)"
+        )
+
+        position.breakeven_guard_active = True
+        position.breakeven_stop_price = breakeven_price
+
+        effective_stop_price = breakeven_price
+        if position.trailing_stop_active and position.trailing_stop_price is not None:
+            if position.side == "long":
+                effective_stop_price = max(breakeven_price, position.trailing_stop_price)
             else:
-                breakeven_reference_price = position.entry_price
-            
-            # Calculate profit percentage
-            profit_pct = ((current_price - breakeven_reference_price) / breakeven_reference_price) * 100.0
-            
-            # Check if profit threshold is reached
+                effective_stop_price = min(breakeven_price, position.trailing_stop_price)
+            logger.info(
+                f"Breakeven guard: Using effective stop ${effective_stop_price:.3f} "
+                f"(breakeven: ${breakeven_price:.3f}, trailing: ${position.trailing_stop_price:.3f})"
+            )
+
+        await self._update_kraken_stop_loss(position, effective_stop_price)
+        position.stop_loss_price = effective_stop_price
+
+        from backend.redis import get_redis_client
+        from backend.redis.keys import POSITION_KEY
+
+        redis_client = get_redis_client()
+        key = POSITION_KEY.format(symbol=position.symbol)
+        redis_client.hset(key, mapping=position.to_dict())
+
+        from backend.api.routes.events import log_activity
+
+        log_activity(
+            activity_type="BREAKEVEN_GUARD_ACTIVATED",
+            message=(
+                f"Breakeven guard activated ({triggered_by}): {position.symbol} - "
+                f"stop moved to ${breakeven_price:.3f} "
+                f"(entry: ${breakeven_reference_price:.2f} + fees, profit: {profit_pct:.2f}%)"
+            ),
+            details={
+                "symbol": position.symbol,
+                "breakeven_stop_price": breakeven_price,
+                "entry_price": breakeven_reference_price,
+                "fees_per_unit": fees_per_unit,
+                "profit_pct": profit_pct,
+                "triggered_by": triggered_by,
+                "scout_entry_price": position.scout_entry_price,
+                "effective_stop_price": effective_stop_price,
+                "trailing_stop_active": position.trailing_stop_active,
+                "strategy": position.opened_by_strategy_id,
+            },
+        )
+
+    async def _check_breakeven_guard(self, position, current_price: float):
+        """
+        Activate breakeven guard after TP1 (default) or at +profit% (legacy mode).
+
+        When BREAKEVEN_REQUIRES_TP1 is true, breakeven is activated from _check_tp1_hit
+        only; this method skips the profit-percent trigger.
+        """
+        if position.breakeven_guard_active:
+            return
+
+        try:
+            from backend.config import BREAKEVEN_GUARD_TRIGGER_PCT, BREAKEVEN_REQUIRES_TP1
+
+            if BREAKEVEN_REQUIRES_TP1:
+                if not self._is_tp1_hit(position.symbol):
+                    logger.debug(
+                        f"Breakeven guard check for {position.symbol}: "
+                        "TP1 not hit yet (BREAKEVEN_REQUIRES_TP1)"
+                    )
+                    return
+                # TP1 hit but guard not active (e.g. flag set before deploy)
+                await self._activate_breakeven_guard(
+                    position, current_price, triggered_by="tp1"
+                )
+                return
+
+            profit_pct = self._profit_pct_vs_reference(position, current_price)
             if profit_pct < BREAKEVEN_GUARD_TRIGGER_PCT:
                 logger.debug(
                     f"Breakeven guard check for {position.symbol}: "
                     f"profit={profit_pct:.2f}% < {BREAKEVEN_GUARD_TRIGGER_PCT}% (not triggered)"
                 )
                 return
-            
-            # Activate breakeven guard
-            # Calculate breakeven price: entry_price + estimated_fees
-            # Estimated fees: KRAKEN_FEE_PCT% of entry_price (Kraken maker fee)
-            fee_pct = KRAKEN_FEE_PCT / 100.0
-            fees_per_unit = breakeven_reference_price * fee_pct
-            breakeven_price = breakeven_reference_price + fees_per_unit
-            
-            logger.info(
-                f"Breakeven guard activated: {position.symbol} stop moved to ${breakeven_price:.3f} "
-                f"(entry: ${breakeven_reference_price:.2f} + fees: ${fees_per_unit:.4f}, "
-                f"profit: {profit_pct:.2f}%)"
+
+            await self._activate_breakeven_guard(
+                position, current_price, triggered_by="profit_pct"
             )
-            
-            # Update position fields
-            position.breakeven_guard_active = True
-            position.breakeven_stop_price = breakeven_price
-            
-            # Determine which stop to use: breakeven or trailing stop (use wider stop)
-            # For long positions: wider stop = higher price
-            # For short positions: wider stop = lower price
-            effective_stop_price = breakeven_price
-            
-            if position.trailing_stop_active and position.trailing_stop_price is not None:
-                if position.side == "long":
-                    # Long: use the higher stop (more protective)
-                    effective_stop_price = max(breakeven_price, position.trailing_stop_price)
-                else:
-                    # Short: use the lower stop (more protective)
-                    effective_stop_price = min(breakeven_price, position.trailing_stop_price)
-                
-                logger.info(
-                    f"Breakeven guard: Using effective stop ${effective_stop_price:.3f} "
-                    f"(breakeven: ${breakeven_price:.3f}, trailing: ${position.trailing_stop_price:.3f})"
-                )
-            
-            # Update Kraken stop-loss order to breakeven price (or effective stop if trailing is wider)
-            await self._update_kraken_stop_loss(position, effective_stop_price)
-            
-            # Update position.stop_loss_price to effective stop
-            position.stop_loss_price = effective_stop_price
-            
-            # Save updated position to Redis
-            tracker = self._get_tracker()
-            from backend.redis import get_redis_client
-            from backend.redis.keys import POSITION_KEY
-            redis_client = get_redis_client()
-            key = POSITION_KEY.format(symbol=position.symbol)
-            redis_client.hset(key, mapping=position.to_dict())
-            
-            # Log BREAKEVEN_GUARD_ACTIVATED activity
-            from backend.api.routes.events import log_activity
-            log_activity(
-                activity_type="BREAKEVEN_GUARD_ACTIVATED",
-                message=(
-                    f"Breakeven guard activated: {position.symbol} - "
-                    f"stop moved to ${breakeven_price:.3f} "
-                    f"(entry: ${breakeven_reference_price:.2f} + fees, profit: {profit_pct:.2f}%)"
-                ),
-                details={
-                    "symbol": position.symbol,
-                    "breakeven_stop_price": breakeven_price,
-                    "entry_price": breakeven_reference_price,
-                    "fees_per_unit": fees_per_unit,
-                    "profit_pct": profit_pct,
-                    "scout_entry_price": position.scout_entry_price,
-                    "effective_stop_price": effective_stop_price,
-                    "trailing_stop_active": position.trailing_stop_active,
-                    "strategy": position.opened_by_strategy_id,
-                },
-            )
-            
+
         except Exception as e:
             logger.error(f"Error checking breakeven guard for {position.symbol}: {e}", exc_info=True)
     
@@ -1099,9 +1570,10 @@ class PositionMonitor:
                 # Trailing stop is active - check for update or exit
                 # Check if price dropped to trailing stop (exit condition)
                 if current_price <= position.trailing_stop_price:
+                    _be_str = f"${position.breakeven_stop_price:.2f}" if position.breakeven_stop_price else "N/A"
                     logger.info(
-                        f"ATR trailing stop triggered: {position.symbol} @ ${current_price:.2f} <= ${effective_stop_for_exit:.2f} "
-                        f"(trailing: ${position.trailing_stop_price:.2f}, breakeven: ${position.breakeven_stop_price:.2f if position.breakeven_stop_price else 'N/A'})"
+                        f"ATR trailing stop triggered: {position.symbol} @ ${current_price:.2f} <= ${position.trailing_stop_price:.2f} "
+                        f"(trailing: ${position.trailing_stop_price:.2f}, breakeven: {_be_str})"
                     )
                     
                     # Get strategy name for logging
@@ -1232,44 +1704,32 @@ class PositionMonitor:
             if not position.stop_loss_order_id:
                 logger.warning(f"No stop-loss order ID for {position.symbol}, cannot update")
                 return
-            
-            client = self._get_kraken_client()
-            
-            # Cancel old stop-loss order
-            client.cancel_order(position.stop_loss_order_id)
+
+            from backend.execution import kraken_cli as _kraken_cli
+
+            await _kraken_cli.cancel_order(position.stop_loss_order_id)
             logger.info(f"Cancelled old stop-loss order {position.stop_loss_order_id}")
-            
-            # Round stop price to 3 decimal places
+
             stop_price_rounded = round(new_stop_price, 3)
-            
-            stop_loss_response = client.add_order(
-                symbol=position.symbol,  # Use symbol, not pair (KrakenClient expects symbol)
+            kraken_pair = _kraken_cli.symbol_to_cli_pair(position.symbol)
+
+            sl_result = await _kraken_cli.place_order(
+                pair=kraken_pair,
                 side="sell",
+                quantity=float(position.quantity),
                 order_type="stop-loss",
-                volume=float(position.quantity),
                 price=stop_price_rounded,
             )
-            
-            # Extract txid from response (KrakenClient returns dict)
-            if "result" in stop_loss_response and "txid" in stop_loss_response["result"]:
-                txids = stop_loss_response["result"]["txid"]
-                if isinstance(txids, list) and len(txids) > 0:
-                    new_txid = txids[0]
-                else:
-                    new_txid = str(txids)
-            else:
-                logger.warning(f"Unexpected stop-loss response format: {stop_loss_response}")
-                return
-            
-            # Update position with new stop-loss info
+            txid_raw = sl_result.get("txid", "")
+            new_txid = txid_raw[0] if isinstance(txid_raw, list) else str(txid_raw)
+
             position.stop_loss_order_id = new_txid
             position.stop_loss_price = stop_price_rounded
-            
+
             logger.info(
-                f"Updated stop-loss to ${stop_price_rounded:.3f} "
-                f"(new txid: {new_txid})"
+                f"Updated stop-loss to ${stop_price_rounded:.3f} (new txid: {new_txid})"
             )
-            
+
         except Exception as e:
             logger.error(f"Failed to update Kraken stop-loss for {position.symbol}: {e}", exc_info=True)
             # Continue even if stop-loss update fails

@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import CORS_ORIGINS, LOG_LEVEL
-from backend.api.routes import health, panic, strategies, signals, orders, status, positions, account, screener, trading, events, metrics
+from backend.api.routes import health, panic, strategies, signals, orders, status, positions, account, screener, trading, events, metrics, history, supervisor, analytics
 from backend.api import websocket
 from backend.positions.tracker import get_position_tracker, SYNC_INTERVAL_SECONDS
 from backend.positions.monitor import PositionMonitor
@@ -83,8 +83,20 @@ app.include_router(screener.router, prefix="/api/v1", tags=["Screener"])
 app.include_router(trading.router, prefix="/api/v1", tags=["Trading"])
 app.include_router(metrics.router, prefix="/api/v1", tags=["Strategies"])
 app.include_router(events.router, prefix="/api/v1", tags=["Events"])
+app.include_router(history.router, prefix="/api/v1", tags=["History"])
+app.include_router(supervisor.router, prefix="/api/v1", tags=["Supervisor"])
+app.include_router(analytics.router, prefix="/api/v1", tags=["Analytics"])
 
 logger.info("FastAPI application initialized")
+
+# TODO SECURITY (CRIT-2): Authentication middleware is required before live trading.
+#   All private API routes must be protected. Consider FastAPI dependency injection
+#   with JWT/API-key validation, or an external reverse-proxy auth layer (e.g. nginx
+#   with basic auth). No real order should ever be reachable without authentication.
+#
+# TODO SECURITY (CRIT-3): Rate limiting middleware is required before live trading.
+#   Without rate limiting, the API is vulnerable to abuse and accidental order floods.
+#   Consider slowapi (Starlette rate-limiter) or a gateway-level solution.
 
 
 def _signal_handler(signum, frame):
@@ -128,7 +140,7 @@ async def _periodic_kraken_sync():
             
             logger.info(f"Running periodic Kraken position sync (every {SYNC_INTERVAL_SECONDS}s)")
             tracker = get_position_tracker()
-            result = tracker.sync_from_kraken()
+            result = await tracker.sync_from_kraken()
             logger.info(f"Periodic sync result: {result}")
         except asyncio.CancelledError:
             logger.info("Periodic Kraken sync task cancelled")
@@ -209,6 +221,21 @@ async def startup_event():
     global _sync_task, _risk_recalc_task, _screener_service, _position_monitor
     
     logger.info("API server starting up")
+
+    try:
+        from backend.startup.validation import run_startup_validation
+
+        run_startup_validation()
+    except Exception as e:
+        logger.error(f"Startup validation failed: {e}", exc_info=True)
+
+    # Start persistent audit writer (PostgreSQL background thread)
+    try:
+        from backend.db.audit import init_audit_writer
+        init_audit_writer()
+        logger.info("Audit writer started")
+    except Exception as e:
+        logger.error(f"Failed to start audit writer: {e}", exc_info=True)
     
     # Sync positions from Kraken on startup (skip in shadow mode)
     try:
@@ -216,7 +243,7 @@ async def startup_event():
         if not get_shadow_live_mode():
             logger.info("Running initial Kraken position sync...")
             tracker = get_position_tracker()
-            result = tracker.sync_from_kraken()
+            result = await tracker.sync_from_kraken()
             logger.info(f"Initial Kraken sync complete: {result}")
         else:
             logger.info("Skipping initial Kraken sync (shadow mode active)")
@@ -255,6 +282,7 @@ async def startup_event():
         from backend.runner.config import SCREENER_INTERVAL_SECONDS
         _screener_service = ScreenerService(scan_interval_seconds=SCREENER_INTERVAL_SECONDS)
         await _screener_service.start()
+        
         logger.info(f"Screener background service started (interval={SCREENER_INTERVAL_SECONDS}s)")
     except Exception as e:
         logger.error(f"Failed to start screener service: {e}", exc_info=True)
@@ -307,4 +335,12 @@ async def shutdown_event():
         await _screener_service.stop()
         logger.info("Screener background service stopped")
     
+    # Flush and stop audit writer
+    try:
+        from backend.db.audit import shutdown_audit_writer
+        shutdown_audit_writer()
+        logger.info("Audit writer stopped")
+    except Exception as e:
+        logger.error(f"Failed to stop audit writer: {e}", exc_info=True)
+
     logger.info("Shutdown complete")

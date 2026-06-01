@@ -2,14 +2,13 @@
 
 import logging
 import time
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from backend.db import get_engine
+from backend.ingestor.health import check_ingestor_health, check_websocket_health
 from backend.redis import get_redis_client
 
 logger = logging.getLogger(__name__)
@@ -18,13 +17,6 @@ router = APIRouter()
 
 # Service start time for uptime calculation
 _SERVICE_START_TIME: float = time.time()
-
-# Redis keys
-INGESTOR_HEARTBEAT_KEY = "ingestor:heartbeat"
-INGESTOR_SYMBOLS_KEY = "ingestor:symbols_count"
-
-# Ingestor heartbeat max age (seconds)
-INGESTOR_HEARTBEAT_MAX_AGE_SECONDS = 60
 
 
 # --- Response Models ---
@@ -109,97 +101,6 @@ def _check_database_health() -> tuple[str, float]:
         return ("disconnected", 0.0)
 
 
-def _check_ingestor_health(redis_client) -> tuple[str, int]:
-    """
-    Check ingestor status via Redis heartbeat.
-    
-    Returns:
-        Tuple of (status, symbols_count)
-    """
-    try:
-        # Always get symbols count (even if heartbeat is missing)
-        symbols_count = _get_ingestor_symbols_count(redis_client)
-        
-        heartbeat = redis_client.get(INGESTOR_HEARTBEAT_KEY)
-        
-        if heartbeat is None:
-            # No heartbeat key - check if there are active streams as indicator
-            if symbols_count > 0:
-                # Streams exist, so ingestor is likely running but not publishing heartbeat
-                return ("running", symbols_count)
-            return ("unknown", symbols_count)
-        
-        # Parse timestamp and check age
-        heartbeat_time = datetime.fromisoformat(heartbeat.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        age_seconds = (now - heartbeat_time).total_seconds()
-        
-        if age_seconds > INGESTOR_HEARTBEAT_MAX_AGE_SECONDS:
-            status = "stale"
-        else:
-            status = "running"
-        
-        return (status, symbols_count)
-    except Exception as e:
-        logger.warning(f"Ingestor health check failed: {e}")
-        return ("error", 0)
-
-
-def _get_ingestor_symbols_count(redis_client) -> int:
-    """
-    Get the number of symbols being ingested.
-    
-    Tries dedicated key first, then falls back to counting market:raw:* keys.
-    """
-    try:
-        # Try dedicated key first
-        count = redis_client.get(INGESTOR_SYMBOLS_KEY)
-        if count is not None:
-            return int(count)
-        
-        # Fallback: count market:raw:* stream keys
-        keys = redis_client.keys("market:raw:*")
-        return len(keys) if keys else 0
-    except Exception as e:
-        logger.warning(f"Failed to get ingestor symbols count: {e}")
-        return 0
-
-
-def _check_websocket_health(redis_client) -> tuple[str, str]:
-    """
-    Check Kraken WebSocket data feed status via ingestor heartbeat.
-    
-    This checks whether the ingestor is actively receiving market data
-    from Kraken WebSocket, NOT the frontend WS client connections.
-    
-    Returns:
-        Tuple of (status, last_heartbeat_timestamp)
-        - "connected" if ingestor heartbeat is fresh (within 60s)
-        - "stale" if heartbeat exists but is older than 60s
-        - "disconnected" if no heartbeat found
-    """
-    try:
-        heartbeat = redis_client.get(INGESTOR_HEARTBEAT_KEY)
-        
-        if heartbeat is None:
-            return ("disconnected", "N/A")
-        
-        # Parse timestamp and check age
-        heartbeat_time = datetime.fromisoformat(heartbeat.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        age_seconds = (now - heartbeat_time).total_seconds()
-        
-        if age_seconds > INGESTOR_HEARTBEAT_MAX_AGE_SECONDS:
-            status = "stale"
-        else:
-            status = "connected"
-        
-        return (status, heartbeat)
-    except Exception as e:
-        logger.warning(f"WebSocket health check failed: {e}")
-        return ("error", "N/A")
-
-
 def _determine_overall_status(
     redis_status: str,
     db_status: str,
@@ -271,8 +172,8 @@ async def health_detailed() -> HealthDetailedResponse:
     if redis_status == "connected":
         try:
             client = get_redis_client()
-            ingestor_status, symbols_count = _check_ingestor_health(client)
-            ws_status, ws_last_message = _check_websocket_health(client)
+            ingestor_status, symbols_count = check_ingestor_health(client)
+            ws_status, ws_last_message = check_websocket_health(client)
         except Exception as e:
             logger.error(f"Error checking Redis-dependent health: {e}")
             ingestor_status, symbols_count = ("error", 0)

@@ -12,9 +12,19 @@ export interface MicroModeStatus {
   message: string | null;
 }
 
+/** Open position row on GET /api/v1/account (from position tracker). */
+export interface AccountHolding {
+  symbol: string;
+  quantity: number;
+  value_usd: number;
+  current_price: number;
+  entry_price: number;
+}
+
 export interface AccountState {
   initial_equity: number;
   realized_pnl: number;
+  unrealized_pnl: number;
   current_equity: number;
   total_pnl: number;
   pnl_percent: number;
@@ -22,6 +32,8 @@ export interface AccountState {
   max_risk_per_trade: number;
   daily_loss_limit: number;
   risk_pct: number;
+  available_usd?: number;
+  holdings?: AccountHolding[];
   micro_mode?: MicroModeStatus;
   live_slots_active?: number;
   live_slots_max?: number;

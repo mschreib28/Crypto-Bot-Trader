@@ -31,7 +31,11 @@ class Position:
     breakeven_stop_price: Optional[float] = None  # Breakeven stop price (entry + fees)
     trailing_stop_active: bool = False  # Whether ATR trailing stop is active
     trailing_stop_price: Optional[float] = None  # ATR trailing stop price
-    
+    # Frozen at open: Kraken live vs paper for this position's lifecycle (monitor uses only this).
+    execution_live: bool = False
+    # When set, BUY/SELL ledger uses per-strategy SIM balance (Task 3), not global shadow.
+    strategy_canonical: Optional[str] = None
+
     def __post_init__(self):
         """Validate Position fields."""
         if self.side not in ("long", "short"):
@@ -46,6 +50,18 @@ class Position:
             datetime.fromisoformat(self.entry_time.replace('Z', '+00:00'))
         except ValueError:
             raise ValueError(f"entry_time must be ISO8601 format, got: {self.entry_time}")
+
+    def stop_exit_reason(self) -> str:
+        """Classify a stop-price breach as initial stop, breakeven, or trailing."""
+        if self.stop_loss_price is not None:
+            if self.breakeven_guard_active:
+                if self.side == "long" and self.stop_loss_price >= self.entry_price:
+                    return "breakeven_stop"
+                if self.side == "short" and self.stop_loss_price <= self.entry_price:
+                    return "breakeven_stop"
+            if self.trailing_stop_active and self.trailing_stop_price is not None:
+                return "trailing_stop"
+        return "stop_loss"
     
     def to_dict(self) -> dict:
         """Convert position to dictionary for Redis storage."""
@@ -80,13 +96,27 @@ class Position:
             data["trailing_stop_active"] = "true"
         if self.trailing_stop_price is not None:
             data["trailing_stop_price"] = str(self.trailing_stop_price)
+        if self.execution_live:
+            data["execution_live"] = "true"
+        if self.strategy_canonical:
+            data["strategy_canonical"] = self.strategy_canonical
         return data
     
     @classmethod
     def from_dict(cls, data: dict) -> "Position":
         """Create position from dictionary (Redis retrieval)."""
+        def _dec(v):
+            if v is None:
+                return None
+            return v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else v
+
+        data = {(_dec(k) if isinstance(k, (bytes, bytearray)) else k): _dec(v) if isinstance(v, (bytes, bytearray)) else v for k, v in data.items()}
         stop_loss_price = data.get("stop_loss_price")
-        current_price = data.get("current_price")
+        _cp_raw = data.get("current_price")
+        if _cp_raw is None or (isinstance(_cp_raw, str) and _cp_raw.strip() == ""):
+            current_price = None
+        else:
+            current_price = float(_cp_raw)
         scout_entry_price = data.get("scout_entry_price")
         soldier_entry_price = data.get("soldier_entry_price")
         scale_in_triggered = data.get("scale_in_triggered", "false").lower() == "true"
@@ -94,6 +124,8 @@ class Position:
         breakeven_stop_price = data.get("breakeven_stop_price")
         trailing_stop_active = data.get("trailing_stop_active", "false").lower() == "true"
         trailing_stop_price = data.get("trailing_stop_price")
+        execution_live = str(data.get("execution_live", "false")).lower() == "true"
+        strategy_canonical = data.get("strategy_canonical")
         return cls(
             symbol=data["symbol"],
             side=data["side"],
@@ -101,7 +133,7 @@ class Position:
             entry_price=float(data["entry_price"]),
             entry_time=data["entry_time"],
             unrealized_pnl=float(data.get("unrealized_pnl", 0.0)),
-            current_price=float(current_price) if current_price else None,
+            current_price=current_price,
             opened_by_strategy_id=data.get("opened_by_strategy_id"),
             stop_loss_order_id=data.get("stop_loss_order_id"),
             stop_loss_price=float(stop_loss_price) if stop_loss_price else None,
@@ -112,4 +144,6 @@ class Position:
             breakeven_stop_price=float(breakeven_stop_price) if breakeven_stop_price else None,
             trailing_stop_active=trailing_stop_active,
             trailing_stop_price=float(trailing_stop_price) if trailing_stop_price else None,
+            execution_live=execution_live,
+            strategy_canonical=strategy_canonical if strategy_canonical else None,
         )

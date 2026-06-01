@@ -4,6 +4,7 @@ export interface StrategyFilters {
   min_volume_24h?: number;
   confidence_buy?: number;
   confidence_sell?: number;
+  min_allowed_grade?: string;
   min_circulating_supply?: number;
   max_circulating_supply?: number | null;
   min_change_24h_pct?: number;
@@ -76,6 +77,7 @@ export function useStrategyConfig(strategyId: string | undefined): UseStrategyCo
           min_volume_24h: apiFilters.min_volume_24h,
           confidence_buy: apiFilters.confidence_buy ?? 90,
           confidence_sell: apiFilters.confidence_sell ?? 90,
+          min_allowed_grade: apiFilters.min_allowed_grade ?? 'A+',
           min_circulating_supply: apiFilters.min_circulating_supply,
           max_circulating_supply: apiFilters.max_circulating_supply,
         },
@@ -103,7 +105,7 @@ export function useStrategyConfig(strategyId: string | undefined): UseStrategyCo
       // Transform flat config into nested structure expected by backend
       const payload: {
         parameters: Record<string, string | number | undefined>;
-        filters: Record<string, number | null | undefined>;
+        filters: Record<string, number | string | null | undefined>;
         volume_threshold?: number;
       } = {
         // Send ALL parameters dynamically (includes new A+ filters)
@@ -112,6 +114,7 @@ export function useStrategyConfig(strategyId: string | undefined): UseStrategyCo
           min_volume_24h: filters?.min_volume_24h,
           confidence_buy: filters?.confidence_buy,
           confidence_sell: filters?.confidence_sell,
+          min_allowed_grade: filters?.min_allowed_grade,
           min_circulating_supply: filters?.min_circulating_supply,
           max_circulating_supply: filters?.max_circulating_supply,
           min_change_24h_pct: filters?.min_change_24h_pct,
@@ -165,6 +168,7 @@ export function useStrategyConfig(strategyId: string | undefined): UseStrategyCo
           min_volume_24h: apiFilters.min_volume_24h,
           confidence_buy: apiFilters.confidence_buy ?? 90,
           confidence_sell: apiFilters.confidence_sell ?? 90,
+          min_allowed_grade: apiFilters.min_allowed_grade ?? 'A+',
           min_circulating_supply: apiFilters.min_circulating_supply,
           max_circulating_supply: apiFilters.max_circulating_supply,
         },

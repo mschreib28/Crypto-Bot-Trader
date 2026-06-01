@@ -70,6 +70,44 @@ class VWAPMeanReversionStrategy(BaseStrategy):
             f"htf_interval={config.htf_interval}, risk_pct={config.notional_risk_pct}"
         )
     
+    def _check_1m_green_candle(self, symbol: str) -> bool:
+        """
+        Check if the most recent 1-minute candle closed green (Ross Cameron spec).
+        
+        "MUST wait for the first 1-minute candle to close green (no falling knives)"
+        
+        Args:
+            symbol: Trading pair symbol
+            
+        Returns:
+            True if 1-minute green candle confirmed, False otherwise
+            Returns True if 1-minute data unavailable (graceful degradation)
+        """
+        try:
+            # Fetch 1-minute bars using base class method
+            one_min_bars = self.fetch_htf_bars(symbol, "1m", count=1)
+            
+            if not one_min_bars or len(one_min_bars) == 0:
+                # No 1-minute data available - graceful degradation: allow signal
+                logger.debug(f"No 1-minute bars available for {symbol}, skipping green candle check")
+                return True
+            
+            # Check the most recent 1-minute candle
+            latest_1m = one_min_bars[-1]
+            is_green = latest_1m.close > latest_1m.open
+            
+            if not is_green:
+                logger.debug(
+                    f"1-minute green candle check failed for {symbol}: "
+                    f"close={latest_1m.close:.2f} <= open={latest_1m.open:.2f}"
+                )
+            
+            return is_green
+        except Exception as e:
+            # Graceful degradation: if we can't check 1-minute bars, allow the signal
+            logger.warning(f"Failed to check 1-minute green candle for {symbol}: {e}, allowing signal")
+            return True
+    
     def _check_momentum_exclusion(self, bars: List[MarketDataEvent], side: str) -> tuple[bool, Optional[str]]:
         """
         Check momentum exclusion (knife-catch prevention).
@@ -291,6 +329,22 @@ class VWAPMeanReversionStrategy(BaseStrategy):
             logger.error(f"Error checking regime filter: {e}", exc_info=True)
             return (True, f"regime_check_error: {str(e)}")
     
+    def _latest_htf_rsi(self, symbol: str) -> Optional[float]:
+        """RSI on ``htf_interval`` closes (uses ``rsi_period``). None if insufficient data."""
+        try:
+            if len(self._htf_bars) < 50:
+                htf_bars = self.fetch_htf_bars(symbol, self.config.htf_interval, count=200)
+                if htf_bars:
+                    self._htf_bars.extend(htf_bars)
+            need = self.config.rsi_period + 5
+            if len(self._htf_bars) < need:
+                return None
+            htf_closes = [b.close for b in self._htf_bars]
+            return calculate_rsi(htf_closes, period=self.config.rsi_period)
+        except Exception as e:
+            logger.debug("HTF RSI unavailable: %s", e)
+            return None
+    
     def _calculate_vwap_values(self, bars: List[MarketDataEvent]) -> tuple[Optional[float], Optional[float]]:
         """
         Calculate session VWAP and anchored VWAP.
@@ -511,19 +565,43 @@ class VWAPMeanReversionStrategy(BaseStrategy):
         current_volume = volumes[-1]
         volume_ratio = current_volume / volume_sma if volume_sma > 0 else 1.0
         
-        # Check volume filter
+        # Conservative cap on abnormally high volume (skip for long-only + min spike mode)
         if self.config.volume_filter_mode == "conservative":
             if volume_ratio > self.config.volume_max_mult:
-                logger.debug(f"Volume too high: {volume_ratio:.2f} > {self.config.volume_max_mult}")
-                return None
+                skip_high_vol_cap = self.config.long_min_volume_ratio is not None
+                if not skip_high_vol_cap:
+                    logger.debug(
+                        f"Volume too high: {volume_ratio:.2f} > {self.config.volume_max_mult}"
+                    )
+                    return None
         
         current_price = bar.close
         
+        htf_rsi_val: Optional[float] = None
+        if self.config.htf_rsi_long_max is not None:
+            htf_rsi_val = self._latest_htf_rsi(bar.symbol)
+        
         # ============================================================
-        # LONG SIGNAL LOGIC
+        # LONG SIGNAL LOGIC (Ross Cameron spec)
         # ============================================================
         deviation_long = vwap - current_price
-        deviation_long_atr = deviation_long / atr if atr > 0 else 0
+        
+        # Initialize deviation variables
+        deviation_long_pct = None
+        deviation_long_atr = None
+        
+        # Ross Cameron spec: Price > 2% below VWAP (percentage-based, not ATR-based)
+        if self.config.use_percentage_deviation:
+            deviation_long_pct = (deviation_long / vwap) * 100.0 if vwap > 0 else 0
+            deviation_check = deviation_long_pct >= self.config.dev_threshold_pct
+            deviation_value = deviation_long_pct
+            deviation_unit = "%"
+        else:
+            # Legacy ATR-based deviation
+            deviation_long_atr = deviation_long / atr if atr > 0 else 0
+            deviation_check = deviation_long_atr >= self.config.dev_threshold_ATR
+            deviation_value = deviation_long_atr
+            deviation_unit = "ATR"
         
         # Check momentum exclusion (knife-catch prevention)
         momentum_exclude, momentum_reason = self._check_momentum_exclusion(bars_list, "buy")
@@ -541,10 +619,29 @@ class VWAPMeanReversionStrategy(BaseStrategy):
                 logger.debug(f"LONG signal blocked by VWAP slope guard: {slope_reason}, only {confirmation_count}/{self.config.vwap_slope_confirmation_bars} confirmation candles")
                 return None
         
+        # Ross Cameron spec: Check for 1-minute green candle confirmation
+        # "MUST wait for the first 1-minute candle to close green (no falling knives)"
+        one_min_green_confirmed = self._check_1m_green_candle(bar.symbol)
+        
+        long_vol_ok = (
+            self.config.long_min_volume_ratio is None
+            or volume_ratio >= self.config.long_min_volume_ratio
+        )
+        htf_rsi_ok = (
+            self.config.htf_rsi_long_max is None
+            or (
+                htf_rsi_val is not None
+                and htf_rsi_val <= self.config.htf_rsi_long_max
+            )
+        )
+        
         if (
-            deviation_long_atr >= self.config.dev_threshold_ATR and
+            deviation_check and
             rsi <= self.config.rsi_oversold and
-            self._check_reversal_confirmation(bar, vwap, "buy")
+            self._check_reversal_confirmation(bar, vwap, "buy") and
+            one_min_green_confirmed
+            and long_vol_ok
+            and htf_rsi_ok
         ):
             # Calculate entry price (near VWAP retest)
             entry_price = min(current_price, vwap + (atr * self.config.entry_offset_ATR))
@@ -554,8 +651,9 @@ class VWAPMeanReversionStrategy(BaseStrategy):
             
             logger.info(
                 f"LONG signal: price={current_price:.2f}, vwap={vwap:.2f}, "
-                f"deviation={deviation_long_atr:.2f}ATR, rsi={rsi:.2f}, "
-                f"entry={entry_price:.2f}, stop={levels['stop_loss_price']:.2f}"
+                f"deviation={deviation_value:.2f}{deviation_unit}, rsi={rsi:.2f}, "
+                f"entry={entry_price:.2f}, stop={levels['stop_loss_price']:.2f}, "
+                f"1m_green={one_min_green_confirmed}"
             )
             
             return TradeIntent(
@@ -584,18 +682,39 @@ class VWAPMeanReversionStrategy(BaseStrategy):
                         "anchored_vwap": round(anchored_vwap, 8) if anchored_vwap else None,
                         "rsi": round(rsi, 2),
                         "atr": round(atr, 8),
-                        "deviation_atr": round(deviation_long_atr, 4),
+                        "deviation_pct": round(deviation_long_pct, 2) if deviation_long_pct is not None else None,
+                        "deviation_atr": round(deviation_long_atr, 4) if deviation_long_atr is not None else None,
+                        "1m_green_confirmed": one_min_green_confirmed,
                         "volume_ratio": round(volume_ratio, 2),
                     },
                     "timestamp": bar.timestamp,
                 },
             )
         
+        if self.config.long_only:
+            return None
+
         # ============================================================
-        # SHORT SIGNAL LOGIC
+        # SHORT SIGNAL LOGIC (Ross Cameron spec)
         # ============================================================
         deviation_short = current_price - vwap
-        deviation_short_atr = deviation_short / atr if atr > 0 else 0
+        
+        # Initialize deviation variables
+        deviation_short_pct = None
+        deviation_short_atr = None
+        
+        # Ross Cameron spec: Price > 2% above VWAP (percentage-based, not ATR-based)
+        if self.config.use_percentage_deviation:
+            deviation_short_pct = (deviation_short / vwap) * 100.0 if vwap > 0 else 0
+            deviation_check = deviation_short_pct >= self.config.dev_threshold_pct
+            deviation_value = deviation_short_pct
+            deviation_unit = "%"
+        else:
+            # Legacy ATR-based deviation
+            deviation_short_atr = deviation_short / atr if atr > 0 else 0
+            deviation_check = deviation_short_atr >= self.config.dev_threshold_ATR
+            deviation_value = deviation_short_atr
+            deviation_unit = "ATR"
         
         # Check momentum exclusion (knife-catch prevention)
         momentum_exclude, momentum_reason = self._check_momentum_exclusion(bars_list, "sell")
@@ -614,7 +733,7 @@ class VWAPMeanReversionStrategy(BaseStrategy):
                 return None
         
         if (
-            deviation_short_atr >= self.config.dev_threshold_ATR and
+            deviation_check and
             rsi >= self.config.rsi_overbought and
             self._check_reversal_confirmation(bar, vwap, "sell")
         ):
@@ -626,7 +745,7 @@ class VWAPMeanReversionStrategy(BaseStrategy):
             
             logger.info(
                 f"SHORT signal: price={current_price:.2f}, vwap={vwap:.2f}, "
-                f"deviation={deviation_short_atr:.2f}ATR, rsi={rsi:.2f}, "
+                f"deviation={deviation_value:.2f}{deviation_unit}, rsi={rsi:.2f}, "
                 f"entry={entry_price:.2f}, stop={levels['stop_loss_price']:.2f}"
             )
             
@@ -656,7 +775,8 @@ class VWAPMeanReversionStrategy(BaseStrategy):
                         "anchored_vwap": round(anchored_vwap, 8) if anchored_vwap else None,
                         "rsi": round(rsi, 2),
                         "atr": round(atr, 8),
-                        "deviation_atr": round(deviation_short_atr, 4),
+                        "deviation_pct": round(deviation_short_pct, 2) if deviation_short_pct is not None else None,
+                        "deviation_atr": round(deviation_short_atr, 4) if deviation_short_atr is not None else None,
                         "volume_ratio": round(volume_ratio, 2),
                     },
                     "timestamp": bar.timestamp,
@@ -819,8 +939,31 @@ class VWAPMeanReversionStrategy(BaseStrategy):
             signal_type = "NONE"
             confidence = 0.0
             
+            htf_rsi_screen: Optional[float] = None
+            if self.config.htf_rsi_long_max is not None:
+                try:
+                    htf_ev = self.fetch_htf_bars(symbol, self.config.htf_interval, count=200)
+                    if len(htf_ev) >= self.config.rsi_period + 5:
+                        hc = [b.close for b in htf_ev]
+                        htf_rsi_screen = calculate_rsi(hc, period=self.config.rsi_period)
+                except Exception:
+                    htf_rsi_screen = None
+            
+            long_gate_ok = True
+            if self.config.long_min_volume_ratio is not None:
+                long_gate_ok = long_gate_ok and volume_ratio >= self.config.long_min_volume_ratio
+            if self.config.htf_rsi_long_max is not None:
+                long_gate_ok = long_gate_ok and (
+                    htf_rsi_screen is not None
+                    and htf_rsi_screen <= self.config.htf_rsi_long_max
+                )
+            
             # LONG setup scoring
-            if deviation_atr <= -self.config.dev_threshold_ATR and rsi <= self.config.rsi_oversold:
+            if (
+                long_gate_ok
+                and deviation_atr <= -self.config.dev_threshold_ATR
+                and rsi <= self.config.rsi_oversold
+            ):
                 # Base confidence from deviation and RSI
                 deviation_score = min(40.0, abs(deviation_atr) / self.config.dev_threshold_ATR * 20.0)
                 rsi_score = min(30.0, (self.config.rsi_oversold - rsi) / self.config.rsi_oversold * 30.0)
@@ -835,8 +978,8 @@ class VWAPMeanReversionStrategy(BaseStrategy):
                 confidence = deviation_score + rsi_score + volume_score + reversal_score
                 signal_type = "BUY"
             
-            # SHORT setup scoring
-            elif deviation_atr >= self.config.dev_threshold_ATR and rsi >= self.config.rsi_overbought:
+            # SHORT setup scoring (disabled when long_only)
+            elif not self.config.long_only and deviation_atr >= self.config.dev_threshold_ATR and rsi >= self.config.rsi_overbought:
                 # Base confidence from deviation and RSI
                 deviation_score = min(40.0, deviation_atr / self.config.dev_threshold_ATR * 20.0)
                 rsi_score = min(30.0, (rsi - self.config.rsi_overbought) / (100 - self.config.rsi_overbought) * 30.0)
@@ -862,6 +1005,7 @@ class VWAPMeanReversionStrategy(BaseStrategy):
                 "rsi": round(rsi, 2),
                 "atr": round(atr, 8),
                 "volume_ratio": round(volume_ratio, 2),
+                "htf_rsi": round(htf_rsi_screen, 2) if htf_rsi_screen is not None else None,
                 # Frontend display indicators - always include keys
                 "bb_position": round(bb_position, 4) if bb_position is not None else None,
                 "adx": round(adx, 2) if adx is not None else None,

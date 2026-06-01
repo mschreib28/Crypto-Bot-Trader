@@ -36,8 +36,9 @@ htmlcov/
 .coverage
 coverage.xml
 
-# Supervisor cycle logs
+# Logs
 logs/
+*.log
 suit.log
 tmux-*.log
 

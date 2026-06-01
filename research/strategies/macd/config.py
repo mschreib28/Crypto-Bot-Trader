@@ -45,9 +45,9 @@ class MACDConfig:
     ema_trend_period: int = 50
     
     # ADX threshold for trending market confirmation
-    # ADX > 20 indicates a trending market (good for MACD)
-    # ADX < 20 indicates ranging/choppy market (avoid signals)
-    adx_threshold: float = 20.0
+    # ADX > 25 indicates a strong trending market (good for MACD)
+    # ADX < 25 indicates ranging/choppy market (avoid signals)
+    adx_threshold: float = 25.0
     
     # Volume ratio threshold for confirmation
     # Current volume should be > threshold × average volume
@@ -60,7 +60,11 @@ class MACDConfig:
     symbol: str = "BTC/USD"
     
     # Bar interval for analysis (recommended: 1h or 4h for A+ setups)
-    interval: str = "5m"
+    interval: str = "1h"
+    
+    # Stop-loss parameters
+    atr_stop_mult: float = 1.8  # Stop distance = ATR * this multiplier (appropriate for trend following)
+    atr_period: int = 14  # ATR calculation period
     
     # Strategy identifier
     strategy_id: str = "macd_crossover"
@@ -84,6 +88,8 @@ def get_config_schema() -> Dict[str, Any]:
             "volume_threshold": defaults.volume_threshold,
             "notional_risk_pct": defaults.notional_risk_pct,
             "interval": defaults.interval,
+            "atr_stop_mult": defaults.atr_stop_mult,
+            "atr_period": defaults.atr_period,
         },
         "filters": {
             "min_volume_24h": 1000000,

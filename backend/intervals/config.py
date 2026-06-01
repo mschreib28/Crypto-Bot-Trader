@@ -34,12 +34,12 @@ POSITION_MONITOR_INTERVAL_SECONDS: float = UI_REFRESH_INTERVAL_SECONDS
 # ============================================================================
 
 # Screener scan interval
-# Default: 60 seconds for status + previews
-# Hard max: 60 seconds (as per requirements)
+# Default: 30 seconds for near-real-time signal strength updates
+# Min: 30s, max: 60s - balance between freshness and API/CPU load
 # Note: Real signal generation happens on candle close, but screener
-#       can run every 60s for monitoring and candidate detection
-SCREENER_TICK_INTERVAL_SECONDS: float = float(os.getenv("SCREENER_INTERVAL_SECONDS", "60.0"))
-SCREENER_TICK_INTERVAL_SECONDS = min(SCREENER_TICK_INTERVAL_SECONDS, 60.0)  # Cap at 60s max
+#       runs frequently for accurate, up-to-date signal strength display
+SCREENER_TICK_INTERVAL_SECONDS: float = float(os.getenv("SCREENER_INTERVAL_SECONDS", "30.0"))
+SCREENER_TICK_INTERVAL_SECONDS = max(30.0, min(SCREENER_TICK_INTERVAL_SECONDS, 60.0))
 
 # ============================================================================
 # Strategy Timeframes (Per-Strategy Configuration)

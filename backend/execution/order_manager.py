@@ -7,7 +7,7 @@ import logging
 from typing import Dict, Any, Optional
 from decimal import Decimal
 
-from backend.execution.kraken_interface import KrakenClientInterface, KrakenOrderResponse
+# KrakenClientInterface removed — live orders go through kraken_cli.place_order()
 
 logger = logging.getLogger(__name__)
 
@@ -161,52 +161,7 @@ def classify_kraken_error(error_message: str) -> str:
     return "unknown_error"
 
 
-def execute_order(
-    client: KrakenClientInterface,
-    order_params: Dict[str, Any],
-) -> KrakenOrderResponse:
-    """
-    Execute an order on Kraken using the provided client.
-    
-    TICKET-605: Enhanced error handling with error classification.
-    
-    Args:
-        client: Kraken REST API client (implements KrakenClientInterface)
-        order_params: Order parameters from convert_intent_to_order_params
-        
-    Returns:
-        KrakenOrderResponse with exchange_order_id and order details
-        
-    Raises:
-        Exception: If order execution fails (with classified error type in message)
-    """
-    logger.info(f"Executing order with params: {order_params}")
-    
-    try:
-        response = client.add_order(**order_params)
-        
-        if response.error:
-            error_msg = ", ".join(response.error) if isinstance(response.error, list) else str(response.error)
-            error_type = classify_kraken_error(error_msg)
-            classified_error = f"{error_type}: {error_msg}"
-            logger.error(f"Order execution failed: {classified_error}")
-            raise Exception(classified_error)
-        
-        logger.info(f"Order executed successfully: txid={response.txid}")
-        return response
-        
-    except Exception as e:
-        # Classify error if not already classified
-        error_str = str(e)
-        if ":" not in error_str or error_str.split(":")[0] not in [
-            "insufficient_funds", "price_moved", "below_costmin", 
-            "rate_limit", "exchange_error", "network_error", "unknown_error"
-        ]:
-            error_type = classify_kraken_error(error_str)
-            error_str = f"{error_type}: {error_str}"
-        
-        logger.error(f"Order execution failed: {error_str}")
-        raise Exception(error_str)
+# execute_order() removed — live orders now go through kraken_cli.place_order() directly.
 
 
 def calculate_slippage(

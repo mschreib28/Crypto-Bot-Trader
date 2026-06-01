@@ -23,13 +23,9 @@ from backend.risk.limits import (
 )
 from backend.risk.micro_mode import (
     is_micro_mode,
-    check_max_positions,
+    check_entry_position_limits,
     get_micro_mode_status,
-    get_live_slots_max,
-    get_live_slots_status,
 )
-# Lazy import to avoid circular dependency with backend.ingestor.symbols
-# is_in_live_universe imported inside evaluate_intent() function
 
 logger = logging.getLogger(__name__)
 
@@ -92,20 +88,6 @@ def evaluate_intent(trade_intent: TradeIntent) -> RiskDecision:
         f"symbol={trade_intent.symbol}, side={trade_intent.side}, "
         f"intent_type={trade_intent.intent_type}, notional_risk_pct={trade_intent.notional_risk_pct}"
     )
-    
-    # 0. Check live universe restriction (fail-closed: reject if not in live universe)
-    # Lazy import to avoid circular dependency
-    from backend.ingestor.symbols import is_in_live_universe
-    if not is_in_live_universe(trade_intent.symbol):
-        logger.warning(f"TradeIntent rejected: symbol {trade_intent.symbol} not in live universe")
-        return RiskDecision(
-            intent_id=intent_id,
-            approved=False,
-            rejection_reason="not_in_live_universe",
-            evaluated_portfolio_risk=0.0,
-            timestamp=timestamp,
-        )
-    
     # 1. Check system halt state (fail-closed: reject if halted)
     if is_halted():
         logger.warning(f"TradeIntent rejected: system is halted")
@@ -230,7 +212,83 @@ def evaluate_intent(trade_intent: TradeIntent) -> RiskDecision:
             timestamp=timestamp,
         )
     
-    # 9. Check daily loss limit (halt if exceeded)
+    # 9. Check max drawdown kill switch (Ross Cameron spec: 3.0% daily equity drop)
+    try:
+        from backend.config import MAX_DRAWDOWN_PCT
+        from backend.risk.portfolio import get_daily_pnl, get_current_equity
+
+        # Get initial equity for today (start of day)
+        session = get_session()
+        try:
+            from backend.db.models import EquityCurve
+            from sqlalchemy import desc
+            
+            now = datetime.now(timezone.utc)
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            # Get first equity snapshot of today
+            first_today = (
+                session.query(EquityCurve.total_equity)
+                .filter(EquityCurve.timestamp >= today_start)
+                .order_by(EquityCurve.timestamp)
+                .first()
+            )
+            
+            if first_today:
+                initial_equity_today = float(first_today[0])
+                current_equity_val = float(get_current_equity(session))
+                
+                if initial_equity_today > 0:
+                    drawdown_pct = ((initial_equity_today - current_equity_val) / initial_equity_today) * 100.0
+                    
+                    if drawdown_pct >= MAX_DRAWDOWN_PCT:
+                        logger.error(
+                            f"MAX DRAWDOWN KILL SWITCH TRIGGERED: "
+                            f"Daily equity drop {drawdown_pct:.2f}% >= {MAX_DRAWDOWN_PCT}% "
+                            f"(initial=${initial_equity_today:.2f}, current=${current_equity_val:.2f})"
+                        )
+                        
+                        # Execute panic sequence: halt system, cancel orders, disable trading
+                        from backend.execution.panic import execute_panic_sequence
+                        panic_result = execute_panic_sequence()
+                        
+                        logger.error(
+                            f"PANIC SEQUENCE EXECUTED: {panic_result.get('orders_cancelled', 0)} orders cancelled, "
+                            f"trading disabled={panic_result.get('trading_disabled', False)}"
+                        )
+                        
+                        from backend.api.routes.events import log_activity
+                        log_activity(
+                            activity_type="PANIC_KILL_SWITCH",
+                            message=(
+                                f"MAX DRAWDOWN KILL SWITCH: Daily equity dropped {drawdown_pct:.2f}% "
+                                f"(initial=${initial_equity_today:.2f}, current=${current_equity_val:.2f}). "
+                                f"All trading halted, orders cancelled."
+                            ),
+                            details={
+                                "drawdown_pct": drawdown_pct,
+                                "max_drawdown_pct": MAX_DRAWDOWN_PCT,
+                                "initial_equity": initial_equity_today,
+                                "current_equity": current_equity_val,
+                                "orders_cancelled": panic_result.get("orders_cancelled", 0),
+                            },
+                        )
+                        
+                        return RiskDecision(
+                            intent_id=intent_id,
+                            approved=False,
+                            rejection_reason=f"max_drawdown_kill_switch_{drawdown_pct:.2f}%",
+                            evaluated_portfolio_risk=total_exposure_after,
+                            timestamp=timestamp,
+                        )
+        finally:
+            session.close()
+    except Exception as e:
+        # If we can't check drawdown, log warning but continue
+        # This is a softer failure since drawdown check is a safety net
+        logger.warning(f"Could not check max drawdown: {e}. Continuing evaluation.")
+    
+    # 10. Check daily loss limit (halt if exceeded)
     try:
         from backend.risk.portfolio import get_daily_pnl
         daily_pnl = get_daily_pnl(session=None)
@@ -269,79 +327,40 @@ def evaluate_intent(trade_intent: TradeIntent) -> RiskDecision:
             evaluated_portfolio_risk=total_exposure_after,
             timestamp=timestamp,
         )
-    
-    # 11. Check micro mode limits (if active)
-    if is_micro_mode(float(current_equity)):
-        # Get current position count
+
+    # 11b. Mode-aware entry position slots (BUY only; never block exits)
+    if trade_intent.side == "buy":
         try:
             from backend.positions.tracker import get_position_tracker
+            from backend.supervisor.store import canonical_name
+
             tracker = get_position_tracker()
-            current_positions = tracker.get_all_positions()
-            position_count = len(current_positions)
-            
-            # Check max positions limit (micro mode: max 1 position)
-            can_open_new, position_reason = check_max_positions(position_count)
-            if not can_open_new:
+            canon = canonical_name(trade_intent.strategy_id)
+            can_open, slot_reason = check_entry_position_limits(
+                trade_intent.symbol, canon, tracker
+            )
+            if not can_open:
                 logger.warning(
-                    f"TradeIntent rejected (micro mode): {position_reason}. "
-                    f"Current positions: {position_count}"
+                    f"TradeIntent rejected (position slots): {slot_reason}"
                 )
                 return RiskDecision(
                     intent_id=intent_id,
                     approved=False,
-                    rejection_reason=f"micro_mode_{position_reason}",
+                    rejection_reason=f"position_slot_{slot_reason}",
                     evaluated_portfolio_risk=total_exposure_after,
                     timestamp=timestamp,
                 )
         except Exception as e:
-            logger.warning(f"Failed to check micro mode position limit: {e}. Continuing evaluation.")
-    
-    # 12. Check live slots limit (after micro mode check)
-    try:
-        from backend.positions.tracker import get_position_tracker
-        tracker = get_position_tracker()
-        current_live_positions = tracker.get_live_position_count()
-        live_slots_max = get_live_slots_max(float(current_equity))
-        
-        logger.info(
-            f"LIVE_SLOTS check: {current_live_positions}/{live_slots_max} slots used"
-        )
-        
-        if current_live_positions >= live_slots_max:
-            # Check if Shadow Mode is enabled
-            try:
-                from backend.api.routes.trading import get_shadow_live_mode
-                shadow_mode_enabled = get_shadow_live_mode()
-            except Exception as e:
-                logger.warning(f"Failed to check shadow mode: {e}")
-                shadow_mode_enabled = False
-            
-            if shadow_mode_enabled:
-                logger.info(
-                    f"Live slots full ({current_live_positions}/{live_slots_max}), "
-                    f"routing to Shadow Mode"
-                )
-                return RiskDecision(
-                    intent_id=intent_id,
-                    approved=False,
-                    rejection_reason="live_slots_full_routed_to_shadow",
-                    evaluated_portfolio_risk=total_exposure_after,
-                    timestamp=timestamp,
-                )
-            else:
-                logger.warning(
-                    f"Live slots full ({current_live_positions}/{live_slots_max}), "
-                    f"Shadow Mode disabled - rejecting"
-                )
-                return RiskDecision(
-                    intent_id=intent_id,
-                    approved=False,
-                    rejection_reason="live_slots_full",
-                    evaluated_portfolio_risk=total_exposure_after,
-                    timestamp=timestamp,
-                )
-    except Exception as e:
-        logger.warning(f"Failed to check live slots limit: {e}. Continuing evaluation.")
+            logger.warning(
+                f"Failed to check entry position limits: {e}. Rejecting (fail-closed)."
+            )
+            return RiskDecision(
+                intent_id=intent_id,
+                approved=False,
+                rejection_reason="position_slot_check_failed",
+                evaluated_portfolio_risk=total_exposure_after,
+                timestamp=timestamp,
+            )
     
     # All checks passed - approve the intent
     logger.info(

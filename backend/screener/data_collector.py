@@ -9,8 +9,9 @@ Fetches required data for scoring:
 
 import json
 import logging
+import requests
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from backend.ingestor.historical import fetch_kraken_ohlc
 from backend.ingestor.symbols import (
@@ -27,6 +28,100 @@ logger = logging.getLogger(__name__)
 # Redis cache keys for 50-day SMA
 HOURLY_SMA_50D_CACHE_KEY_PREFIX = "screener:hourly_sma_50d:"
 HOURLY_SMA_50D_CACHE_TTL = 3600  # 1 hour TTL (update once per hour)
+
+# Redis cache for 50-day daily SMA (from Kraken REST API)
+DAILY_SMA_50D_CACHE_KEY_PREFIX = "screener:daily_sma_50d:"
+DAILY_SMA_50D_CACHE_TTL = 86400  # 24-hour TTL (daily bars change slowly)
+
+KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
+
+
+def _symbol_to_kraken_pair(symbol: str) -> str:
+    """Convert 'ETH/USD' -> 'ETHUSD', 'BTC/USD' -> 'XBTUSD'."""
+    pair = symbol.replace("/", "")
+    if pair.startswith("BTC"):
+        pair = "XBT" + pair[3:]
+    return pair
+
+
+def fetch_daily_sma_50d(symbol: str) -> Optional[float]:
+    """
+    Fetch the 50-day average daily volume for a symbol using Kraken's public OHLC API.
+
+    Uses Redis cache with a 24-hour TTL so each symbol is only fetched once per day.
+    This works from day one — no need for weeks of local Redis bar data.
+
+    Returns the average daily volume (in base currency) or None on failure.
+    """
+    cache_key = f"{DAILY_SMA_50D_CACHE_KEY_PREFIX}{symbol}"
+
+    # Check Redis cache first
+    try:
+        client = get_redis_client()
+        cached = client.get(cache_key)
+        if cached:
+            if isinstance(cached, bytes):
+                cached = cached.decode()
+            return float(cached)
+    except Exception as e:
+        logger.debug(f"[RVOL] Cache read failed for {symbol}: {e}")
+
+    # Fetch from Kraken public OHLC endpoint (no auth required)
+    try:
+        pair = _symbol_to_kraken_pair(symbol)
+        resp = requests.get(
+            KRAKEN_OHLC_URL,
+            params={"pair": pair, "interval": 1440},  # 1440 min = daily
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("error"):
+            logger.debug(f"[RVOL] Kraken error for {symbol}: {data['error']}")
+            return None
+
+        result = data.get("result", {})
+        pair_data: Optional[List] = None
+        for key in result:
+            if key != "last":
+                pair_data = result[key]
+                break
+
+        if not pair_data or len(pair_data) < 7:
+            logger.debug(f"[RVOL] Insufficient daily bars for {symbol}: {len(pair_data) if pair_data else 0}")
+            return None
+
+        # Kraken OHLC format: [time, open, high, low, close, vwap, volume, count]
+        # Convert base-currency volume to USD using vwap: usd_vol = vwap × volume
+        # This matches get_symbol_volume() which also returns USD volume.
+        bars = pair_data[-50:]
+        usd_volumes = []
+        for row in bars:
+            vwap = float(row[5])
+            vol = float(row[6])
+            if vwap > 0 and vol > 0:
+                usd_volumes.append(vwap * vol)
+
+        if len(usd_volumes) < 7:
+            logger.debug(f"[RVOL] Not enough valid daily volumes for {symbol}: {len(usd_volumes)}")
+            return None
+
+        avg_daily_volume = sum(usd_volumes) / len(usd_volumes)
+
+        # Cache result
+        try:
+            client = get_redis_client()
+            client.setex(cache_key, DAILY_SMA_50D_CACHE_TTL, str(avg_daily_volume))
+        except Exception as e:
+            logger.debug(f"[RVOL] Cache write failed for {symbol}: {e}")
+
+        logger.debug(f"[RVOL] {symbol}: 50-day daily avg volume = {avg_daily_volume:.2f} ({len(volumes)} bars)")
+        return avg_daily_volume
+
+    except Exception as e:
+        logger.debug(f"[RVOL] Failed to fetch daily SMA for {symbol}: {e}")
+        return None
 
 # Number of 1-hour bars needed for 50-day SMA (50 days * 24 hours = 1200 bars)
 REQUIRED_HOURLY_BARS = 1200
@@ -195,29 +290,6 @@ def fetch_market_data(symbol: str) -> Dict[str, Any]:
     coingecko_data = get_market_data(symbol)
     result["market_cap"] = coingecko_data.get("market_cap")
     result["supply_ratio"] = coingecko_data.get("supply_ratio")
-    
-    # #region agent log
-    import time
-    try:
-        with open("/home/kevin/Documents/Projects/Personal/Crypto Bot Trading/.cursor/debug-d22363.log", "a") as f:
-            log_entry = {
-                "sessionId": "d22363",
-                "runId": "initial",
-                "hypothesisId": "C",
-                "location": "data_collector.py:197",
-                "message": "Market data fetched from CoinGecko",
-                "data": {
-                    "symbol": symbol,
-                    "market_cap": result["market_cap"],
-                    "supply_ratio": result["supply_ratio"],
-                    "coingecko_data": coingecko_data
-                },
-                "timestamp": int(time.time() * 1000)
-            }
-            f.write(json.dumps(log_entry) + "\n")
-    except Exception:
-        pass
-    # #endregion
     
     # Fetch 1-hour volume
     current_1h_volume = fetch_1h_volume(symbol)

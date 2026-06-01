@@ -4,10 +4,10 @@ This strategy uses Bollinger Bands and RSI to identify oversold and overbought c
 for mean-reversion trading on ETH/USD.
 
 A+ Setup Criteria (weighted confidence scoring):
-- RSI at extreme levels (oversold < 25 or overbought > 75)
+- RSI extremes vs MeanReversionConfig thresholds (oversold / overbought)
 - Price at outer Bollinger Bands (< 10% or > 90% position)
-- ADX < 20 (ranging market - CRITICAL for mean reversion)
-- ATR > average (market is active, not dead)
+- ADX below adx_max_threshold (ranging market — CRITICAL for mean reversion)
+- ATR ratio vs atr_min_ratio (market active, not dead)
 
 Mean reversion FAILS in trending markets. The ADX filter is essential.
 """
@@ -20,6 +20,7 @@ from typing import Deque, List, Optional
 from research.strategies.base import BaseStrategy
 from research.strategies.indicators import (
     calculate_adx,
+    calculate_atr,
     calculate_atr_ratio,
 )
 from research.strategies.meanrev.config import MeanReversionConfig
@@ -65,6 +66,10 @@ class MeanReversionStrategy(BaseStrategy):
         
         # Price change history for RSI calculation
         self._price_changes: Deque[float] = deque(maxlen=config.rsi_period)
+        
+        # Rolling window of bars for ATR calculation
+        # Need at least atr_period + 1 bars for ATR calculation
+        self._bars: Deque[MarketDataEvent] = deque(maxlen=max(config.atr_period + 1, config.lookback_period + 10))
         
         logger.info(
             f"Initialized MeanReversionStrategy: "
@@ -197,6 +202,9 @@ class MeanReversionStrategy(BaseStrategy):
             )
             return None
         
+        # Update bars window for ATR calculation
+        self._bars.append(bar)
+        
         # Store previous price for RSI calculation
         previous_price = self._price_history[-1] if self._price_history else None
         
@@ -257,6 +265,28 @@ class MeanReversionStrategy(BaseStrategy):
                 f"upper_band={upper_band:.2f}, rsi={rsi:.2f}"
             )
             
+            # Calculate ATR for stop-loss calculation
+            bars_list = list(self._bars)
+            if len(bars_list) < self.config.atr_period + 1:
+                logger.debug("Insufficient bars for ATR calculation")
+                return None
+            
+            highs = [b.high for b in bars_list]
+            lows = [b.low for b in bars_list]
+            closes = [b.close for b in bars_list]
+            
+            atr = calculate_atr(highs, lows, closes, period=self.config.atr_period)
+            if atr is None or atr == 0:
+                logger.debug("Could not calculate ATR")
+                return None
+            
+            # Calculate stop-loss above upper Bollinger Band with buffer
+            entry_price = bar.close
+            stop_above_band = upper_band + (atr * self.config.stop_buffer_ATR)
+            # Ensure minimum distance is atr * atr_stop_mult
+            min_stop_distance = atr * self.config.atr_stop_mult
+            stop_loss_price = max(stop_above_band, entry_price + min_stop_distance)
+            
             return TradeIntent(
                 strategy_id=self.config.strategy_id,
                 symbol=self.config.symbol,
@@ -271,6 +301,10 @@ class MeanReversionStrategy(BaseStrategy):
                     "lower_band": round(lower_band, 2),
                     "price": round(bar.close, 2),
                     "timestamp": bar.timestamp,
+                    "stop_loss_price": round(stop_loss_price, 8),
+                    "atr": round(atr, 8),
+                    "atr_stop_mult": self.config.atr_stop_mult,
+                    "stop_buffer_ATR": self.config.stop_buffer_ATR,
                 },
             )
         

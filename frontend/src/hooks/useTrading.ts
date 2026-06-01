@@ -13,7 +13,7 @@ interface UseTradinReturn {
   refetch: () => Promise<void>;
 }
 
-const POLL_INTERVAL_MS = 10000;
+const POLL_INTERVAL_MS = 30000;
 
 export function useTrading(): UseTradinReturn {
   const [trading, setTrading] = useState<TradingState | null>(null);

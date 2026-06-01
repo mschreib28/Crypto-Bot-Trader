@@ -1,3 +1,6 @@
+# RETIRED May 2026 — no edge as standalone. MACD used as confirmation
+# filter inside bull_flag strategy only.
+
 """MACD Crossover strategy implementation for cryptocurrency trading.
 
 This strategy generates trading signals based on MACD (Moving Average Convergence
@@ -29,6 +32,7 @@ from typing import Any, Dict, List, Optional
 from research.strategies.base import BaseStrategy
 from research.strategies.indicators import (
     calculate_adx,
+    calculate_atr,
     calculate_ema,
     calculate_volume_ratio,
 )
@@ -81,6 +85,10 @@ class MACDStrategy(BaseStrategy):
         # Need enough data for slow EMA + signal EMA warm-up
         self._min_periods = config.slow_period + config.signal_period
         self._price_window: deque[float] = deque(maxlen=self._min_periods * 2)
+        
+        # Rolling window of bars for ATR calculation
+        # Need at least atr_period + 1 bars for ATR calculation
+        self._bars: deque[MarketDataEvent] = deque(maxlen=max(config.atr_period + 1, self._min_periods * 2))
         
         # Track previous histogram value for crossover detection
         self._prev_histogram: Optional[float] = None
@@ -201,6 +209,9 @@ class MACDStrategy(BaseStrategy):
         # Update price window with current bar's close price
         self._price_window.append(bar.close)
         
+        # Update bars window for ATR calculation
+        self._bars.append(bar)
+        
         # Calculate MACD indicators
         macd_data = self._calculate_macd(list(self._price_window))
         
@@ -242,6 +253,28 @@ class MACDStrategy(BaseStrategy):
             )
             return None
         
+        # Calculate ATR for stop-loss calculation
+        bars_list = list(self._bars)
+        if len(bars_list) < self.config.atr_period + 1:
+            logger.debug("Insufficient bars for ATR calculation")
+            return None
+        
+        highs = [b.high for b in bars_list]
+        lows = [b.low for b in bars_list]
+        closes = [b.close for b in bars_list]
+        
+        atr = calculate_atr(highs, lows, closes, period=self.config.atr_period)
+        if atr is None or atr == 0:
+            logger.debug("Could not calculate ATR")
+            return None
+        
+        # Calculate stop-loss price
+        entry_price = bar.close
+        if signal_side == "buy":
+            stop_loss_price = entry_price - (atr * self.config.atr_stop_mult)
+        else:  # sell
+            stop_loss_price = entry_price + (atr * self.config.atr_stop_mult)
+        
         # Create TradeIntent with indicator values in metadata
         intent = TradeIntent(
             strategy_id=self.strategy_id,
@@ -260,6 +293,9 @@ class MACDStrategy(BaseStrategy):
                 "current_price": bar.close,
                 "bar_timestamp": bar.timestamp,
                 "interval": bar.interval,
+                "stop_loss_price": round(stop_loss_price, 8),
+                "atr": round(atr, 8),
+                "atr_stop_mult": self.config.atr_stop_mult,
             },
         )
         

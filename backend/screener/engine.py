@@ -22,38 +22,51 @@ MIN_BARS_THRESHOLD = 20
 DEFAULT_RSI_PERIOD = 14
 
 
-def _calculate_rvol(bars: List[Dict[str, Any]], volume_24h: Optional[float]) -> Dict[str, Optional[float]]:
+def _calculate_rvol(bars: List[Dict[str, Any]], volume_24h: Optional[float], symbol: Optional[str] = None) -> Dict[str, Optional[float]]:
     """
-    Calculate Relative Volume (RVOL) percentage.
-    
-    RVOL % = (Current 24h Volume / Daily-Scaled Average Volume) × 100
-    
-    The per-bar average is scaled to a daily equivalent before comparison,
-    so that RVOL ~100% means today's volume equals historical average.
-    
+    Calculate Daily Relative Volume (RVOL) vs 50-Day Moving Average.
+
+    RVOL % = (Current 24h Volume / 50-Day Daily Average Volume) × 100
+
+    RVOL ~100% means today's volume equals the 50-day average.
+    RVOL 200% means today's volume is 2x the 50-day average.
+
+    Primary method: volume_24h / (hourly_sma_50d × 24) × 100
+    Fallback (no SMA data): bar-based calculation using recent bars.
+
     Args:
-        bars: List of OHLCV bar dictionaries with 'volume' and optionally 'interval' keys
-        volume_24h: Current 24h volume
-        
+        bars: List of OHLCV bar dictionaries with 'volume' key
+        volume_24h: Current 24h volume (primary numerator)
+        symbol: Trading symbol — used to fetch 50-day hourly SMA from Redis
+
     Returns:
-        Dict with 'rvol_pct' and 'avg_volume_20d' (daily-scaled, None if insufficient data)
+        Dict with 'rvol_pct' and 'avg_volume_50d' (daily average, None if insufficient data)
     """
     result: Dict[str, Optional[float]] = {
         "rvol_pct": None,
-        "avg_volume_20d": None,
+        "avg_volume_50d": None,
     }
-    
-    # Edge case: fewer than 5 bars
-    if len(bars) < 5:
-        return result
-    
-    # Edge case: no volume_24h
+
     if volume_24h is None:
         return result
-    
-    # Extract volumes from bars (up to 20 most recent)
-    # Note: Bar volumes are in base currency units (e.g., ETH for ETH/USD)
-    # We calculate RVOL as current bar volume vs average bar volume (same units)
+
+    # Primary: 50-day daily average from Kraken REST API (real data, available from day one)
+    if symbol is not None:
+        try:
+            from backend.screener.data_collector import fetch_daily_sma_50d
+            daily_sma_50d = fetch_daily_sma_50d(symbol)
+            if daily_sma_50d is not None and daily_sma_50d > 0:
+                rvol_pct = (volume_24h / daily_sma_50d) * 100
+                result["avg_volume_50d"] = round(daily_sma_50d, 2)
+                result["rvol_pct"] = round(rvol_pct, 2)
+                return result
+        except Exception:
+            pass
+
+    # Fallback: bar-based average when 50-day SMA unavailable
+    if len(bars) < 5:
+        return result
+
     volumes: List[float] = []
     for bar in bars[-20:]:
         if isinstance(bar, dict):
@@ -62,29 +75,20 @@ def _calculate_rvol(bars: List[Dict[str, Any]], volume_24h: Optional[float]) -> 
                 volumes.append(float(vol))
         elif hasattr(bar, 'volume'):
             volumes.append(float(bar.volume))
-    
-    # Need at least 5 bars for meaningful average
-    if len(volumes) < 5:
-        return result
-    
-    # Calculate average volume (excluding most recent bar)
+
     if len(volumes) < 2:
         return result
-    
+
     avg_volume = sum(volumes[:-1]) / (len(volumes) - 1)
     current_volume = volumes[-1]
-    
-    # Edge case: avg_volume is 0
+
     if avg_volume == 0:
         return result
-    
-    # Calculate RVOL percentage (current bar volume vs average bar volume)
-    # This shows if current activity is above/below typical for this symbol
+
     rvol_pct = (current_volume / avg_volume) * 100
-    
-    result["avg_volume_20d"] = round(avg_volume, 2)  # Average bar volume (for reference)
+    result["avg_volume_50d"] = round(avg_volume, 2)
     result["rvol_pct"] = round(rvol_pct, 2)
-    
+
     return result
 
 
@@ -163,6 +167,26 @@ def _ensure_indicators(signal_result: Any, bars: List[Dict[str, Any]], symbol: O
         elif hasattr(last_bar, 'timestamp'):
             indicators['bar_timestamp'] = last_bar.timestamp
     
+    # Ensure 'price' and 'current_price' are present (normalize from 'current_price' or bars)
+    if 'current_price' not in indicators:
+        if 'price' in indicators:
+            indicators['current_price'] = indicators['price']
+        elif bars:
+            # Extract price from last bar
+            last_bar = bars[-1]
+            if isinstance(last_bar, dict):
+                close = last_bar.get('close')
+                if close is not None:
+                    price_val = float(close)
+                    indicators['current_price'] = price_val
+                    if 'price' not in indicators:
+                        indicators['price'] = price_val
+            elif hasattr(last_bar, 'close'):
+                price_val = float(last_bar.close)
+                indicators['current_price'] = price_val
+                if 'price' not in indicators:
+                    indicators['price'] = price_val
+    
     # Ensure 'price' is present (normalize from 'current_price')
     if 'price' not in indicators:
         if 'current_price' in indicators:
@@ -189,12 +213,12 @@ def _ensure_indicators(signal_result: Any, bars: List[Dict[str, Any]], symbol: O
         if volume_24h is not None:
             indicators['volume_24h'] = volume_24h
     
-    # Ensure 'rvol_pct' and 'avg_volume_20d' are present
+    # Ensure 'rvol_pct' and 'avg_volume_50d' are present
     if 'rvol_pct' not in indicators and bars:
         volume_24h = indicators.get('volume_24h')
-        rvol_data = _calculate_rvol(bars, volume_24h)
+        rvol_data = _calculate_rvol(bars, volume_24h, symbol)
         indicators['rvol_pct'] = rvol_data['rvol_pct']
-        indicators['avg_volume_20d'] = rvol_data['avg_volume_20d']
+        indicators['avg_volume_50d'] = rvol_data['avg_volume_50d']
     
     # Ensure frontend display indicators are always present (even if None)
     # These are required by the frontend ScreenerPanel component
@@ -238,7 +262,7 @@ def _evaluate_mean_reversion(
     volume_24h = get_symbol_volume(symbol)
     
     # Calculate RVOL
-    rvol_data = _calculate_rvol(bars, volume_24h)
+    rvol_data = _calculate_rvol(bars, volume_24h, symbol)
     rvol_pct = rvol_data.get("rvol_pct")
     
     # Calculate threshold as percentage (volume_threshold 1.5 = 150%)
@@ -673,11 +697,11 @@ class ScreenerEngine:
         if volume_24h is not None:
             indicators['volume_24h'] = volume_24h
         
-        # Add RVOL percentage
-        rvol_data = _calculate_rvol(bars, volume_24h)
+        # Add RVOL percentage (daily vol vs 50-day daily MA)
+        rvol_data = _calculate_rvol(bars, volume_24h, symbol)
         indicators['rvol_pct'] = rvol_data['rvol_pct']
-        indicators['avg_volume_20d'] = rvol_data['avg_volume_20d']
-        
+        indicators['avg_volume_50d'] = rvol_data['avg_volume_50d']
+
         rsi = indicators.get("rsi")
         bb_position = indicators.get("bb_position")
         
@@ -909,22 +933,31 @@ async def scan_with_strategy(
                 f"(confidence={confidence:.1f}%, direction={direction})"
             )
             
-            # Log SETUP_DETECTED for informational purposes (can be chatty)
-            # This shows when setups are observed during evaluation
+            # Log SETUP_DETECTED only for actionable setups:
+            # - BUY signals ONLY when no position exists (skip if already holding)
+            # - SELL signals ONLY when there is an active position (skip no-shorting cases)
             if signal_type in ("BUY", "SELL"):
-                from backend.api.routes.events import log_activity
-                log_activity(
-                    activity_type="SETUP_DETECTED",
-                    message=f"Setup detected: {signal_type} {symbol} [{strategy_id}]",
-                    details={
-                        "symbol": symbol,
-                        "signal_type": signal_type,
-                        "confidence": confidence,
-                        "strategy": strategy_id,
-                        "direction": direction,
-                        "stage": "evaluation",
-                    },
-                )
+                try:
+                    from backend.positions.tracker import get_position_tracker
+                    _has_pos = get_position_tracker().has_position(symbol)
+                except Exception:
+                    _has_pos = False
+                should_log = (signal_type == "BUY" and not _has_pos) or (signal_type == "SELL" and _has_pos)
+                if should_log:
+                    from backend.api.routes.events import log_activity
+                    display_name = getattr(strategy, "strategy_name", None) or strategy_id
+                    log_activity(
+                        activity_type="SETUP_DETECTED",
+                        message=f"Setup detected: {signal_type} {symbol} [{display_name}]",
+                        details={
+                            "symbol": symbol,
+                            "signal_type": signal_type,
+                            "confidence": confidence,
+                            "strategy": strategy_id,
+                            "direction": direction,
+                            "stage": "evaluation",
+                        },
+                    )
                 
         except Exception as e:
             logger.warning(f"[STRATEGY:{strategy_id}] {symbol}: ERROR - {e}")

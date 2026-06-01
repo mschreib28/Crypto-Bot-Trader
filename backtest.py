@@ -7,14 +7,18 @@ Two modes:
   Pipeline mode:  python backtest.py --days 60  (full Kraken USD universe, default)
 
 Pipeline mode is the DEFAULT when --symbol is omitted. The full Kraken USD universe is
-fetched automatically; for each bar, all pairs are graded via the 5-pillar scanner logic
+fetched automatically; OHLCV is Binance USDT klines (api.binance.com → api.binance.us on 451/refused).
+Universe naming stays Kraken (e.g. XBT/USD). Live trading stays Kraken; backtests map prices as USDT.
+For each bar, all pairs are graded via the 5-pillar scanner logic
 (OHLCV only — no Redis, no live APIs), the top-graded pair is selected, the active
 strategy evaluates it for an entry, and the position is held until exit.
 
-Strategies (--strategy): vwap_meanrev (default), pullback_vwap, htf_trend,
-                          volatility_breakout, meanrev
+Strategies (--strategy): vwap_meanrev (default), vwap_meanrev_1h, pullback_vwap, htf_trend,
+                          volatility_breakout, meanrev, bull_flag (alias → 5m I1),
+                          bull_flag_1m, bull_flag_5m, bull_flag_1h, swing_bull_flag (W2, 4h)
 
 Skipped (live-data-only): HTF regime filter, 1m green candle check, VWAP slope guard.
+Optional HTF RSI gate for VWAP backtests: pass --htf-rsi-long-max and 4h (or --htf-rsi-bars-interval) data.
 
 Usage:
     python backtest.py --days 30                              # all-pairs pipeline, vwap_meanrev
@@ -25,18 +29,22 @@ Usage:
 
 import argparse
 import csv
+import errno
 import json
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Callable, Optional
+import urllib.error
+import urllib.parse
 import urllib.request
 
 # Allow imports from research/strategies/indicators.py without installing the package
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from research.strategies.btc_daily_regime import btc_daily_bars_pass_bull_filter_at_ts
 from research.strategies.indicators import (
     calculate_adx,
     calculate_atr,
@@ -49,8 +57,24 @@ from research.strategies.indicators import (
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-KRAKEN_OHLCV_URL       = "https://api.kraken.com/0/public/OHLC"
+BINANCE_REST_COM           = "https://api.binance.com"
+BINANCE_REST_US            = "https://api.binance.us"
+BINANCE_KLINES_PATH        = "/api/v3/klines"
+BINANCE_PAGE_LIMIT         = 1000
+YEARS_APPROX_DAYS_PER_YEAR = 365.2425
+
+# Locks to whichever Binance REST host succeeds first (.com preferred).
+_BINANCE_LOCKED_BASE: Optional[str] = None
+# After first HTTP 451 from api.binance.com, skip probing .com again (same process).
+_BINANCE_COM_SKIP: bool = False
+
 KRAKEN_ASSET_PAIRS_URL = "https://api.kraken.com/0/public/AssetPairs"
+
+# Kraken wsname base ticker → Binance base symbol (paired with USDT).
+_KRAKEN_BASE_ASSET_ALIAS: dict[str, str] = {
+    "XBT": "BTC",
+    "XDG": "DOGE",
+}
 
 # Tokens that make no sense to trade with this strategy: stablecoins (near 1.0,
 # no reversion signal) and wrapped tokens (correlated to their underlying).
@@ -93,6 +117,11 @@ DEFAULT_CONFIG: dict = {
     "invalidation_vwap_atr_mult": 2.0,
     "invalidation_rsi_candles":   4,
     "min_stop_pct":               5.0,   # for min-profit gate: 1.5 × stop_pct
+    "volume_filter_mode":         "conservative",
+    "long_min_volume_ratio":      None,  # e.g. 2.0 = require ≥2× volume SMA on signal bar (long)
+    "htf_rsi_long_max":           None,  # e.g. 40.0 = require HTF RSI ≤ 40 (see htf_rsi_bars_interval)
+    "htf_rsi_bars_interval":      "4h",  # Binance interval for HTF RSI when htf_rsi_long_max is set
+    "breakeven_requires_tp1":     True,   # Move stop to breakeven only after TP1 partial fill
 }
 
 # Strategy 6 defaults — mirrors PullbackVWAPConfig
@@ -125,11 +154,11 @@ MEANREV_DEFAULT_CONFIG: dict = {
     "std_dev_multiplier":          2.0,    # BB band width (σ)
     # RSI
     "rsi_period":                  14,
-    "rsi_oversold_threshold":      25.0,   # A+ oversold level
+    "rsi_oversold_threshold":      40.0,   # Mirrors MeanReversionConfig (Task B iter)
     "rsi_overbought_threshold":    75.0,
-    # A+ filters
-    "adx_max_threshold":           18.0,   # Ranging market: ADX < 18
-    "atr_min_ratio":               1.0,    # Market must be active (ATR ≥ avg ATR)
+    # A+ filters (mirrors MeanReversionConfig)
+    "adx_max_threshold":           30.0,   # Ranging market: ADX < threshold
+    "atr_min_ratio":               0.8,    # Min ATR as fraction of avg ATR
     # Stop-loss
     "atr_stop_mult":               1.5,    # Min stop = ATR × this
     "atr_period":                  14,
@@ -146,6 +175,66 @@ MEANREV_DEFAULT_CONFIG: dict = {
     "invalidation_rsi_candles":    4,
     "min_stop_pct":                5.0,
 }
+
+# Strategy I1 — Bull Flag + Momentum Pullback (mirrors BullFlagConfig + shared exits)
+BULL_FLAG_DEFAULT_CONFIG: dict = {
+    "interval":                    "5m",
+    "pole_min_pct":                5.0,
+    "pole_max_candles":            10,
+    "pole_volume_multiplier":      3.0,
+    "flag_min_candles":            3,
+    "flag_max_candles":            8,
+    "flag_max_retracement":        0.5,
+    "entry_volume_multiplier":     1.0,
+    "rsi_overbought":              75.0,
+    "macd_fast":                   12,
+    "macd_slow":                   26,
+    "macd_signal":                 9,
+    "ema_fast":                    9,
+    "ema_slow":                    20,
+    "rsi_period":                  14,
+    "volume_sma_period":           20,
+    "vwap_touch_pct":              0.5,
+    "mild_initial_vol_lookback":   15,
+    "confidence_base_mild":        0.40,
+    "confidence_base_strong":      0.60,
+    "multi_tf_bonus":              0.15,
+    "atr_period":                  14,
+    "notional_risk_pct":           2.0,
+    "max_bars_in_trade":           18,
+    "tp1_R":                       1.0,
+    "tp2_R":                       2.0,
+    "tp1_partial_pct":             0.6,
+    "anchored_vwap_lookback":      20,
+    "invalidation_vwap_atr_mult":  10.0,
+    "invalidation_rsi_candles":    4,
+    "min_stop_pct":                5.0,
+}
+
+
+def bull_flag_backtest_cfg(strategy: str) -> dict:
+    """Return merged bull-flag dict for a named instance (1m / 5m / 1h)."""
+    c = BULL_FLAG_DEFAULT_CONFIG.copy()
+    if strategy == "bull_flag_1m":
+        c["interval"] = "1m"
+        c["max_bars_in_trade"] = 6
+    elif strategy == "bull_flag_5m":
+        c["interval"] = "5m"
+        c["max_bars_in_trade"] = 18
+    elif strategy == "bull_flag_1h":
+        c["interval"] = "1h"
+        c["max_bars_in_trade"] = 8
+    return c
+
+
+def swing_bull_flag_backtest_cfg() -> dict:
+    """W2 — Swing Bull Flag on 4h (mirrors BullFlagConfig + config_swing preset)."""
+    from research.strategies.bull_flag.config_swing import SWING_BULL_FLAG_BACKTEST_OVERRIDES
+
+    c = BULL_FLAG_DEFAULT_CONFIG.copy()
+    c.update(SWING_BULL_FLAG_BACKTEST_OVERRIDES)
+    return c
+
 
 # Strategy volatility_breakout defaults — mirrors VolatilityBreakoutConfig
 VOLATILITY_BREAKOUT_DEFAULT_CONFIG: dict = {
@@ -175,7 +264,33 @@ VOLATILITY_BREAKOUT_DEFAULT_CONFIG: dict = {
     "invalidation_vwap_atr_mult":    10.0, # effectively disabled
     "invalidation_rsi_candles":      4,
     "min_stop_pct":                  5.0,
+    # BTC macro (pipeline uses Binance 1d XBT/USD; live uses Kraken daily in strategy)
+    "require_btc_bull_market":       True,
+    "btc_ema_period":                200,
 }
+
+
+def _merge_vb_btc_bull_env_into_cfg(cfg: dict) -> None:
+    raw = os.environ.get("VB_REQUIRE_BTC_BULL")
+    if raw is not None:
+        cfg["require_btc_bull_market"] = raw.strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+
+
+def _merge_htf_btc_bull_env_into_cfg(cfg: dict) -> None:
+    raw = os.environ.get("HTF_REQUIRE_BTC_BULL")
+    if raw is not None:
+        cfg["require_btc_bull_market"] = raw.strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+
 
 # Strategy htf_trend defaults — mirrors HTFTrendConfig
 HTF_TREND_DEFAULT_CONFIG: dict = {
@@ -205,6 +320,9 @@ HTF_TREND_DEFAULT_CONFIG: dict = {
     "invalidation_rsi_candles":       6,    # min bars held before RSI invalidation can fire
     "invalidation_rsi_long_floor":    35,   # longs exit when rsi < this (was 40)
     "min_stop_pct":                   5.0,
+    # BTC macro bull gate (daily close > BTC EMA(btc_ema_period))
+    "require_btc_bull_market":        True,
+    "btc_ema_period":                 200,
 }
 
 # ─── Pipeline grader constants (mirrors pipeline.py — no Redis required) ──────
@@ -222,7 +340,7 @@ D3_MIN_VOLUME          = 500_000         # $500K
 D3_MAX_VOLUME          = 50_000_000      # $50M
 D4_MAX_BTC_DROP        = -4.0            # BTC not down > 4% in 4h
 
-PIPELINE_DEFAULT_INTERVAL = "1h"         # Default for pipeline mode; 30d Kraken retention
+PIPELINE_DEFAULT_INTERVAL = "1h"        # Pipeline default; OHLC depth from Binance
 PIPELINE_RVOL_DAYS        = 30           # Target RVOL baseline (days); capped adaptively
 
 GRADE_ORDER             = {"A+": 4, "A": 3, "B": 2, "C": 1, "F": 0}
@@ -345,96 +463,285 @@ class Trade:
     grade: str = ""                  # pipeline mode only
 
 
-# ─── OHLCV Fetcher ────────────────────────────────────────────────────────────
+# ─── OHLCV Fetcher (Binance klines → USDT bars; universe symbols stay Kraken) ─
 
 def _symbol_to_kraken_pair(symbol: str) -> str:
     """'SNX/USD' → 'SNXUSD'"""
     return symbol.replace("/", "")
 
 
-def fetch_kraken_ohlcv(
-    symbol: str, interval_min: int, days: int, no_cache: bool = False
-) -> list[Bar]:
-    """
-    Fetch historical OHLCV from Kraken public REST API, paginating as needed.
-    Caches responses to backtest_cache/ for 4 hours to avoid re-fetching.
-    """
-    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-
-    pair = _symbol_to_kraken_pair(symbol)
-    cache_file = os.path.join(cache_dir, f"{pair}_{interval_min}m_{days}d.json")
-
-    if not no_cache and os.path.exists(cache_file):
-        age_hours = (time.time() - os.path.getmtime(cache_file)) / 3600
-        if age_hours < 4:
-            with open(cache_file) as f:
-                raw = json.load(f)
-            print(f"  [cache] Loaded {len(raw)} bars ({age_hours:.1f}h old)")
-            return _parse_raw_bars(raw)
-
-    print(f"  Fetching {symbol} {interval_min}m OHLCV from Kraken…")
-    since_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
-    all_raw: list = []
-
-    while True:
-        url = f"{KRAKEN_OHLCV_URL}?pair={pair}&interval={interval_min}&since={since_ts}"
-        req = urllib.request.Request(url, headers={"User-Agent": "crypto-backtester/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-
-        if data.get("error"):
-            raise RuntimeError(f"Kraken API error: {data['error']}")
-
-        result = data.get("result", {})
-        ohlcv_key = next((k for k in result if k != "last"), None)
-        if not ohlcv_key:
-            break
-
-        batch: list = result[ohlcv_key]
-        last_ts: int = result.get("last", 0)
-
-        if not batch:
-            break
-
-        all_raw.extend(batch)
-
-        if len(batch) < 720:
-            break  # No more pages
-
-        since_ts = last_ts
-        time.sleep(0.5)
-
-    # Deduplicate and sort
-    seen: set = set()
-    deduped: list = []
-    for row in all_raw:
-        ts = row[0]
-        if ts not in seen:
-            seen.add(ts)
-            deduped.append(row)
-    deduped.sort(key=lambda r: r[0])
-
-    print(f"  Fetched {len(deduped)} bars total")
-    with open(cache_file, "w") as f:
-        json.dump(deduped, f)
-
-    return _parse_raw_bars(deduped)
+def kraken_usd_to_binance_symbol(kraken_pair: str) -> str:
+    """'XBT/USD' → BTCUSDT, 'SNX/USD' → SNXUSDT."""
+    pair = kraken_pair.strip().upper()
+    if "/" not in pair:
+        raise ValueError(f"Expected Kraken pair like XXX/USD, got {kraken_pair!r}")
+    base, quote = pair.split("/", 1)
+    quote = quote.strip()
+    base = base.strip().upper()
+    if quote != "USD":
+        raise ValueError(f"Only USD-quote Kraken pairs supported, got {kraken_pair!r}")
+    b = _KRAKEN_BASE_ASSET_ALIAS.get(base, base)
+    return f"{b}USDT"
 
 
-def _parse_raw_bars(raw: list) -> list[Bar]:
-    """Kraken row: [time, open, high, low, close, vwap, volume, count]"""
+def _urllib_is_connection_refused(err: urllib.error.URLError) -> bool:
+    r = getattr(err, "reason", None)
+    return isinstance(r, OSError) and r.errno == errno.ECONNREFUSED
+
+
+def _unpack_binance_cache_payload(payload: Any) -> list:
+    """Cache may be bare list rows or {\"rows\": [...]}."""
+    if isinstance(payload, dict) and "rows" in payload:
+        return payload["rows"]
+    if isinstance(payload, list):
+        return payload
+    raise ValueError("Invalid Binance OHLC cache file shape")
+
+
+def _parse_binance_kline_rows(rows: list) -> list[Bar]:
+    """Binance kline row: openTime(ms), open, high, low, close, volume, ..."""
     return [
         Bar(
-            timestamp=datetime.fromtimestamp(row[0], tz=timezone.utc),
+            timestamp=datetime.fromtimestamp(row[0] / 1000.0, tz=timezone.utc),
             open=float(row[1]),
             high=float(row[2]),
             low=float(row[3]),
             close=float(row[4]),
-            volume=float(row[6]),
+            volume=float(row[5]),
         )
-        for row in raw
+        for row in rows
     ]
+
+
+def _dedupe_sort_raw_klines(rows: list) -> list:
+    """Rows are Binance kline arrays indexed by ms openTime."""
+    by_ts: dict[int, list] = {}
+    for row in rows:
+        by_ts[int(row[0])] = row
+    return [by_ts[k] for k in sorted(by_ts)]
+
+
+def _binance_rest_get_json(path: str, query: dict[str, str]) -> Any:
+    """GET JSON from locked Binance host; first success locks host to .com or .us."""
+    global _BINANCE_LOCKED_BASE, _BINANCE_COM_SKIP
+
+    qs = urllib.parse.urlencode(query)
+    last_err: Optional[BaseException] = None
+
+    if _BINANCE_LOCKED_BASE:
+        bases = [_BINANCE_LOCKED_BASE]
+    elif _BINANCE_COM_SKIP:
+        bases = [BINANCE_REST_US]
+    else:
+        bases = [BINANCE_REST_COM, BINANCE_REST_US]
+
+    for base_url in bases:
+        url = f"{base_url}{path}?{qs}"
+        req = urllib.request.Request(url, headers={"User-Agent": "crypto-backtester/1.2"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+            if _BINANCE_LOCKED_BASE is None:
+                _BINANCE_LOCKED_BASE = base_url
+                if base_url != BINANCE_REST_COM:
+                    print(f"  [binance] Using {_BINANCE_LOCKED_BASE}")
+            return json.loads(raw)
+
+        except urllib.error.HTTPError as e:
+            last_err = e
+            body = ""
+            try:
+                body = (e.fp.read().decode(errors="ignore")[:200]).replace("\n", " ")
+            except Exception:
+                pass
+
+            fallback_ok = (
+                base_url == BINANCE_REST_COM
+                and _BINANCE_LOCKED_BASE is None
+                and e.code == 451
+            )
+            if fallback_ok:
+                _BINANCE_COM_SKIP = True
+                print(
+                    "  [binance] api.binance.com returned HTTP 451; "
+                    "falling back to api.binance.us (skipping .com for later requests)"
+                )
+                continue
+
+            msg = getattr(e, "reason", "") or ""
+            hint = " " + body if body else ""
+            raise RuntimeError(f"Binance HTTP {e.code} {msg!s}{hint}") from None
+
+        except urllib.error.URLError as e:
+            last_err = e
+            if (
+                base_url == BINANCE_REST_COM
+                and _BINANCE_LOCKED_BASE is None
+                and _urllib_is_connection_refused(e)
+            ):
+                _BINANCE_COM_SKIP = True
+                print(
+                    "  [binance] Connection refused on api.binance.com; "
+                    "falling back to api.binance.us (skipping .com for later requests)"
+                )
+                continue
+            raise RuntimeError(f"Binance URLError: {e}") from e
+
+    raise RuntimeError(f"Binance request failed after fallbacks: {last_err}") from None
+
+
+def _download_binance_klines_backwards_raw(
+    binance_symbol: str, interval_label: str, cutoff_ms: int, now_ms: int
+) -> list:
+    """Paginate backwards with endTime/limit until data reaches cutoff or API runs out."""
+    all_rows: list = []
+    end_ms = now_ms
+
+    while True:
+        page = _binance_rest_get_json(
+            BINANCE_KLINES_PATH,
+            {
+                "symbol": binance_symbol,
+                "interval": interval_label,
+                "limit": str(BINANCE_PAGE_LIMIT),
+                "endTime": str(end_ms),
+            },
+        )
+        if not isinstance(page, list) or len(page) == 0:
+            break
+
+        all_rows.extend(page)
+        first_open = int(page[0][0])
+
+        reached_cutoff = first_open <= cutoff_ms
+        exhausted = len(page) < BINANCE_PAGE_LIMIT
+
+        if reached_cutoff or exhausted:
+            break
+
+        next_end = first_open - 1
+        if next_end >= end_ms:
+            break
+        end_ms = next_end
+        time.sleep(0.08)
+
+    return _dedupe_sort_raw_klines(all_rows)
+
+
+def fetch_binance_ohlcv(
+    kraken_symbol: str,
+    interval_label: str,
+    span_days: float,
+    no_cache: bool = False,
+) -> tuple[list[Bar], str]:
+    """
+    Load OHLCV for a Kraken-style pair symbol using Binance klines (paginated backwards).
+
+    Caches maximal downloaded history under backtest_cache/{PAIR}_{interval}_full.json.
+    Returns (bars in [now - span_days, now], human-readable OHLC mapping note).
+    """
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    pair_slug = _symbol_to_kraken_pair(kraken_symbol)
+    cache_file = os.path.join(cache_dir, f"{pair_slug}_{interval_label}_full.json")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=float(span_days))
+    cutoff_ms = int(cutoff.timestamp() * 1000)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    try:
+        binance_symbol = kraken_usd_to_binance_symbol(kraken_symbol)
+    except ValueError:
+        raise
+
+    hint = f"{kraken_symbol} → Binance `{binance_symbol}` ({interval_label})"
+
+    cached_rows: Optional[list] = None
+    if not no_cache and os.path.exists(cache_file):
+        with open(cache_file) as f:
+            cached_rows = _unpack_binance_cache_payload(json.load(f))
+
+    if cached_rows is not None:
+        raw_full = cached_rows
+    else:
+        print(f"  Fetching OHLC from Binance: {hint}…")
+        raw_full = _download_binance_klines_backwards_raw(
+            binance_symbol, interval_label, cutoff_ms, now_ms
+        )
+
+        envelope = {
+            "version": 1,
+            "kraken_wsname": kraken_symbol,
+            "binance_symbol": binance_symbol,
+            "interval": interval_label,
+            "first_open_ms": raw_full[0][0] if raw_full else None,
+            "last_open_ms": raw_full[-1][0] if raw_full else None,
+            "rows": raw_full,
+        }
+        with open(cache_file, "w") as f:
+            json.dump(envelope, f)
+        print(f"  Wrote Binance OHLC cache: {cache_file} ({len(raw_full)} bars)")
+
+    bars_all = _parse_binance_kline_rows(raw_full)
+
+    interval_min = INTERVAL_MAP[interval_label]
+    slack_ms = interval_min * 60 * 1000 * 2
+    did_extend = False
+    if (
+        cached_rows is not None
+        and bars_all
+        and int(bars_all[0].timestamp.timestamp() * 1000) > cutoff_ms + slack_ms
+    ):
+        did_extend = True
+        print(
+            f"  [cache refresh] Oldest bar {bars_all[0].timestamp.date()} is after window start "
+            f"→ re-fetch for {hint}"
+        )
+        print(f"  Fetching OHLC from Binance (extend history): {hint}…")
+        raw_full = _download_binance_klines_backwards_raw(
+            binance_symbol, interval_label, cutoff_ms, now_ms
+        )
+        envelope = {
+            "version": 1,
+            "kraken_wsname": kraken_symbol,
+            "binance_symbol": binance_symbol,
+            "interval": interval_label,
+            "first_open_ms": raw_full[0][0] if raw_full else None,
+            "last_open_ms": raw_full[-1][0] if raw_full else None,
+            "rows": raw_full,
+        }
+        with open(cache_file, "w") as f:
+            json.dump(envelope, f)
+        print(f"  Updated Binance OHLC cache ({len(raw_full)} bars)")
+        bars_all = _parse_binance_kline_rows(raw_full)
+
+    utc_now = datetime.now(timezone.utc)
+    trimmed = [b for b in bars_all if cutoff <= b.timestamp <= utc_now]
+
+    src = "[cache]" if (cached_rows is not None and not did_extend) else "[network]"
+    if trimmed:
+        print(
+            f"  {src} Using {len(trimmed)} bars in window "
+            f"({trimmed[0].timestamp.date()} → {trimmed[-1].timestamp.date()})"
+        )
+    else:
+        print(f"  {src} No bars in requested window.")
+
+    return trimmed, hint
+
+
+def fetch_binance_ohlcv_for_backtest(
+    kraken_symbol: str,
+    interval_label: str,
+    span_days: float,
+    no_cache: bool = False,
+) -> list[Bar]:
+    """Convenience: only bar list."""
+    bars, _ = fetch_binance_ohlcv(
+        kraken_symbol, interval_label, span_days, no_cache=no_cache
+    )
+    return bars
 
 
 # ─── Indicator helpers ────────────────────────────────────────────────────────
@@ -531,15 +838,31 @@ def _compute_stop_and_targets(
 
 # ─── Signal detection ─────────────────────────────────────────────────────────
 
+def _vwap_htf_rsi_at(
+    htf_bars: Optional[list[Bar]], rsi_period: int, as_of: datetime,
+) -> Optional[float]:
+    """RSI on HTF closes ending at ``as_of`` (inclusive). None if insufficient data."""
+    if not htf_bars:
+        return None
+    sub = [b for b in htf_bars if b.timestamp <= as_of]
+    need = rsi_period + 5
+    if len(sub) < need:
+        return None
+    closes = [b.close for b in sub]
+    return calculate_rsi(closes, period=rsi_period)
+
+
 def check_entry_signal(
     bars: list[Bar], cfg: dict, equity: float, risk_pct: float, long_only: bool,
     debug: bool = False,
+    htf_bars: Optional[list[Bar]] = None,
 ) -> Optional[Trade]:
     """
     Evaluate the most-recent bar for a VWAP mean-reversion entry signal.
 
     Faithfully ports generate_signals() core conditions.
     Skipped (require live data): HTF regime filter, 1m green candle, VWAP slope guard.
+    Optional ``htf_bars``: when ``cfg['htf_rsi_long_max']`` is set, used for HTF RSI gate.
     """
     if len(bars) < WARMUP_BARS:
         return None
@@ -562,16 +885,32 @@ def check_entry_signal(
     if not atr:
         return None
 
-    # Volume filter — skip if abnormally high volume (conservative mode)
     vol_sma = sum(volumes[-cfg["volume_sma_period"]:]) / cfg["volume_sma_period"]
-    if vol_sma > 0 and volumes[-1] / vol_sma > cfg["volume_max_mult"]:
-        if debug:
-            rvol = volumes[-1] / vol_sma
-            print(f"REJECT {bars[-1].timestamp.strftime('%Y-%m-%d %H:%M')} | VOL_HIGH={rvol:.2f}x(max={cfg['volume_max_mult']}x)")
-        return None
+    vol_ratio = volumes[-1] / vol_sma if vol_sma > 0 else 1.0
+    long_min = cfg.get("long_min_volume_ratio")
+    vol_mode = cfg.get("volume_filter_mode", "conservative")
+    if vol_mode == "conservative" and vol_ratio > cfg["volume_max_mult"]:
+        skip_high_vol_cap = long_min is not None
+        if not skip_high_vol_cap:
+            if debug:
+                print(
+                    f"REJECT {bars[-1].timestamp.strftime('%Y-%m-%d %H:%M')} | "
+                    f"VOL_HIGH={vol_ratio:.2f}x(max={cfg['volume_max_mult']}x)"
+                )
+            return None
 
     price = bars[-1].close
     bar   = bars[-1]
+
+    htf_rsi_val: Optional[float] = None
+    htf_max = cfg.get("htf_rsi_long_max")
+    if htf_max is not None:
+        htf_rsi_val = _vwap_htf_rsi_at(htf_bars, cfg["rsi_period"], bar.timestamp)
+
+    long_vol_ok = long_min is None or vol_ratio >= long_min
+    htf_long_ok = htf_max is None or (
+        htf_rsi_val is not None and htf_rsi_val <= htf_max
+    )
 
     def _build_trade(side: str, entry: float, levels: dict) -> Optional[Trade]:
         risk = levels["risk"]
@@ -599,7 +938,9 @@ def check_entry_signal(
     long_rev  = _reversal_confirmed(bar, vwap, "buy", cfg)
     long_mom  = not _momentum_excluded(bars, "buy", cfg)
 
-    if debug and not (long_dev and long_rsi and long_rev and long_mom):
+    if debug and not (
+        long_dev and long_rsi and long_rev and long_mom and long_vol_ok and htf_long_ok
+    ):
         ts = bar.timestamp.strftime("%Y-%m-%d %H:%M")
         reasons: list[str] = []
         if not long_dev:
@@ -610,9 +951,26 @@ def check_entry_signal(
             reasons.append("REVERSAL=fail")
         if not long_mom:
             reasons.append("MOMENTUM_EXCLUDED")
+        if not long_vol_ok:
+            if long_min is not None:
+                reasons.append(f"VOL_SPIKE={vol_ratio:.2f}x(need>={long_min}x)")
+            else:
+                reasons.append("VOL_LONG=fail")
+        if not htf_long_ok:
+            if htf_rsi_val is not None:
+                reasons.append(f"HTF_RSI={htf_rsi_val:.1f}(need<={htf_max})")
+            else:
+                reasons.append("HTF_RSI=unavailable")
         print(f"REJECT {ts} | {' | '.join(reasons)}")
 
-    if long_dev and long_rsi and long_rev and long_mom:
+    if (
+        long_dev
+        and long_rsi
+        and long_rev
+        and long_mom
+        and long_vol_ok
+        and htf_long_ok
+    ):
         entry  = min(price, vwap + atr * 0.05)
         levels = _compute_stop_and_targets(entry, "buy", bars, atr, cfg)
         return _build_trade("long", entry, levels)
@@ -782,6 +1140,83 @@ def check_pullback_vwap_entry_signal(
     )
 
 
+# ─── Bull Flag + Momentum Pullback (I1) ───────────────────────────────────────
+
+
+def check_bull_flag_entry_signal(
+    bars: list[Bar],
+    cfg: dict,
+    equity: float,
+    risk_pct: float,
+    debug: bool = False,
+    *,
+    daily_timestamps: Optional[list[Any]] = None,
+    daily_closes: Optional[list[float]] = None,
+    btc_closes: Optional[list[float]] = None,
+    btc_4h_change_pct: Optional[float] = None,
+) -> Optional[Trade]:
+    """Long-only bull flag / mild pullback; mirrors research.strategies.bull_flag.strategy."""
+    from research.strategies.bull_flag.config import BullFlagConfig
+    from research.strategies.bull_flag.strategy import analyze_bull_flag_last_bar
+
+    _names = {f.name for f in fields(BullFlagConfig)}
+    bf_kw: dict = {"strategy_id": "backtest", "interval": cfg.get("interval", "5m")}
+    for k, v in cfg.items():
+        if k in _names and k != "strategy_id":
+            bf_kw[k] = v
+    if cfg.get("max_bars_in_trade") is not None:
+        bf_kw["max_hold_candles"] = int(cfg["max_bars_in_trade"])
+    bf = BullFlagConfig(**bf_kw)
+
+    opens = [b.open for b in bars]
+    highs = [b.high for b in bars]
+    lows = [b.low for b in bars]
+    closes = [b.close for b in bars]
+    vols = [b.volume for b in bars]
+    snap = analyze_bull_flag_last_bar(
+        opens,
+        highs,
+        lows,
+        closes,
+        vols,
+        bf,
+        daily_timestamps=daily_timestamps,
+        daily_closes=daily_closes,
+        btc_closes=btc_closes,
+        btc_4h_change_pct=btc_4h_change_pct,
+        entry_timestamp=bars[-1].timestamp,
+    )
+    if snap is None:
+        if debug:
+            print(f"REJECT {bars[-1].timestamp} | bull_flag no_setup")
+        return None
+
+    bar = bars[-1]
+    entry_price = bar.close
+    stop_loss = snap.stop
+    risk = entry_price - stop_loss
+    if risk <= 0 or risk / entry_price < 0.005:
+        return None
+
+    tp1 = snap.tp1
+    tp2 = snap.tp2
+    risk_dollars = equity * risk_pct / 100.0
+    qty = risk_dollars / risk
+
+    return Trade(
+        trade_num=0,
+        side="long",
+        entry_bar=len(bars) - 1,
+        entry_time=bar.timestamp,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        tp1_price=tp1,
+        tp2_price=tp2,
+        qty=qty,
+        qty_remaining=qty,
+    )
+
+
 # ─── Mean-reversion (BB + RSI + ADX) signal detection ────────────────────────
 
 def _calc_bb_from_closes(closes: list[float], period: int, std_mult: float) -> tuple[float, float, float]:
@@ -801,9 +1236,9 @@ def check_meanrev_entry_signal(
 
     Entry criteria (long only):
     - Price in bottom 20% of BB range (band_position < 0.2)
-    - RSI < rsi_oversold_threshold (default 25 — A+ level)
-    - ADX < adx_max_threshold (default 18 — ranging market)
-    - ATR ratio >= atr_min_ratio (default 1.0 — market is active)
+    - RSI < rsi_oversold_threshold (mirrors MeanReversionConfig, default 40)
+    - ADX < adx_max_threshold (mirrors MeanReversionConfig, default 30)
+    - ATR ratio >= atr_min_ratio (mirrors MeanReversionConfig, default 0.8)
 
     Stop: min(lower_band − atr × stop_buffer_atr, entry − atr × atr_stop_mult)
     TP1/TP2: entry + risk × tp1_R / tp2_R
@@ -898,7 +1333,12 @@ def check_meanrev_entry_signal(
 # ─── Volatility Breakout signal detection ────────────────────────────────────
 
 def check_volatility_breakout_entry_signal(
-    bars: list[Bar], cfg: dict, equity: float, risk_pct: float, debug: bool = False
+    bars: list[Bar],
+    cfg: dict,
+    equity: float,
+    risk_pct: float,
+    debug: bool = False,
+    vb_btc_daily_bars: Optional[list[Bar]] = None,
 ) -> Optional[Trade]:
     """
     Volatility compression → breakout entry signal (long only).
@@ -993,6 +1433,36 @@ def check_volatility_breakout_entry_signal(
                 print(f"REJECT {bar.timestamp.strftime('%Y-%m-%d %H:%M')} | CANDLE: {' | '.join(reasons)}")
             return None
 
+    if cfg.get("require_btc_bull_market", True):
+        from research.strategies.bull_flag.strategy import daily_close_above_daily_ema
+
+        ema_p = int(cfg.get("btc_ema_period", 200))
+        if not vb_btc_daily_bars:
+            if debug:
+                print(
+                    f"REJECT {bar.timestamp.strftime('%Y-%m-%d %H:%M')} | "
+                    "BTC_MACRO(no_daily_btc_series)"
+                )
+            return None
+        t_end = bar.timestamp
+        sub_d = [b for b in vb_btc_daily_bars if b.timestamp <= t_end]
+        if not sub_d or len(sub_d) < ema_p:
+            if debug:
+                print(
+                    f"REJECT {bar.timestamp.strftime('%Y-%m-%d %H:%M')} | "
+                    f"BTC_MACRO(insufficient_daily_bars={len(sub_d)} need>={ema_p})"
+                )
+            return None
+        d_ts = [b.timestamp for b in sub_d]
+        d_cl = [b.close for b in sub_d]
+        if not daily_close_above_daily_ema(d_ts, d_cl, t_end, ema_p):
+            if debug:
+                print(
+                    f"REJECT {bar.timestamp.strftime('%Y-%m-%d %H:%M')} | "
+                    f"BTC_BELOW_EMA{ema_p}"
+                )
+            return None
+
     # ── ATR + sizing ───────────────────────────────────────────────────────
     atr = calculate_atr(highs, lows, closes, period=cfg["atr_period"])
     if not atr or atr == 0:
@@ -1028,7 +1498,12 @@ def check_volatility_breakout_entry_signal(
 # ─── HTF Trend Pullback signal detection ─────────────────────────────────────
 
 def check_htf_trend_entry_signal(
-    bars: list[Bar], cfg: dict, equity: float, risk_pct: float, debug: bool = False
+    bars: list[Bar],
+    cfg: dict,
+    equity: float,
+    risk_pct: float,
+    debug: bool = False,
+    btc_daily_bars: Optional[list[Bar]] = None,
 ) -> Optional[Trade]:
     """
     HTF trend pullback continuation entry signal (long only).
@@ -1054,6 +1529,26 @@ def check_htf_trend_entry_signal(
     highs  = [b.high  for b in bars]
     lows   = [b.low   for b in bars]
     bar    = bars[-1]
+
+    if cfg.get("require_btc_bull_market", False):
+        if not btc_daily_bars:
+            if debug:
+                print(
+                    f"REJECT {bar.timestamp.strftime('%Y-%m-%d %H:%M')} | "
+                    "BTC_BULL_GATE(no_daily_btc_series)"
+                )
+            return None
+        if not btc_daily_bars_pass_bull_filter_at_ts(
+            btc_daily_bars,
+            bar.timestamp,
+            int(cfg.get("btc_ema_period", 200)),
+        ):
+            if debug:
+                print(
+                    f"REJECT {bar.timestamp.strftime('%Y-%m-%d %H:%M')} | "
+                    "BTC_BULL_GATE(close_not_above_btc_daily_ema)"
+                )
+            return None
 
     # ── HTF trend filter: price above EMA200 ──────────────────────────────
     ema200 = calculate_ema(closes, htf_period)
@@ -1183,12 +1678,12 @@ def check_exits(
         if tp1_reached:
             trade.tp1_hit = True
             trade.qty_remaining = trade.qty * (1.0 - cfg["tp1_partial_pct"])
-            # Breakeven stop: entry + round-trip fees buffer
-            fee_buf = MAKER_FEE + TAKER_FEE
-            if trade.side == "long":
-                trade.breakeven_stop = trade.entry_price * (1.0 + fee_buf)
-            else:
-                trade.breakeven_stop = trade.entry_price * (1.0 - fee_buf)
+            if cfg.get("breakeven_requires_tp1", True):
+                fee_buf = MAKER_FEE + TAKER_FEE
+                if trade.side == "long":
+                    trade.breakeven_stop = trade.entry_price * (1.0 + fee_buf)
+                else:
+                    trade.breakeven_stop = trade.entry_price * (1.0 - fee_buf)
 
     # 3. TP2 full close
     tp2_reached = (
@@ -1300,6 +1795,11 @@ def run_backtest(
     long_only: bool,
     strategy: str = "vwap_meanrev",
     debug_signal: bool = False,
+    swing_daily_bars: Optional[list[Bar]] = None,
+    swing_btc_bars: Optional[list[Bar]] = None,
+    vb_btc_daily_bars: Optional[list[Bar]] = None,
+    htf_btc_daily_bars: Optional[list[Bar]] = None,
+    vwap_htf_bars: Optional[list[Bar]] = None,
 ) -> tuple[list[Trade], list[float]]:
     """
     Bar-by-bar replay for a single symbol.
@@ -1335,12 +1835,59 @@ def run_backtest(
                 signal = check_pullback_vwap_entry_signal(bars_so_far, cfg, equity, risk_pct, debug=debug_signal)
             elif strategy == "meanrev":
                 signal = check_meanrev_entry_signal(bars_so_far, cfg, equity, risk_pct, debug=debug_signal)
+            elif strategy in ("bull_flag_1m", "bull_flag_5m", "bull_flag_1h"):
+                signal = check_bull_flag_entry_signal(bars_so_far, cfg, equity, risk_pct, debug=debug_signal)
+            elif strategy == "swing_bull_flag":
+                d_ts: Optional[list[Any]] = None
+                d_cl: Optional[list[float]] = None
+                if swing_daily_bars:
+                    t_end = bars_so_far[-1].timestamp
+                    sub_d = [b for b in swing_daily_bars if b.timestamp <= t_end]
+                    if sub_d:
+                        d_ts = [b.timestamp for b in sub_d]
+                        d_cl = [b.close for b in sub_d]
+                btc_c: Optional[list[float]] = None
+                if swing_btc_bars:
+                    upto = min(len(bars_so_far), len(swing_btc_bars))
+                    btc_c = [swing_btc_bars[j].close for j in range(upto)]
+                signal = check_bull_flag_entry_signal(
+                    bars_so_far,
+                    cfg,
+                    equity,
+                    risk_pct,
+                    debug=debug_signal,
+                    daily_timestamps=d_ts,
+                    daily_closes=d_cl,
+                    btc_closes=btc_c,
+                )
             elif strategy == "volatility_breakout":
-                signal = check_volatility_breakout_entry_signal(bars_so_far, cfg, equity, risk_pct, debug=debug_signal)
+                signal = check_volatility_breakout_entry_signal(
+                    bars_so_far,
+                    cfg,
+                    equity,
+                    risk_pct,
+                    debug=debug_signal,
+                    vb_btc_daily_bars=vb_btc_daily_bars,
+                )
             elif strategy == "htf_trend":
-                signal = check_htf_trend_entry_signal(bars_so_far, cfg, equity, risk_pct, debug=debug_signal)
+                signal = check_htf_trend_entry_signal(
+                    bars_so_far,
+                    cfg,
+                    equity,
+                    risk_pct,
+                    debug=debug_signal,
+                    btc_daily_bars=htf_btc_daily_bars,
+                )
             else:
-                signal = check_entry_signal(bars_so_far, cfg, equity, risk_pct, long_only, debug=debug_signal)
+                signal = check_entry_signal(
+                    bars_so_far,
+                    cfg,
+                    equity,
+                    risk_pct,
+                    long_only,
+                    debug=debug_signal,
+                    htf_bars=vwap_htf_bars,
+                )
             if signal is not None:
                 counter       += 1
                 signal.trade_num = counter
@@ -1365,6 +1912,25 @@ def run_backtest(
 
 # ─── Pipeline grader (no Redis, no live APIs) ─────────────────────────────────
 
+def _meanrev_pipeline_d2_substitute(
+    closes: list[float], highs: list[float], lows: list[float]
+) -> bool:
+    """When pipeline strategy is meanrev, D2 momentum is replaced by oversold/ranging gate."""
+    lp = MEANREV_DEFAULT_CONFIG["lookback_period"]
+    std_m = MEANREV_DEFAULT_CONFIG["std_dev_multiplier"]
+    rsi_p = MEANREV_DEFAULT_CONFIG["rsi_period"]
+    adx_max = MEANREV_DEFAULT_CONFIG["adx_max_threshold"]
+    min_len = max(lp + 3, 35)
+    if len(closes) < min_len or len(highs) < min_len or len(lows) < min_len:
+        return False
+    rsi = calculate_rsi(closes, period=rsi_p)
+    _upper, _mid, lower = _calc_bb_from_closes(closes, lp, std_m)
+    adx = calculate_adx(highs, lows, closes, period=14)
+    if rsi is None or adx is None:
+        return False
+    return bool(rsi < 40.0 and closes[-1] <= lower and adx < adx_max)
+
+
 def _grade_pair_at_bar(
     bars: list[Bar],
     btc_bars: list[Bar],
@@ -1372,6 +1938,7 @@ def _grade_pair_at_bar(
     supply: Optional[float],
     relax: bool = False,
     rvol_lb_override: Optional[int] = None,
+    pipeline_strategy: Optional[str] = None,
 ) -> dict:
     """
     Compute the 5-pillar pipeline grade from historical OHLCV bars only.
@@ -1391,10 +1958,12 @@ def _grade_pair_at_bar(
     bars_per_4h = max(1, 240 // interval_min)    # bars in a 4-hour window
 
     closes = [b.close for b in bars]
+    highs = [b.high for b in bars]
+    lows = [b.low for b in bars]
     close  = closes[-1]
 
     # ── Hard floor: 24h USD volume ──────────────────────────────────────────
-    # Kraken volume is in base currency; USD volume = volume × close
+    # Volume is base units; approximate USD notionals as volume × close (USDT)
     vol_24h_usd = sum(b.volume * b.close for b in bars[-bpd:]) if len(bars) >= bpd else 0.0
     floor_thresh = RELAX_HARD_FLOOR if relax else HARD_FLOOR_VOLUME_USD
     hard_floor_pass = vol_24h_usd >= floor_thresh
@@ -1448,6 +2017,8 @@ def _grade_pair_at_bar(
         (mom_24h is not None and mom_24h >= D2_MIN_24H_PCT) or
         (mom_4h  is not None and mom_4h  >= D2_MIN_4H_PCT)
     )
+    if pipeline_strategy == "meanrev":
+        d2_pass = _meanrev_pipeline_d2_substitute(closes, highs, lows)
 
     # ── D3: Volume sweet spot ────────────────────────────────────────────────
     d3_min = RELAX_D3_MIN_VOLUME if relax else D3_MIN_VOLUME
@@ -1514,19 +2085,25 @@ def run_pipeline_backtest(
     relax: bool = False,
     strategy: str = "vwap_meanrev",
     debug_signal: bool = False,
+    daily_fetcher: Optional[Callable[[str], list[Bar]]] = None,
+    vb_btc_daily_bars: Optional[list[Bar]] = None,
+    htf_btc_daily_bars: Optional[list[Bar]] = None,
+    vwap_htf_bars_by_symbol: Optional[dict[str, list[Bar]]] = None,
+    min_grade: str = "B",
 ) -> tuple[list[Trade], list[float]]:
     """
     Pipeline bar-by-bar replay.
 
     At each bar:
       - If in a trade: check exits on the active pair.
-      - If flat: grade all universe pairs, pick the highest-graded (B or better),
-        look for a VWAP mean-reversion entry signal.
+      - If flat: grade all universe pairs, pick the highest-graded pair at or
+        above min_grade, look for a strategy entry signal.
     relax=True lowers pillar thresholds and includes C-grade entries at 0.25× size.
 
     Grade-based position sizing:
       A+/A → full risk_pct  |  B → 50% risk_pct  |  C/F → skip
     """
+    min_grade_score = GRADE_ORDER.get(min_grade, GRADE_ORDER["B"])
     bpd         = max(1, 1440 // interval_min)
 
     # Anchor the window on BTC bars (always has full data), falling back to
@@ -1624,16 +2201,21 @@ def run_pipeline_backtest(
                     supplies.get(sym),
                     relax=relax,
                     rvol_lb_override=rvol_lb,
+                    pipeline_strategy=strategy,
                 )
                 score = GRADE_ORDER.get(result["grade"], 0)
-                if score > best_score:
+                if score >= min_grade_score and score > best_score:
                     best_score  = score
                     best_symbol = sym
                     best_grade  = result["grade"]
 
             sf_table    = GRADE_SIZE_FACTOR_RELAX if relax else GRADE_SIZE_FACTOR
             size_factor = sf_table.get(best_grade, 0.0)
-            if best_symbol and size_factor > 0:
+            if (
+                best_symbol
+                and size_factor > 0
+                and GRADE_ORDER.get(best_grade, 0) >= min_grade_score
+            ):
                 sym_bars   = all_bars[best_symbol]
                 _eq        = equity * size_factor
                 _sl        = sym_bars[:i + 1]
@@ -1641,12 +2223,69 @@ def run_pipeline_backtest(
                     signal = check_pullback_vwap_entry_signal(_sl, cfg, _eq, risk_pct, debug=debug_signal)
                 elif strategy == "meanrev":
                     signal = check_meanrev_entry_signal(_sl, cfg, _eq, risk_pct, debug=debug_signal)
+                elif strategy in ("bull_flag_1m", "bull_flag_5m", "bull_flag_1h"):
+                    signal = check_bull_flag_entry_signal(_sl, cfg, _eq, risk_pct, debug=debug_signal)
+                elif strategy == "swing_bull_flag":
+                    d_ts: Optional[list[Any]] = None
+                    d_cl: Optional[list[float]] = None
+                    if daily_fetcher and best_symbol:
+                        try:
+                            dfull = daily_fetcher(best_symbol)
+                            t_end = _sl[-1].timestamp
+                            sub_d = [b for b in dfull if b.timestamp <= t_end]
+                            if sub_d:
+                                d_ts = [b.timestamp for b in sub_d]
+                                d_cl = [b.close for b in sub_d]
+                        except Exception:
+                            d_ts, d_cl = None, None
+                    btc_c: Optional[list[float]] = None
+                    if btc_bars:
+                        btc_seg = btc_bars[: i + 1]
+                        btc_c = [b.close for b in btc_seg]
+                    signal = check_bull_flag_entry_signal(
+                        _sl,
+                        cfg,
+                        _eq,
+                        risk_pct,
+                        debug=debug_signal,
+                        daily_timestamps=d_ts,
+                        daily_closes=d_cl,
+                        btc_closes=btc_c,
+                    )
                 elif strategy == "volatility_breakout":
-                    signal = check_volatility_breakout_entry_signal(_sl, cfg, _eq, risk_pct, debug=debug_signal)
+                    signal = check_volatility_breakout_entry_signal(
+                        _sl,
+                        cfg,
+                        _eq,
+                        risk_pct,
+                        debug=debug_signal,
+                        vb_btc_daily_bars=vb_btc_daily_bars,
+                    )
                 elif strategy == "htf_trend":
-                    signal = check_htf_trend_entry_signal(_sl, cfg, _eq, risk_pct, debug=debug_signal)
+                    signal = check_htf_trend_entry_signal(
+                        _sl,
+                        cfg,
+                        _eq,
+                        risk_pct,
+                        debug=debug_signal,
+                        btc_daily_bars=htf_btc_daily_bars,
+                    )
                 else:
-                    signal = check_entry_signal(_sl, cfg, _eq, risk_pct, long_only, debug=debug_signal)
+                    htf_seg: Optional[list[Bar]] = None
+                    if vwap_htf_bars_by_symbol and best_symbol:
+                        raw_htf = vwap_htf_bars_by_symbol.get(best_symbol)
+                        if raw_htf:
+                            t_end = _sl[-1].timestamp
+                            htf_seg = [b for b in raw_htf if b.timestamp <= t_end]
+                    signal = check_entry_signal(
+                        _sl,
+                        cfg,
+                        _eq,
+                        risk_pct,
+                        long_only,
+                        debug=debug_signal,
+                        htf_bars=htf_seg,
+                    )
                 if signal is not None:
                     counter          += 1
                     signal.trade_num  = counter
@@ -1676,6 +2315,15 @@ def run_pipeline_backtest(
 
 # ─── Metrics & output ─────────────────────────────────────────────────────────
 
+def _effective_span_days_and_hist_label(ns: argparse.Namespace) -> tuple[float, str]:
+    """If --years set, spans ~365.2425d per year and overrides plain --days labeling."""
+    if ns.years is not None:
+        d = ns.years * YEARS_APPROX_DAYS_PER_YEAR
+        lbl = f"{ns.years:g} years (~{d:.1f}d)"
+        return d, lbl
+    return float(ns.days), f"{ns.days} days"
+
+
 def _max_drawdown(equity_curve: list[float]) -> float:
     peak  = equity_curve[0]
     max_dd = 0.0
@@ -1690,8 +2338,9 @@ def print_metrics(
     equity_curve: list[float],
     starting_equity: float,
     symbol: str,
-    days: int,
+    hist_display: str,
     interval: str,
+    strategy: str = "vwap_meanrev",
 ) -> None:
     if not trades:
         print("\nNo trades generated.")
@@ -1713,13 +2362,26 @@ def print_metrics(
         r = t.exit_reason or "unknown"
         reason_counts[r] = reason_counts.get(r, 0) + 1
 
+    _hdr_labels = {
+        "vwap_meanrev": "VWAP MEAN REVERSION",
+        "vwap_meanrev_1h": "VWAP MEAN REVERSION (1H)",
+        "pullback_vwap": "PULLBACK TO VWAP",
+        "meanrev": "MEAN REVERSION (BB+RSI+ADX)",
+        "volatility_breakout": "VOLATILITY BREAKOUT",
+        "htf_trend": "HTF TREND PULLBACK",
+        "bull_flag_1m": "BULL FLAG + MOMENTUM PULLBACK (1M)",
+        "bull_flag_5m": "BULL FLAG + MOMENTUM PULLBACK (5M)",
+        "bull_flag_1h": "BULL FLAG + MOMENTUM PULLBACK (1H)",
+        "swing_bull_flag": "SWING BULL FLAG (W2, 4H)",
+    }
+    hdr = _hdr_labels.get(strategy, strategy.upper().replace("_", " "))
     w = 60
     print("\n" + "═" * w)
-    print("  VWAP MEAN REVERSION BACKTEST RESULTS")
+    print(f"  {hdr} BACKTEST RESULTS")
     print("═" * w)
-    print(f"  Symbol   : {symbol}   |  Days: {days}  |  Interval: {interval}")
+    print(f"  Symbol   : {symbol}   |  History: {hist_display}  |  Interval: {interval}")
     print(f"  Bars     : {len(equity_curve) - 1:,}  (warmup: {WARMUP_BARS})")
-    print(f"  NOTE     : HTF regime filter, 1m candle check, VWAP slope guard skipped")
+    print(f"  NOTE     : Live-only filters skipped where not modeled (see module docstring)")
     print("─" * w)
     print(f"  Trades   : {total}  ({len(wins)} wins / {len(losses)} losses)")
     print(f"  Win rate : {win_rate:.1f}%")
@@ -1741,7 +2403,7 @@ def print_pipeline_metrics(
     equity_curve: list[float],
     starting_equity: float,
     universe: list[str],
-    days: int,
+    hist_display: str,
     interval: str,
     strategy: str = "vwap_meanrev",
 ) -> None:
@@ -1766,10 +2428,15 @@ def print_pipeline_metrics(
 
     _strategy_labels = {
         "vwap_meanrev":        "VWAP MEAN REVERSION",
+        "vwap_meanrev_1h":     "VWAP MEAN REVERSION (1H)",
         "pullback_vwap":       "PULLBACK TO VWAP",
         "meanrev":             "MEAN REVERSION (BB+RSI+ADX)",
         "volatility_breakout": "VOLATILITY BREAKOUT",
         "htf_trend":           "HTF TREND PULLBACK",
+        "bull_flag_1m":        "BULL FLAG + MOMENTUM PULLBACK (1M)",
+        "bull_flag_5m":        "BULL FLAG + MOMENTUM PULLBACK (5M)",
+        "bull_flag_1h":        "BULL FLAG + MOMENTUM PULLBACK (1H)",
+        "swing_bull_flag":     "SWING BULL FLAG (W2, 4H)",
     }
     strategy_label = _strategy_labels.get(strategy, strategy.upper())
     w = 68
@@ -1777,7 +2444,8 @@ def print_pipeline_metrics(
     print(f"  PIPELINE BACKTEST — {strategy_label}")
     print("═" * w)
     print(f"  Universe : {', '.join(universe)}")
-    print(f"  Days     : {days}  |  Interval: {interval}  |  Pairs: {len(universe)}")
+    print(f"  History  : {hist_display}  |  Interval: {interval}  |  Pairs: {len(universe)}")
+    print(f"  NOTE     : OHLC from Binance (USDT); Kraken wsname universe; live bot unchanged")
     print(f"  NOTE     : HTF regime filter, 1m candle check, VWAP slope guard skipped")
     print(f"  NOTE     : S1 supply from hardcoded table (fail-open for unknown pairs)")
     print("─" * w)
@@ -1831,6 +2499,54 @@ def print_pipeline_metrics(
     print("═" * w)
 
 
+def print_pipeline_calendar_year_breakdown(trades: list[Trade]) -> None:
+    """Per-calendar-year stats by exit_time (UTC). Labels avoid repeating 'Win rate' lines (supervisor parser)."""
+    by_year: dict[int, list[Trade]] = {}
+    for t in trades:
+        et = t.exit_time
+        if et is None:
+            continue
+        by_year.setdefault(et.year, []).append(t)
+
+    years = sorted(by_year.keys())
+    if not years:
+        return
+
+    w = 74
+    print("\n  " + "─" * w)
+    print("  Calendar-year breakdown (UTC, by exit)")
+    print("  " + "─" * w)
+    print(
+        f"  {'Year':<6}"
+        f"{'Trades':>8}"
+        f"{'W/L':>10}"
+        f"{'Pct_wr':>9}"
+        f"{'PnL_$':>12}"
+        f"{'R:R':>10}"
+    )
+    print("  " + "─" * w)
+    for y in years:
+        pts = by_year[y]
+        wins_y = [t for t in pts if t.pnl_usd > 0]
+        loss_y = [t for t in pts if t.pnl_usd <= 0]
+        n = len(pts)
+        pw = len(wins_y) / n * 100.0 if n else 0.0
+        aw = sum(t.pnl_usd for t in wins_y) / len(wins_y) if wins_y else 0.0
+        al = sum(t.pnl_usd for t in loss_y) / len(loss_y) if loss_y else 0.0
+        rr_y = abs(aw / al) if al else float("inf")
+        tot = sum(t.pnl_usd for t in pts)
+        rr_disp = "inf:1" if rr_y == float("inf") else f"{rr_y:.2f}:1"
+        print(
+            f"  {y:<6}"
+            f"{n:>8}"
+            f"{len(wins_y):>5}/{len(loss_y):>4}"
+            f"{pw:>8.1f}%"
+            f"{tot:>+12.4f}"
+            f"{rr_disp:>10}"
+        )
+    print("  " + "─" * w)
+
+
 def write_csv(trades: list[Trade], output_path: str, cfg: dict) -> None:
     if not trades:
         return
@@ -1866,16 +2582,41 @@ def write_csv(trades: list[Trade], output_path: str, cfg: dict) -> None:
     print(f"\n  Trades CSV: {output_path}")
 
 
+def _merge_vwap_cli_overrides(cfg: dict, args: Any, strategy: str) -> None:
+    """Apply CLI overrides for VWAP mean-reversion strategies."""
+    if strategy not in ("vwap_meanrev", "vwap_meanrev_1h"):
+        return
+    if getattr(args, "rsi_oversold", None) is not None:
+        cfg["rsi_oversold"] = args.rsi_oversold
+    if getattr(args, "long_min_volume_ratio", None) is not None:
+        cfg["long_min_volume_ratio"] = args.long_min_volume_ratio
+    if getattr(args, "htf_rsi_long_max", None) is not None:
+        cfg["htf_rsi_long_max"] = args.htf_rsi_long_max
+    if getattr(args, "htf_rsi_bars_interval", None) is not None:
+        cfg["htf_rsi_bars_interval"] = args.htf_rsi_bars_interval
+    if getattr(args, "atr_stop_mult", None) is not None:
+        cfg["atr_stop_mult"] = args.atr_stop_mult
+    if getattr(args, "breakeven_requires_tp1", None) is not None:
+        cfg["breakeven_requires_tp1"] = args.breakeven_requires_tp1
+
+
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(line_buffering=True)
+            sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(
         description="Crypto Strategy Backtester",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python backtest.py --days 30                              # all-pairs pipeline, vwap_meanrev\n"
-            "  python backtest.py --days 30 --strategy htf_trend        # all-pairs pipeline, htf_trend\n"
+            "  python backtest.py --days 30                              # all-pairs pipeline (Binance OHLC)\n"
+            "  python backtest.py --interval 4h --years 5 --strategy htf_trend --all-pairs\n"
             "  python backtest.py --symbol SNX/USD --days 60            # single-symbol\n"
             "  python backtest.py --universe SNX/USD,AXS/USD --days 60  # pipeline, explicit universe\n"
             "  python backtest.py --days 30 --relax-pillars --debug-signal"
@@ -1888,7 +2629,13 @@ def main() -> None:
                         help="Comma-separated pairs for pipeline mode (explicit subset), "
                              "e.g. SNX/USD,AXS/USD,HNT/USD. Omit for the full Kraken universe.")
     parser.add_argument("--days",             type=int,   default=60,
-                        help="History window in days (default: 60)")
+                        help="History window in days (default: 60). Ignored when --years is set.")
+    parser.add_argument(
+        "--years",
+        type=float,
+        default=None,
+        help="History window in years (~365.2425 d/year). When set, overrides --days.",
+    )
     parser.add_argument("--interval",         default=None,
                         choices=list(INTERVAL_MAP.keys()),
                         help="Bar interval (default: 15m for --symbol, 4h for --universe)")
@@ -1912,13 +2659,64 @@ def main() -> None:
     parser.add_argument("--dev-threshold",  type=float, default=None,
                         help="Override dev_threshold_pct (default: 2.0). "
                              "Lower values = more entry signals (e.g. 1.0, 1.5, 2.5)")
+    parser.add_argument(
+        "--rsi-oversold",
+        type=float,
+        default=None,
+        help="Override rsi_oversold for vwap_meanrev / vwap_meanrev_1h (default: 30).",
+    )
+    parser.add_argument(
+        "--long-min-volume-ratio",
+        type=float,
+        default=None,
+        dest="long_min_volume_ratio",
+        help="Require signal-bar volume >= this × volume SMA for VWAP long entries (Task L option B).",
+    )
+    parser.add_argument(
+        "--htf-rsi-long-max",
+        type=float,
+        default=None,
+        dest="htf_rsi_long_max",
+        help="Require HTF RSI <= this for VWAP longs; uses --htf-rsi-bars-interval klines (Task L option C).",
+    )
+    parser.add_argument(
+        "--htf-rsi-bars-interval",
+        default=None,
+        dest="htf_rsi_bars_interval",
+        choices=list(INTERVAL_MAP.keys()),
+        help="HTF kline interval for --htf-rsi-long-max (default: 4h from cfg).",
+    )
+    parser.add_argument(
+        "--atr-stop-mult",
+        type=float,
+        default=None,
+        dest="atr_stop_mult",
+        help="Override atr_stop_mult for VWAP mean-reversion strategies (default: 1.5).",
+    )
+    parser.add_argument(
+        "--min-grade",
+        default="B",
+        choices=["A+", "A", "B", "C"],
+        help="Minimum pipeline grade required for new entries (default: B).",
+    )
+    parser.add_argument(
+        "--breakeven-requires-tp1",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="breakeven_requires_tp1",
+        help="Move stop to breakeven only after TP1 partial fill (default: true).",
+    )
     parser.add_argument("--all-pairs",      action="store_true",
                         help="Explicit flag to use the full Kraken USD universe in pipeline mode. "
                              "This is now the DEFAULT when --symbol and --universe are both omitted.")
     parser.add_argument("--strategy",       default="vwap_meanrev",
-                        choices=["vwap_meanrev", "pullback_vwap", "meanrev",
-                                 "volatility_breakout", "htf_trend"],
+                        choices=["vwap_meanrev", "vwap_meanrev_1h", "pullback_vwap", "meanrev",
+                                 "volatility_breakout", "htf_trend",
+                                 "bull_flag", "bull_flag_1m", "bull_flag_5m", "bull_flag_1h",
+                                 "swing_bull_flag"],
                         help="Strategy to backtest (default: vwap_meanrev). "
+                             "vwap_meanrev_1h is the 1h-chart instance (same logic as vwap_meanrev). "
+                             "bull_flag is an alias for bull_flag_5m (primary I1). "
                              "Works in both single-symbol and pipeline mode.")
     parser.add_argument("--debug-signal",  action="store_true",
                         help="Print per-bar rejection reasons for the selected pair. "
@@ -1928,8 +2726,14 @@ def main() -> None:
                              "htf_trend: EMA200/PULLBACK/EMA50/CANDLE")
     args = parser.parse_args()
 
+    # Primary I1 name from docs / TASK D — canonical internal id is bull_flag_5m
+    if args.strategy == "bull_flag":
+        args.strategy = "bull_flag_5m"
+
     if args.symbol is None and args.universe is None:
         args.all_pairs = True  # default: full Kraken USD universe
+
+    span_days, hist_label = _effective_span_days_and_hist_label(args)
 
     pipeline_mode = args.universe is not None or args.all_pairs
 
@@ -1938,7 +2742,7 @@ def main() -> None:
         interval = args.interval or PIPELINE_DEFAULT_INTERVAL
         if args.interval is None:
             print(f"  [pipeline] Defaulting to --interval {interval} "
-                  f"(Kraken 1h retention: ~30d; use --interval 4h for 60+ days)")
+                  f"(full depth from Binance; use explicit --interval when needed)")
         interval_min = INTERVAL_MAP[interval]
 
         if args.all_pairs:
@@ -1963,10 +2767,15 @@ def main() -> None:
         relax = args.relax_pillars
         _pipeline_labels = {
             "vwap_meanrev":        "VWAP Mean Reversion",
+            "vwap_meanrev_1h":     "VWAP Mean Reversion (1h)",
             "pullback_vwap":       "Pullback to VWAP",
             "meanrev":             "Mean Reversion (BB+RSI+ADX)",
             "volatility_breakout": "Volatility Breakout",
             "htf_trend":           "HTF Trend Pullback",
+            "bull_flag_1m":        "Bull Flag + Momentum Pullback (1m)",
+            "bull_flag_5m":        "Bull Flag + Momentum Pullback (5m)",
+            "bull_flag_1h":        "Bull Flag + Momentum Pullback (1h)",
+            "swing_bull_flag":     "Swing Bull Flag (W2, 4h)",
         }
         pipeline_strategy_label = _pipeline_labels.get(args.strategy, args.strategy)
         print(f"\n{pipeline_strategy_label} — PIPELINE BACKTEST")
@@ -1975,7 +2784,7 @@ def main() -> None:
         else:
             print(f"Universe : {', '.join(universe)}")
         print(f"Strategy : {args.strategy}")
-        print(f"Days     : {args.days}  |  Interval: {interval}")
+        print(f"History  : {hist_label}  |  Interval: {interval}")
         print(f"Equity   : ${args.starting_equity:.2f}  |  Risk/trade: {args.risk_pct}%")
         if relax:
             print(f"Mode     : RELAXED pillars (floor $10K, RVOL≥1.5×, D3≥$100K, C=0.25×)")
@@ -1987,7 +2796,9 @@ def main() -> None:
         for i, sym in enumerate(fetch_list):
             print(f"\n[{sym}]")
             try:
-                bars = fetch_kraken_ohlcv(sym, interval_min, args.days, no_cache=args.no_cache)
+                bars = fetch_binance_ohlcv_for_backtest(
+                    sym, interval, span_days, no_cache=args.no_cache
+                )
                 all_bar_data[sym] = bars
                 if bars:
                     print(f"  Date range: {bars[0].timestamp.date()} → {bars[-1].timestamp.date()}")
@@ -2001,19 +2812,98 @@ def main() -> None:
         btc_bars = all_bar_data.get(BTC_KRAKEN, [])
         universe_bars = {sym: all_bar_data[sym] for sym in universe if all_bar_data.get(sym)}
 
+        vb_btc_daily_bars: Optional[list[Bar]] = None
+        htf_btc_daily_bars: Optional[list[Bar]] = None
+        if args.strategy == "volatility_breakout":
+            print(f"\n[{BTC_KRAKEN}] (1d — BTC EMA macro gate)")
+            try:
+                vb_btc_daily_bars = fetch_binance_ohlcv_for_backtest(
+                    BTC_KRAKEN, "1d", span_days, no_cache=args.no_cache
+                )
+                if vb_btc_daily_bars:
+                    print(
+                        f"  Date range: {vb_btc_daily_bars[0].timestamp.date()} → "
+                        f"{vb_btc_daily_bars[-1].timestamp.date()} ({len(vb_btc_daily_bars)} bars)"
+                    )
+                else:
+                    print("  WARNING: no daily BTC bars — VB entries will be blocked (fail-closed)")
+            except Exception as e:
+                print(f"  ERROR fetching daily BTC: {e}")
+        elif args.strategy == "htf_trend":
+            print(f"\n[{BTC_KRAKEN}] (1d — HTF BTC EMA macro gate)")
+            try:
+                htf_btc_daily_bars = fetch_binance_ohlcv_for_backtest(
+                    BTC_KRAKEN, "1d", span_days, no_cache=args.no_cache
+                )
+                if htf_btc_daily_bars:
+                    print(
+                        f"  Date range: {htf_btc_daily_bars[0].timestamp.date()} → "
+                        f"{htf_btc_daily_bars[-1].timestamp.date()} ({len(htf_btc_daily_bars)} bars)"
+                    )
+                else:
+                    print("  WARNING: no daily BTC bars — HTF entries will be blocked (fail-closed)")
+            except Exception as e:
+                print(f"  ERROR fetching daily BTC: {e}")
+
         if args.strategy == "pullback_vwap":
             cfg = PULLBACK_VWAP_DEFAULT_CONFIG.copy()
         elif args.strategy == "meanrev":
             cfg = MEANREV_DEFAULT_CONFIG.copy()
         elif args.strategy == "volatility_breakout":
             cfg = VOLATILITY_BREAKOUT_DEFAULT_CONFIG.copy()
+            _merge_vb_btc_bull_env_into_cfg(cfg)
         elif args.strategy == "htf_trend":
             cfg = HTF_TREND_DEFAULT_CONFIG.copy()
+            _merge_htf_btc_bull_env_into_cfg(cfg)
+        elif args.strategy in ("bull_flag_1m", "bull_flag_5m", "bull_flag_1h"):
+            cfg = bull_flag_backtest_cfg(args.strategy)
+        elif args.strategy == "swing_bull_flag":
+            cfg = swing_bull_flag_backtest_cfg()
+        elif args.strategy == "vwap_meanrev_1h":
+            cfg = DEFAULT_CONFIG.copy()
+            cfg["max_bars_in_trade"] = 12
         else:
             cfg = DEFAULT_CONFIG.copy()
             if args.dev_threshold is not None:
                 cfg["dev_threshold_pct"] = args.dev_threshold
                 print(f"  dev_threshold_pct overridden → {args.dev_threshold}%")
+
+        _merge_vwap_cli_overrides(cfg, args, args.strategy)
+        cfg["breakeven_requires_tp1"] = args.breakeven_requires_tp1
+
+        vwap_htf_by_sym: Optional[dict[str, list[Bar]]] = None
+        if (
+            args.strategy in ("vwap_meanrev", "vwap_meanrev_1h")
+            and cfg.get("htf_rsi_long_max") is not None
+        ):
+            htf_iv = cfg.get("htf_rsi_bars_interval") or "4h"
+            vwap_htf_by_sym = {}
+            print(f"\n[VWAP HTF RSI] Fetching {htf_iv} bars ({hist_label}) for HTF RSI gate…")
+            for j, sym in enumerate(fetch_list):
+                print(f"  [{sym}] {htf_iv}")
+                try:
+                    h_rows = fetch_binance_ohlcv_for_backtest(
+                        sym, htf_iv, span_days, no_cache=args.no_cache
+                    )
+                    vwap_htf_by_sym[sym] = h_rows
+                except Exception as e:
+                    print(f"    ERROR: {e}")
+                    vwap_htf_by_sym[sym] = []
+                if args.all_pairs and j < len(fetch_list) - 1:
+                    time.sleep(0.25)
+
+        _daily_ohlcv_cache: dict[str, list[Bar]] = {}
+
+        def _pipeline_daily_fetch(sym: str) -> list[Bar]:
+            if sym not in _daily_ohlcv_cache:
+                _daily_ohlcv_cache[sym] = fetch_binance_ohlcv_for_backtest(
+                    sym, "1d", span_days, no_cache=args.no_cache
+                )
+            return _daily_ohlcv_cache[sym]
+
+        _daily_fetcher: Optional[Callable[[str], list[Bar]]] = (
+            _pipeline_daily_fetch if args.strategy == "swing_bull_flag" else None
+        )
 
         trades, equity_curve = run_pipeline_backtest(
             universe_bars,
@@ -2028,13 +2918,20 @@ def main() -> None:
             relax=relax,
             strategy=args.strategy,
             debug_signal=args.debug_signal,
+            daily_fetcher=_daily_fetcher,
+            vb_btc_daily_bars=vb_btc_daily_bars,
+            htf_btc_daily_bars=htf_btc_daily_bars,
+            vwap_htf_bars_by_symbol=vwap_htf_by_sym,
+            min_grade=args.min_grade,
         )
 
         print_pipeline_metrics(
             trades, equity_curve, args.starting_equity,
-            universe, args.days, interval,
+            universe, hist_label, interval,
             strategy=args.strategy,
         )
+        if trades:
+            print_pipeline_calendar_year_breakdown(trades)
         write_csv(trades, args.output, cfg)
 
     # ── Single-symbol mode ─────────────────────────────────────────────────────
@@ -2043,23 +2940,40 @@ def main() -> None:
             # --long-only is implicit for pullback_vwap; warn if user set it explicitly
             pass  # no conflict
 
-        interval = args.interval or "15m"
-        interval_min = INTERVAL_MAP[interval]
+        if args.interval is not None:
+            interval = args.interval
+        elif args.strategy == "swing_bull_flag":
+            interval = "4h"
+        elif args.strategy == "bull_flag_1m":
+            interval = "1m"
+        elif args.strategy == "bull_flag_5m":
+            interval = "5m"
+        elif args.strategy == "bull_flag_1h":
+            interval = "1h"
+        elif args.strategy == "vwap_meanrev_1h":
+            interval = "1h"
+        else:
+            interval = "15m"
 
         strategy_label = {
             "vwap_meanrev":        "VWAP Mean Reversion",
+            "vwap_meanrev_1h":     "VWAP Mean Reversion (1h)",
             "pullback_vwap":       "Pullback to VWAP",
             "meanrev":             "Mean Reversion (BB + RSI + ADX)",
             "volatility_breakout": "Volatility Breakout (Compression → Expansion)",
             "htf_trend":           "HTF Trend Pullback Continuation",
+            "bull_flag_1m":        "Bull Flag + Momentum Pullback (1m)",
+            "bull_flag_5m":        "Bull Flag + Momentum Pullback (5m)",
+            "bull_flag_1h":        "Bull Flag + Momentum Pullback (1h)",
+            "swing_bull_flag":     "Swing Bull Flag (W2, 4h)",
         }.get(args.strategy, args.strategy)
 
         print(f"\n{strategy_label} Backtester")
-        print(f"Symbol: {args.symbol}  |  Days: {args.days}  |  Interval: {interval}")
+        print(f"Symbol: {args.symbol}  |  History: {hist_label}  |  Interval: {interval}")
         print(f"Equity: ${args.starting_equity:.2f}  |  Risk/trade: {args.risk_pct}%\n")
 
-        bars = fetch_kraken_ohlcv(
-            args.symbol, interval_min, args.days, no_cache=args.no_cache
+        bars = fetch_binance_ohlcv_for_backtest(
+            args.symbol, interval, span_days, no_cache=args.no_cache
         )
 
         if len(bars) < WARMUP_BARS + 10:
@@ -2076,24 +2990,91 @@ def main() -> None:
             base_cfg_for_csv = MEANREV_DEFAULT_CONFIG
         elif args.strategy == "volatility_breakout":
             cfg = VOLATILITY_BREAKOUT_DEFAULT_CONFIG.copy()
+            _merge_vb_btc_bull_env_into_cfg(cfg)
             base_cfg_for_csv = VOLATILITY_BREAKOUT_DEFAULT_CONFIG
         elif args.strategy == "htf_trend":
             cfg = HTF_TREND_DEFAULT_CONFIG.copy()
             base_cfg_for_csv = HTF_TREND_DEFAULT_CONFIG
+            _merge_htf_btc_bull_env_into_cfg(cfg)
+        elif args.strategy in ("bull_flag_1m", "bull_flag_5m", "bull_flag_1h"):
+            cfg = bull_flag_backtest_cfg(args.strategy)
+            base_cfg_for_csv = cfg
+        elif args.strategy == "swing_bull_flag":
+            cfg = swing_bull_flag_backtest_cfg()
+            base_cfg_for_csv = cfg
+        elif args.strategy == "vwap_meanrev_1h":
+            cfg = DEFAULT_CONFIG.copy()
+            cfg["max_bars_in_trade"] = 12
+            base_cfg_for_csv = cfg
         else:
             cfg = DEFAULT_CONFIG.copy()
             base_cfg_for_csv = DEFAULT_CONFIG
             if args.dev_threshold is not None:
                 cfg["dev_threshold_pct"] = args.dev_threshold
 
+        _merge_vwap_cli_overrides(cfg, args, args.strategy)
+        cfg["breakeven_requires_tp1"] = args.breakeven_requires_tp1
+
+        swing_daily: Optional[list[Bar]] = None
+        swing_btc: Optional[list[Bar]] = None
+        vb_btc_daily_s: Optional[list[Bar]] = None
+        htf_btc_daily_s: Optional[list[Bar]] = None
+        if args.strategy == "swing_bull_flag":
+            swing_daily = fetch_binance_ohlcv_for_backtest(
+                args.symbol, "1d", span_days, no_cache=args.no_cache
+            )
+            swing_btc = fetch_binance_ohlcv_for_backtest(
+                BTC_KRAKEN, interval, span_days, no_cache=args.no_cache
+            )
+        elif args.strategy == "volatility_breakout":
+            try:
+                vb_btc_daily_s = fetch_binance_ohlcv_for_backtest(
+                    BTC_KRAKEN, "1d", span_days, no_cache=args.no_cache
+                )
+            except Exception as e:
+                print(f"  WARNING: daily BTC fetch failed: {e}")
+        elif args.strategy == "htf_trend":
+            try:
+                htf_btc_daily_s = fetch_binance_ohlcv_for_backtest(
+                    BTC_KRAKEN, "1d", span_days, no_cache=args.no_cache
+                )
+            except Exception as e:
+                print(f"  WARNING: daily BTC fetch failed: {e}")
+
+        vwap_htf_single: Optional[list[Bar]] = None
+        if (
+            args.strategy in ("vwap_meanrev", "vwap_meanrev_1h")
+            and cfg.get("htf_rsi_long_max") is not None
+        ):
+            htf_iv = cfg.get("htf_rsi_bars_interval") or "4h"
+            try:
+                vwap_htf_single = fetch_binance_ohlcv_for_backtest(
+                    args.symbol, htf_iv, span_days, no_cache=args.no_cache
+                )
+                nhtf = len(vwap_htf_single or [])
+                print(f"  HTF ({htf_iv}) for RSI gate: {nhtf} bars")
+            except Exception as e:
+                print(f"  WARNING: HTF fetch for RSI gate failed: {e}")
+
         trades, equity_curve = run_backtest(
-            bars, cfg, args.starting_equity, args.risk_pct,
-            long_only=True, strategy=args.strategy, debug_signal=args.debug_signal,
+            bars,
+            cfg,
+            args.starting_equity,
+            args.risk_pct,
+            long_only=True,
+            strategy=args.strategy,
+            debug_signal=args.debug_signal,
+            swing_daily_bars=swing_daily,
+            swing_btc_bars=swing_btc,
+            vb_btc_daily_bars=vb_btc_daily_s,
+            htf_btc_daily_bars=htf_btc_daily_s,
+            vwap_htf_bars=vwap_htf_single,
         )
 
         print_metrics(
             trades, equity_curve, args.starting_equity,
-            args.symbol, args.days, interval,
+            args.symbol, hist_label, interval,
+            strategy=args.strategy,
         )
         write_csv(trades, args.output, base_cfg_for_csv)
 

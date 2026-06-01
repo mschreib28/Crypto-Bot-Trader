@@ -56,17 +56,13 @@ export function useActivity(): UseActivityReturn {
   }, []);
 
   const clearActivity = useCallback(async (): Promise<boolean> => {
-    console.log('[useActivity] clearActivity called');
     clearingRef.current = true;
     try {
-      console.log('[useActivity] Sending DELETE request...');
       const response = await fetch('/api/v1/events', { method: 'DELETE' });
-      console.log('[useActivity] DELETE response status:', response.status);
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
-      const data = await response.json();
-      console.log('[useActivity] DELETE response data:', data);
+      await response.json();
       setActivities([]);
       setError(null);
       return true;

@@ -1,5 +1,10 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Strategy } from '../types/strategy';
+import { Strategy, StrategyLifecycleStatus } from '../types/strategy';
+
+function parseStrategyStatus(raw: unknown): StrategyLifecycleStatus {
+  if (raw === 'active' || raw === 'paused' || raw === 'stopped') return raw;
+  return 'stopped';
+}
 
 interface UseStrategiesReturn {
   strategies: Strategy[];
@@ -28,15 +33,21 @@ export function useStrategies(): UseStrategiesReturn {
       const strategiesArray = Array.isArray(data) ? data : (data.strategies || []);
       
       // Map API fields to frontend expected format
-      const mapped: Strategy[] = strategiesArray.map((s: Record<string, unknown>) => ({
-        strategy_id: (s.strategy_id || s.id || '') as string,
-        name: (s.name || '') as string,
-        symbol: (s.symbol || 'ETH/USD') as string,
-        interval: (s.interval || '5m') as string,
-        max_risk_pct: (s.max_risk_pct ?? 2.0) as number,
-        enabled: s.enabled ?? (s.status === 'active'),
-        parameters: (s.parameters || {}) as Record<string, unknown>,
-      }));
+      const mapped: Strategy[] = strategiesArray.map((s: Record<string, unknown>) => {
+        const status = parseStrategyStatus(s.status);
+        const enabled =
+          typeof s.enabled === 'boolean' ? s.enabled : status === 'active';
+        return {
+          strategy_id: (s.strategy_id || s.id || '') as string,
+          name: (s.name || '') as string,
+          symbol: (s.symbol || 'ETH/USD') as string,
+          interval: (s.interval || '5m') as string,
+          max_risk_pct: (s.max_risk_pct ?? 2.0) as number,
+          status,
+          enabled,
+          parameters: (s.parameters || {}) as Record<string, unknown>,
+        };
+      });
       
       setStrategies(mapped);
       setError(null);

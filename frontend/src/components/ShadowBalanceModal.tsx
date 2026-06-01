@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 interface ShadowBalanceModalProps {
   isOpen: boolean;
   currentBalance?: number;
-  onConfirm: (amount: number) => Promise<boolean>;
+  onConfirm: (amount: number) => Promise<{ success: boolean; positionsClosed: number }>;
   onCancel: () => void;
   loading?: boolean;
 }
@@ -17,6 +17,7 @@ export function ShadowBalanceModal({
 }: ShadowBalanceModalProps) {
   const [amount, setAmount] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const cancelButtonRef = useRef<HTMLButtonElement>(null);
 
@@ -25,6 +26,7 @@ export function ShadowBalanceModal({
       // Reset form when modal opens
       setAmount(currentBalance?.toFixed(2) || '');
       setError(null);
+      setSuccessMessage(null);
       // Focus input after a brief delay to ensure modal is rendered
       setTimeout(() => {
         inputRef.current?.focus();
@@ -53,11 +55,27 @@ export function ShadowBalanceModal({
     }
 
     setError(null);
-    const success = await onConfirm(value);
+    setSuccessMessage(null);
+    const result = await onConfirm(value);
     
-    if (success) {
+    if (result.success) {
       setAmount('');
-      onCancel();
+      // Show success message with positions closed count
+      if (result.positionsClosed > 0) {
+        setSuccessMessage(`Shadow balance updated successfully. ${result.positionsClosed} position(s) closed.`);
+        // Close modal after 2 seconds
+        setTimeout(() => {
+          setSuccessMessage(null);
+          onCancel();
+        }, 2000);
+      } else {
+        setSuccessMessage('Shadow balance updated successfully.');
+        // Close modal after 1.5 seconds
+        setTimeout(() => {
+          setSuccessMessage(null);
+          onCancel();
+        }, 1500);
+      }
     } else {
       setError('Failed to set shadow balance. Please try again.');
     }
@@ -97,6 +115,10 @@ export function ShadowBalanceModal({
 
         <p className="text-sm text-gray-400 mb-4">
           Enter the amount of money for the shadow portfolio.
+          <br />
+          <span className="text-yellow-400 text-xs mt-1 block font-medium">
+            ⚠️ Warning: All shadow positions will be closed when setting a new balance. This resets your shadow portfolio to start fresh with the new balance amount.
+          </span>
         </p>
 
         <div className="space-y-4">
@@ -122,6 +144,9 @@ export function ShadowBalanceModal({
             />
             {error && (
               <p className="mt-1 text-sm text-red-400">{error}</p>
+            )}
+            {successMessage && (
+              <p className="mt-1 text-sm text-green-400 font-medium">{successMessage}</p>
             )}
           </div>
 

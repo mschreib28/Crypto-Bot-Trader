@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 
-interface StrategyMetrics {
+export interface StrategyMetricsItem {
   accuracy_pct: number;
   total_pnl: number;
   win_count: number;
@@ -8,8 +8,8 @@ interface StrategyMetrics {
   open_count: number;
 }
 
-interface MetricsResponse {
-  strategies: Record<string, StrategyMetrics>;
+export interface MetricsResponse {
+  strategies: Record<string, StrategyMetricsItem>;
   total_pnl: number;
   overall_accuracy_pct: number;
 }

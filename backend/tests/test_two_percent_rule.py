@@ -50,6 +50,22 @@ class TestPositionSizer:
         assert valid is False
         assert "below_kraken_minimum" in reason
 
+    def test_calculate_rejects_below_min_notional(self):
+        """Sub-$1 position notional before rounding must return None (shadow skips micro_mode)."""
+        sizer = PositionSizer()
+        # equity 500 avoids micro mode; tiny risk yields position_size_usd < $1
+        assert (
+            sizer.calculate(
+                account_equity=500.0,
+                risk_pct=0.002,
+                entry_price=100.0,
+                stop_loss_pct=5.0,
+                strategy_id=None,
+                symbol="TEST/USD",
+            )
+            is None
+        )
+
 
 class TestAccountTracker:
     def test_initial_equity(self):

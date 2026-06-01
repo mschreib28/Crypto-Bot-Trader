@@ -55,18 +55,17 @@ class TestShadowModeExecutionGate:
         self, screener_service, mock_strategy, symbols_bars, actionable_buy_signal
     ):
         """When shadow mode is ON and trading is OFF, _process_auto_execution should be called."""
-        with patch('backend.redis.get_redis_client') as mock_redis_cls:
-            mock_redis = Mock()
-            mock_redis.get = Mock(return_value=None)
-            mock_redis.set = Mock(return_value=True)
-            mock_redis.setex = Mock(return_value=True)
-            mock_redis.lpush = Mock(return_value=True)
-            mock_redis.ltrim = Mock(return_value=True)
-            mock_redis.exists = Mock(return_value=False)
-            mock_redis_cls.return_value = mock_redis
+        mock_redis = Mock()
+        mock_redis.get = Mock(return_value=None)
+        mock_redis.set = Mock(return_value=True)
+        mock_redis.setex = Mock(return_value=True)
+        mock_redis.lpush = Mock(return_value=True)
+        mock_redis.ltrim = Mock(return_value=True)
+        mock_redis.exists = Mock(return_value=False)
 
-            with patch('backend.screener.service.get_trading_enabled', return_value=False):
-                with patch('backend.api.routes.trading.get_shadow_live_mode', return_value=True):
+        with patch('backend.screener.service.get_redis_client', return_value=mock_redis):
+            with patch('backend.redis.get_redis_client', return_value=mock_redis):
+                with patch('backend.screener.service.get_bot_mode', return_value='SHADOW'):
                     with patch(
                         'backend.screener.service.scan_with_strategy',
                         new_callable=AsyncMock,
@@ -87,30 +86,29 @@ class TestShadowModeExecutionGate:
                                         confidence_sell=70.0,
                                     )
 
-                            # Shadow mode + trading off: execution allowed, so _process_auto_execution is called
-                            assert mock_process.call_count == 1
-                            call_args = mock_process.call_args
-                            assert call_args[0][1] is True  # trading_enabled passed as True (shadow allows execution)
-                            assert call_args[0][0].symbol == "BTC/USD"
-                            assert call_args[0][0].signal_type == "BUY"
+                    # Shadow mode + trading off: execution allowed, so _process_auto_execution is called
+                    assert mock_process.call_count == 1
+                    call_args = mock_process.call_args
+                    assert call_args[0][1] is True  # trading_enabled passed as True (shadow allows execution)
+                    assert call_args[0][0].symbol == "BTC/USD"
+                    assert call_args[0][0].signal_type == "BUY"
 
     @pytest.mark.asyncio
     async def test_both_off_skips_auto_execution(
         self, screener_service, mock_strategy, symbols_bars, actionable_buy_signal
     ):
         """When both trading and shadow are OFF, _process_auto_execution should not be called."""
-        with patch('backend.redis.get_redis_client') as mock_redis_cls:
-            mock_redis = Mock()
-            mock_redis.get = Mock(return_value=None)
-            mock_redis.set = Mock(return_value=True)
-            mock_redis.setex = Mock(return_value=True)
-            mock_redis.lpush = Mock(return_value=True)
-            mock_redis.ltrim = Mock(return_value=True)
-            mock_redis.exists = Mock(return_value=False)
-            mock_redis_cls.return_value = mock_redis
+        mock_redis = Mock()
+        mock_redis.get = Mock(return_value=None)
+        mock_redis.set = Mock(return_value=True)
+        mock_redis.setex = Mock(return_value=True)
+        mock_redis.lpush = Mock(return_value=True)
+        mock_redis.ltrim = Mock(return_value=True)
+        mock_redis.exists = Mock(return_value=False)
 
-            with patch('backend.screener.service.get_trading_enabled', return_value=False):
-                with patch('backend.api.routes.trading.get_shadow_live_mode', return_value=False):
+        with patch('backend.screener.service.get_redis_client', return_value=mock_redis):
+            with patch('backend.redis.get_redis_client', return_value=mock_redis):
+                with patch('backend.screener.service.get_bot_mode', return_value='SHADOW'):
                     with patch(
                         'backend.screener.service.scan_with_strategy',
                         new_callable=AsyncMock,
@@ -131,11 +129,10 @@ class TestShadowModeExecutionGate:
                                         confidence_sell=70.0,
                                     )
 
-                            # Both off: _process_auto_execution is still called but with trading_enabled=False
-                            # (it logs and returns early inside _process_auto_execution)
-                            assert mock_process.call_count == 1
-                            call_args = mock_process.call_args
-                            assert call_args[0][1] is False  # trading_enabled passed as False
+                    # Unified bot mode: caller always passes trading_enabled=True to auto-exec
+                    assert mock_process.call_count == 1
+                    call_args = mock_process.call_args
+                    assert call_args[0][1] is True
 
 
 class TestScreenerGlobalFilters:
@@ -171,14 +168,14 @@ class TestScreenerGlobalFilters:
         strategy_id = "test-strategy-123"
         
         with patch('backend.redis.get_redis_client', return_value=mock_redis):
-            with patch('backend.api.routes.trading.get_shadow_live_mode', return_value=True):
-                with patch('backend.ingestor.config.get_enforce_whitelist_in_shadow', return_value=True):
-                    with patch('backend.ingestor.symbols.is_in_live_universe') as mock_is_whitelisted:
+            with patch('backend.screener.service.get_bot_mode', return_value='SHADOW'):
+                with patch('backend.screener.service.get_enforce_whitelist_in_shadow', return_value=True):
+                    with patch('backend.screener.service.is_in_live_universe') as mock_is_whitelisted:
                         # BTC/USD and ETH/USD are whitelisted, XPL/USD and ZRO/USD are not
                         mock_is_whitelisted.side_effect = lambda s: s in ["BTC/USD", "ETH/USD"]
                         
-                        with patch('backend.ingestor.symbols.get_symbol_volume', return_value=50000000.0):
-                            with patch('backend.ingestor.symbols.get_symbol_spread', return_value=10.0):
+                        with patch('backend.screener.service.get_symbol_volume', return_value=50000000.0):
+                            with patch('backend.screener.service.get_symbol_spread', return_value=10.0):
                                 with patch('backend.api.routes.events.log_activity') as mock_log_activity:
                                     filtered, skip_reasons = await screener_service._apply_global_filters(
                                         symbols, strategy_id
@@ -210,14 +207,14 @@ class TestScreenerGlobalFilters:
         strategy_id = "test-strategy-123"
         
         with patch('backend.redis.get_redis_client', return_value=mock_redis):
-            with patch('backend.api.routes.trading.get_shadow_live_mode', return_value=False):
-                with patch('backend.ingestor.config.get_enforce_whitelist_in_shadow', return_value=True):
-                    with patch('backend.ingestor.symbols.is_in_live_universe') as mock_is_whitelisted:
+            with patch('backend.screener.service.get_bot_mode', return_value='LIVE'):
+                with patch('backend.screener.service.get_enforce_whitelist_in_shadow', return_value=True):
+                    with patch('backend.screener.service.is_in_live_universe') as mock_is_whitelisted:
                         # Even if XPL/USD is not whitelisted, it should pass when not in shadow mode
                         mock_is_whitelisted.return_value = False
                         
-                        with patch('backend.ingestor.symbols.get_symbol_volume', return_value=50000000.0):
-                            with patch('backend.ingestor.symbols.get_symbol_spread', return_value=10.0):
+                        with patch('backend.screener.service.get_symbol_volume', return_value=50000000.0):
+                            with patch('backend.screener.service.get_symbol_spread', return_value=10.0):
                                 with patch('backend.api.routes.events.log_activity') as mock_log_activity:
                                     filtered, skip_reasons = await screener_service._apply_global_filters(
                                         symbols, strategy_id
@@ -245,19 +242,19 @@ class TestScreenerGlobalFilters:
         strategy_id = "test-strategy-123"
         
         with patch('backend.redis.get_redis_client', return_value=mock_redis):
-            with patch('backend.api.routes.trading.get_shadow_live_mode', return_value=False):
-                with patch('backend.ingestor.config.get_min_24h_volume_usd', return_value=10000000.0):
-                    with patch('backend.ingestor.symbols.is_in_live_universe', return_value=True):
-                        with patch('backend.ingestor.symbols.get_symbol_volume') as mock_get_volume:
+            with patch('backend.screener.service.get_bot_mode', return_value='LIVE'):
+                with patch('backend.screener.service.get_min_24h_volume_usd', return_value=10000000.0):
+                    with patch('backend.screener.service.is_in_live_universe', return_value=True):
+                        with patch('backend.screener.service.get_symbol_volume') as mock_get_volume:
                             # BTC/USD and ETH/USD have high volume, LOWVOL/USD has low volume
                             def volume_side_effect(symbol):
                                 if symbol == "LOWVOL/USD":
-                                    return 5000000.0  # Below $10M threshold
+                                    return 50_000.0  # Below $100K hard floor in _apply_global_filters
                                 return 50000000.0  # Above threshold
                             
                             mock_get_volume.side_effect = volume_side_effect
                             
-                            with patch('backend.ingestor.symbols.get_symbol_spread', return_value=10.0):
+                            with patch('backend.screener.service.get_symbol_spread', return_value=10.0):
                                 with patch('backend.api.routes.events.log_activity') as mock_log_activity:
                                     filtered, skip_reasons = await screener_service._apply_global_filters(
                                         symbols, strategy_id
@@ -286,10 +283,10 @@ class TestScreenerGlobalFilters:
         strategy_id = "test-strategy-123"
         
         with patch('backend.redis.get_redis_client', return_value=mock_redis):
-            with patch('backend.api.routes.trading.get_shadow_live_mode', return_value=False):
-                with patch('backend.ingestor.config.get_min_24h_volume_usd', return_value=10000000.0):
-                    with patch('backend.ingestor.symbols.is_in_live_universe', return_value=True):
-                        with patch('backend.ingestor.symbols.get_symbol_volume') as mock_get_volume:
+            with patch('backend.screener.service.get_bot_mode', return_value='LIVE'):
+                with patch('backend.screener.service.get_min_24h_volume_usd', return_value=10000000.0):
+                    with patch('backend.screener.service.is_in_live_universe', return_value=True):
+                        with patch('backend.screener.service.get_symbol_volume') as mock_get_volume:
                             # BTC/USD has volume data, NODATA/USD has None
                             def volume_side_effect(symbol):
                                 if symbol == "NODATA/USD":
@@ -298,7 +295,7 @@ class TestScreenerGlobalFilters:
                             
                             mock_get_volume.side_effect = volume_side_effect
                             
-                            with patch('backend.ingestor.symbols.get_symbol_spread', return_value=10.0):
+                            with patch('backend.screener.service.get_symbol_spread', return_value=10.0):
                                 with patch('backend.api.routes.events.log_activity') as mock_log_activity:
                                     filtered, skip_reasons = await screener_service._apply_global_filters(
                                         symbols, strategy_id
@@ -326,11 +323,11 @@ class TestScreenerGlobalFilters:
         strategy_id = "test-strategy-123"
         
         with patch('backend.redis.get_redis_client', return_value=mock_redis):
-            with patch('backend.api.routes.trading.get_shadow_live_mode', return_value=False):
-                with patch('backend.ingestor.config.get_max_spread_bps', return_value=15.0):
-                    with patch('backend.ingestor.symbols.is_in_live_universe', return_value=True):
-                        with patch('backend.ingestor.symbols.get_symbol_volume', return_value=50000000.0):
-                            with patch('backend.ingestor.symbols.get_symbol_spread') as mock_get_spread:
+            with patch('backend.screener.service.get_bot_mode', return_value='LIVE'):
+                with patch('backend.screener.service.get_max_spread_bps', return_value=15.0):
+                    with patch('backend.screener.service.is_in_live_universe', return_value=True):
+                        with patch('backend.screener.service.get_symbol_volume', return_value=50000000.0):
+                            with patch('backend.screener.service.get_symbol_spread') as mock_get_spread:
                                 # BTC/USD and ETH/USD have tight spread, WIDESPREAD/USD has wide spread
                                 def spread_side_effect(symbol):
                                     if symbol == "WIDESPREAD/USD":
@@ -367,11 +364,11 @@ class TestScreenerGlobalFilters:
         strategy_id = "test-strategy-123"
         
         with patch('backend.redis.get_redis_client', return_value=mock_redis):
-            with patch('backend.api.routes.trading.get_shadow_live_mode', return_value=False):
-                with patch('backend.ingestor.config.get_max_spread_bps', return_value=15.0):
-                    with patch('backend.ingestor.symbols.is_in_live_universe', return_value=True):
-                        with patch('backend.ingestor.symbols.get_symbol_volume', return_value=50000000.0):
-                            with patch('backend.ingestor.symbols.get_symbol_spread') as mock_get_spread:
+            with patch('backend.screener.service.get_bot_mode', return_value='LIVE'):
+                with patch('backend.screener.service.get_max_spread_bps', return_value=15.0):
+                    with patch('backend.screener.service.is_in_live_universe', return_value=True):
+                        with patch('backend.screener.service.get_symbol_volume', return_value=50000000.0):
+                            with patch('backend.screener.service.get_symbol_spread') as mock_get_spread:
                                 # BTC/USD has spread data, NODATA/USD has None
                                 def spread_side_effect(symbol):
                                     if symbol == "NODATA/USD":
@@ -413,23 +410,23 @@ class TestScreenerGlobalFilters:
         strategy_id = "test-strategy-123"
         
         with patch('backend.redis.get_redis_client', return_value=mock_redis):
-            with patch('backend.api.routes.trading.get_shadow_live_mode', return_value=True):
-                with patch('backend.ingestor.config.get_enforce_whitelist_in_shadow', return_value=True):
-                    with patch('backend.ingestor.config.get_min_24h_volume_usd', return_value=10000000.0):
-                        with patch('backend.ingestor.config.get_max_spread_bps', return_value=15.0):
-                            with patch('backend.ingestor.symbols.is_in_live_universe') as mock_is_whitelisted:
+            with patch('backend.screener.service.get_bot_mode', return_value='SHADOW'):
+                with patch('backend.screener.service.get_enforce_whitelist_in_shadow', return_value=True):
+                    with patch('backend.screener.service.get_min_24h_volume_usd', return_value=10000000.0):
+                        with patch('backend.screener.service.get_max_spread_bps', return_value=15.0):
+                            with patch('backend.screener.service.is_in_live_universe') as mock_is_whitelisted:
                                 # Only BTC/USD and ETH/USD are whitelisted
                                 mock_is_whitelisted.side_effect = lambda s: s in ["BTC/USD", "ETH/USD"]
                                 
-                                with patch('backend.ingestor.symbols.get_symbol_volume') as mock_get_volume:
+                                with patch('backend.screener.service.get_symbol_volume') as mock_get_volume:
                                     def volume_side_effect(symbol):
                                         if symbol == "LOWVOL/USD":
-                                            return 5000000.0  # Below threshold
+                                            return 50_000.0  # Below $100K hard floor
                                         return 50000000.0  # Above threshold
                                     
                                     mock_get_volume.side_effect = volume_side_effect
                                     
-                                    with patch('backend.ingestor.symbols.get_symbol_spread') as mock_get_spread:
+                                    with patch('backend.screener.service.get_symbol_spread') as mock_get_spread:
                                         def spread_side_effect(symbol):
                                             if symbol == "WIDESPREAD/USD":
                                                 return 25.0  # Above threshold
@@ -467,81 +464,64 @@ class TestScreenerGlobalFilters:
     async def test_filter_respects_env_var_overrides(
         self, screener_service, mock_redis
     ):
-        """Test that filters respect environment variable overrides."""
+        """Hard floor uses $100K 24h volume in _apply_global_filters (not get_min_24h_volume_usd)."""
         symbols = ["BTC/USD", "CUSTOMVOL/USD"]
         strategy_id = "test-strategy-123"
         
         with patch('backend.redis.get_redis_client', return_value=mock_redis):
-            with patch('backend.api.routes.trading.get_shadow_live_mode', return_value=False):
-                # Test custom volume threshold
-                with patch('backend.ingestor.config.get_min_24h_volume_usd', return_value=50000000.0):
-                    with patch('backend.ingestor.symbols.is_in_live_universe', return_value=True):
-                        with patch('backend.ingestor.symbols.get_symbol_volume') as mock_get_volume:
-                            # BTC/USD has $60M (above custom $50M threshold)
-                            # CUSTOMVOL/USD has $30M (below custom $50M threshold)
-                            def volume_side_effect(symbol):
-                                if symbol == "CUSTOMVOL/USD":
-                                    return 30000000.0
-                                return 60000000.0
-                            
-                            mock_get_volume.side_effect = volume_side_effect
-                            
-                            with patch('backend.ingestor.symbols.get_symbol_spread', return_value=10.0):
-                                with patch('backend.api.routes.events.log_activity'):
-                                    filtered, skip_reasons = await screener_service._apply_global_filters(
-                                        symbols, strategy_id
-                                    )
-                                    
-                                    # CUSTOMVOL/USD should be filtered out with custom threshold
-                                    assert len(filtered) == 1
-                                    assert "BTC/USD" in filtered
-                                    assert "CUSTOMVOL/USD" not in filtered
-                                    assert len(skip_reasons) == 1
-                                    assert "CUSTOMVOL/USD" in skip_reasons
+            with patch('backend.screener.service.get_bot_mode', return_value='LIVE'):
+                with patch('backend.screener.service.is_in_live_universe', return_value=True):
+                    with patch('backend.screener.service.get_symbol_volume') as mock_get_volume:
+                        def volume_side_effect(symbol):
+                            if symbol == "CUSTOMVOL/USD":
+                                return 99_000.0  # Below $100K hard floor
+                            return 600_000.0
+
+                        mock_get_volume.side_effect = volume_side_effect
+
+                        with patch('backend.screener.service.get_symbol_spread', return_value=10.0):
+                            with patch('backend.api.routes.events.log_activity'):
+                                filtered, skip_reasons = await screener_service._apply_global_filters(
+                                    symbols, strategy_id
+                                )
+
+                                assert len(filtered) == 1
+                                assert "BTC/USD" in filtered
+                                assert "CUSTOMVOL/USD" not in filtered
+                                assert len(skip_reasons) == 1
+                                assert "CUSTOMVOL/USD" in skip_reasons
     
     @pytest.mark.asyncio
     async def test_filter_logs_summary_message(
         self, screener_service, mock_redis
     ):
         """Test that filter summary is logged correctly."""
-        import logging
-        
         symbols = ["BTC/USD", "SKIP1/USD", "SKIP2/USD"]
         strategy_id = "test-strategy-123"
         
         with patch('backend.redis.get_redis_client', return_value=mock_redis):
-            with patch('backend.api.routes.trading.get_shadow_live_mode', return_value=False):
-                with patch('backend.ingestor.config.get_min_24h_volume_usd', return_value=10000000.0):
-                    with patch('backend.ingestor.symbols.is_in_live_universe', return_value=True):
-                        with patch('backend.ingestor.symbols.get_symbol_volume') as mock_get_volume:
-                            def volume_side_effect(symbol):
-                                if symbol in ["SKIP1/USD", "SKIP2/USD"]:
-                                    return 5000000.0  # Below threshold
-                                return 50000000.0
-                            
-                            mock_get_volume.side_effect = volume_side_effect
-                            
-                            with patch('backend.ingestor.symbols.get_symbol_spread', return_value=10.0):
-                                with patch('backend.api.routes.events.log_activity'):
-                                    # Capture logger.info calls
-                                    with patch('backend.screener.service.logger') as mock_logger:
-                                        filtered, skip_reasons = await screener_service._apply_global_filters(
-                                            symbols, strategy_id
-                                        )
-                                        
-                                        # Verify summary log was called
-                                        info_calls = [str(call) for call in mock_logger.info.call_args_list]
-                                        
-                                        # Should have summary log
-                                        summary_logs = [
-                                            call for call in info_calls
-                                            if f"Strategy {strategy_id}" in str(call) and "Filtered" in str(call)
-                                        ]
-                                        assert len(summary_logs) > 0
-                                        
-                                        # Should have breakdown log (since symbols were skipped)
-                                        breakdown_logs = [
-                                            call for call in info_calls
-                                            if "Skip breakdown" in str(call)
-                                        ]
-                                        assert len(breakdown_logs) > 0
+            with patch('backend.screener.service.get_bot_mode', return_value='LIVE'):
+                with patch('backend.screener.service.is_in_live_universe', return_value=True):
+                    with patch('backend.screener.service.get_symbol_volume') as mock_get_volume:
+                        def volume_side_effect(symbol):
+                            if symbol in ["SKIP1/USD", "SKIP2/USD"]:
+                                return 50_000.0  # Below $100K hard floor
+                            return 50000000.0
+
+                        mock_get_volume.side_effect = volume_side_effect
+
+                        with patch('backend.screener.service.get_symbol_spread', return_value=10.0):
+                            with patch('backend.api.routes.events.log_activity'):
+                                with patch('backend.screener.service.logger') as mock_logger:
+                                    await screener_service._apply_global_filters(
+                                        symbols, strategy_id
+                                    )
+
+                                    info_calls = [str(call) for call in mock_logger.info.call_args_list]
+                                    summary_logs = [
+                                        call for call in info_calls
+                                        if f"Strategy {strategy_id}" in str(call)
+                                        and "→" in str(call)
+                                        and "skipped:" in str(call)
+                                    ]
+                                    assert len(summary_logs) > 0

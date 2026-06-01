@@ -39,7 +39,8 @@ LIMIT_ORDER_OFFSET_PCT: float = float(os.getenv("LIMIT_ORDER_OFFSET_PCT", "0.02"
 OPPORTUNITY_FILTER_HOURS: float = float(os.getenv("OPPORTUNITY_FILTER_HOURS", "48.0"))
 
 # Breakeven Guard Configuration
-BREAKEVEN_GUARD_TRIGGER_PCT: float = float(os.getenv("BREAKEVEN_GUARD_TRIGGER_PCT", "1.0"))  # Ross Cameron spec: +1.0% trigger
+BREAKEVEN_GUARD_TRIGGER_PCT: float = float(os.getenv("BREAKEVEN_GUARD_TRIGGER_PCT", "1.0"))  # Legacy: +1.0% trigger when BREAKEVEN_REQUIRES_TP1=false
+BREAKEVEN_REQUIRES_TP1: bool = os.getenv("BREAKEVEN_REQUIRES_TP1", "true").lower() == "true"
 KRAKEN_FEE_PCT: float = float(os.getenv("KRAKEN_FEE_PCT", "0.26"))
 
 # Minimum Hold Duration Configuration (TICKET-614)

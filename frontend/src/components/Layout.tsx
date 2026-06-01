@@ -1,16 +1,37 @@
 import { ReactNode } from 'react';
 import { Header } from './Header';
 import { useSystemStatus } from '../hooks/useSystemStatus';
-import { useShadowLive } from '../hooks/useShadowLive';
-import { useTrading } from '../hooks/useTrading';
+import { useShadowLive, ShadowLiveState } from '../hooks/useShadowLive';
+import { useTrading, TradingState } from '../hooks/useTrading';
 
 interface LayoutProps {
   children: ReactNode;
 }
 
-function ShadowModeBanner() {
-  const { shadowLive } = useShadowLive();
-  const { trading } = useTrading();
+interface BannerProps {
+  trading: TradingState | null;
+  shadowLive: ShadowLiveState | null;
+}
+
+function TradingOffBanner({ trading, shadowLive }: BannerProps) {
+  
+  const isOff = !trading?.enabled && !shadowLive?.enabled;
+  
+  if (!isOff) return null;
+  
+  return (
+    <div className="w-full bg-amber-900/80 border-b-2 border-amber-600 px-4 py-2">
+      <div className="flex items-center gap-3">
+        <span className="font-bold text-amber-200 text-sm">⚠️ TRADING OFF</span>
+        <span className="text-amber-300 text-xs">
+          — BUY signals will not open positions — Enable Shadow mode to simulate trades
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function ShadowModeBanner({ trading, shadowLive }: BannerProps) {
   
   const isShadowMode = shadowLive?.enabled && !trading?.enabled;
   
@@ -31,9 +52,7 @@ function ShadowModeBanner() {
   );
 }
 
-function LiveModeBanner() {
-  const { shadowLive } = useShadowLive();
-  const { trading } = useTrading();
+function LiveModeBanner({ trading, shadowLive }: BannerProps) {
   
   const isLiveMode = trading?.enabled && !shadowLive?.enabled;
   
@@ -56,6 +75,8 @@ function LiveModeBanner() {
 
 export function Layout({ children }: LayoutProps) {
   const { status, loading, error } = useSystemStatus();
+  const { trading } = useTrading();
+  const { shadowLive } = useShadowLive();
 
   return (
     <div className="h-screen bg-gray-900 text-white flex flex-col overflow-hidden">
@@ -64,8 +85,9 @@ export function Layout({ children }: LayoutProps) {
         loading={loading}
         error={error}
       />
-      <ShadowModeBanner />
-      <LiveModeBanner />
+      <TradingOffBanner trading={trading} shadowLive={shadowLive} />
+      <ShadowModeBanner trading={trading} shadowLive={shadowLive} />
+      <LiveModeBanner trading={trading} shadowLive={shadowLive} />
       <main className="p-3 flex-1 min-h-0 overflow-hidden">{children}</main>
     </div>
   );

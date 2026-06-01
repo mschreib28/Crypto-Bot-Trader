@@ -1,6 +1,7 @@
 import os
 import logging
 import time
+import json
 from dataclasses import dataclass
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
@@ -35,13 +36,12 @@ class AccountTracker:
     def __init__(self, initial_equity: float = None, kraken_client=None):
         """
         Initialize AccountTracker.
-        
+
         Args:
-            initial_equity: Override equity (for testing). If provided, uses static 
+            initial_equity: Override equity (for testing). If provided, uses static
                           equity tracking without Kraken API calls.
-            kraken_client: Optional KrakenClient instance (lazy-loaded if None).
+            kraken_client: Ignored (kept for API compatibility). CLI is used instead.
         """
-        self._kraken = kraken_client
         self._cached_balance: Optional[Dict[str, Any]] = None
         self._cache_time: Optional[float] = None
         
@@ -54,21 +54,92 @@ class AccountTracker:
         self.daily_pnl = 0.0
         self._risk_pct = float(os.getenv("RISK_PCT_PER_TRADE", "2.0")) / 100.0
 
-    def _get_kraken_client(self):
-        """Lazy-load KrakenClient to avoid circular imports."""
-        if self._kraken is None:
-            from backend.execution.kraken_rest import KrakenClient
-            self._kraken = KrakenClient()
-        return self._kraken
+    def _fetch_live_balance_dict(self) -> dict:
+        """Fetch balance dict using the Kraken CLI sync helper.
+
+        Only counts USD/ZUSD holdings toward total_usd for simplicity
+        (crypto holdings are excluded from the live equity calculation here;
+        use the /api/v1/account/balance endpoint for full portfolio value).
+        """
+        from backend.execution.kraken_cli import get_balance_sync, _normalize_kraken_asset, _USD_ASSETS
+        raw = get_balance_sync()
+        holdings = []
+        total_usd = 0.0
+        for asset, bal_str in raw.items():
+            try:
+                quantity = float(bal_str)
+            except (TypeError, ValueError):
+                continue
+            if quantity <= 0:
+                continue
+            symbol = _normalize_kraken_asset(asset)
+            if asset in _USD_ASSETS or symbol == "USD":
+                value_usd = quantity
+                total_usd += value_usd
+                holdings.append({
+                    "symbol": symbol,
+                    "quantity": round(quantity, 8),
+                    "value_usd": round(value_usd, 2),
+                })
+        return {
+            "total_usd": round(total_usd, 2),
+            "available_usd": round(total_usd, 2),
+            "holdings": holdings,
+        }
+
+    def _get_shadow_balance(self) -> Optional[Dict[str, Any]]:
+        """
+        Get shadow balance from Redis.
+        
+        Returns:
+            Shadow balance dict with total_usd, available_usd, holdings, or None if not found.
+        """
+        try:
+            from backend.redis import get_redis_client
+            from backend.redis.keys import SHADOW_BALANCE_KEY
+            
+            redis_client = get_redis_client()
+            shadow_balance_json = redis_client.get(SHADOW_BALANCE_KEY)
+            
+            if shadow_balance_json:
+                return json.loads(shadow_balance_json)
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to get shadow balance: {e}")
+            return None
 
     def _get_cached_balance(self) -> Dict[str, Any]:
         """
         Get balance from cache or fetch from Kraken.
         
+        In shadow mode: returns shadow balance from Redis.
+        In live mode: fetches from Kraken API with caching.
+        
         Returns:
             Balance dict with total_usd, available_usd, holdings.
             Falls back to last known balance or zeros if API fails.
         """
+        # Check shadow mode first
+        try:
+            from backend.api.routes.trading import get_shadow_live_mode
+            if get_shadow_live_mode():
+                # Shadow mode: use shadow balance from Redis
+                shadow_balance = self._get_shadow_balance()
+                if shadow_balance:
+                    logger.debug(f"Using shadow balance: total=${shadow_balance.get('total_usd', 0)}")
+                    return shadow_balance
+                else:
+                    # Shadow balance not set, return default
+                    logger.info("Shadow mode enabled but no balance set, returning default $1000")
+                    return {
+                        "total_usd": 1000.0,
+                        "available_usd": 1000.0,
+                        "holdings": [{"symbol": "USD", "quantity": 1000.0, "value_usd": 1000.0}]
+                    }
+        except Exception as e:
+            logger.warning(f"Failed to check shadow mode: {e}, falling back to Kraken API")
+        
+        # Live mode: fetch from Kraken API
         now = time.time()
         
         # Check if cache is still valid
@@ -79,24 +150,23 @@ class AccountTracker:
         ):
             return self._cached_balance
         
-        # Fetch fresh balance from Kraken
+        # Fetch fresh balance from Kraken CLI
         try:
-            client = self._get_kraken_client()
-            balance = client.get_account_balance()
-            
+            balance = self._fetch_live_balance_dict()
+
             # Update cache
             self._cached_balance = balance
             self._cache_time = now
-            
+
             logger.info(
-                f"Balance fetched from Kraken: total=${balance['total_usd']}, "
+                f"Balance fetched via CLI: total=${balance['total_usd']}, "
                 f"available=${balance['available_usd']} (cached for {BALANCE_CACHE_TTL}s)"
             )
-            
+
             return balance
-            
+
         except Exception as e:
-            logger.error(f"Failed to fetch balance from Kraken: {e}")
+            logger.error(f"Failed to fetch balance from Kraken CLI: {e}")
             
             # Fallback to last known balance
             if self._cached_balance is not None:
@@ -127,9 +197,37 @@ class AccountTracker:
 
     @property
     def initial_equity(self) -> float:
-        """Get initial equity (first balance fetch or fallback)."""
+        """
+        Get initial equity (first balance fetch or fallback).
+        
+        In shadow mode: returns stored initial shadow equity from Redis.
+        In live mode: returns fallback equity from env var.
+        """
         if self._use_static_equity:
             return self._static_equity
+        
+        # Check shadow mode for initial equity
+        try:
+            from backend.api.routes.trading import get_shadow_live_mode
+            if get_shadow_live_mode():
+                from backend.redis import get_redis_client
+                from backend.redis.keys import SHADOW_INITIAL_EQUITY_KEY
+                
+                redis_client = get_redis_client()
+                initial_equity_str = redis_client.get(SHADOW_INITIAL_EQUITY_KEY)
+                
+                if initial_equity_str:
+                    return float(initial_equity_str)
+                else:
+                    # Initial equity not stored yet, use current shadow balance as initial (first-time setup)
+                    shadow_balance = self._get_shadow_balance()
+                    if shadow_balance:
+                        initial_equity = shadow_balance.get("total_usd", 0.0)
+                        logger.info(f"Using current shadow balance as initial equity: ${initial_equity}")
+                        return initial_equity
+        except Exception as e:
+            logger.warning(f"Failed to get shadow initial equity: {e}, using fallback")
+        
         return self._fallback_equity
 
     @property

@@ -1,8 +1,7 @@
+import { useCallback, useState } from 'react';
 import { PanicButton } from './PanicButton';
-import { useTrading } from '../hooks/useTrading';
-import { useShadowLive } from '../hooks/useShadowLive';
+import { useBotMode } from '../hooks/useBotMode';
 import { useAccount } from '../hooks/useAccount';
-
 
 interface StatusIndicatorProps {
   halted: boolean | null;
@@ -46,55 +45,6 @@ function StatusIndicator({ halted, loading, error }: StatusIndicatorProps) {
   );
 }
 
-interface ToggleButtonProps {
-  enabled: boolean;
-  loading: boolean;
-  onToggle: () => void;
-  enabledText: string;
-  disabledText: string;
-  enabledColor: string;
-  disabledColor: string;
-  ariaLabel: string;
-  title: string;
-}
-
-function ToggleButton({
-  enabled,
-  loading,
-  onToggle,
-  enabledText,
-  disabledText,
-  enabledColor,
-  disabledColor,
-  ariaLabel,
-  title,
-}: ToggleButtonProps) {
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      disabled={loading}
-      className={`
-        relative inline-flex items-center h-8 px-3 rounded-full
-        transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900
-        ${enabled ? enabledColor : disabledColor}
-        ${loading ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}
-      `}
-      aria-pressed={enabled}
-      aria-label={ariaLabel}
-      title={title}
-    >
-      {loading ? (
-        <span className="text-white text-xs font-medium">...</span>
-      ) : (
-        <span className="text-white text-xs font-semibold">
-          {enabled ? enabledText : disabledText}
-        </span>
-      )}
-    </button>
-  );
-}
-
 interface HeaderProps {
   halted: boolean | null;
   loading: boolean;
@@ -103,7 +53,7 @@ interface HeaderProps {
 
 function MicroModeBanner({ active, message }: { active: boolean; message: string | null }) {
   if (!active || !message) return null;
-  
+
   return (
     <div className="bg-yellow-900/50 border border-yellow-700 rounded px-3 py-1.5 text-xs text-yellow-200">
       <div className="flex items-center gap-2">
@@ -115,83 +65,96 @@ function MicroModeBanner({ active, message }: { active: boolean; message: string
 }
 
 export function Header({ halted, loading, error }: HeaderProps) {
-  const { trading, loading: tradingLoading, toggleTrading, refetch } = useTrading();
-  const { shadowLive, loading: shadowLiveLoading, toggleShadowLive } = useShadowLive();
+  const { botMode, loading: modeLoading, error: modeError, setMode, refetch } = useBotMode();
   const { account } = useAccount();
   const microMode = account?.micro_mode;
+  const [pending, setPending] = useState(false);
 
-  // Determine if we're in Live or Shadow mode
-  const isLiveMode = trading?.enabled && !shadowLive?.enabled;
-  const isShadowMode = shadowLive?.enabled && !trading?.enabled;
-  const isOff = !trading?.enabled && !shadowLive?.enabled;
+  const mode = botMode?.mode ?? 'SHADOW';
 
-  const handleLiveShadowToggle = async () => {
-    if (isOff) {
-      // If both are off, enable shadow mode
-      await toggleShadowLive();
-    } else if (isShadowMode) {
-      // Switch from Shadow to Live
-      await toggleShadowLive();
-      await toggleTrading();
-    } else if (isLiveMode) {
-      // Switch from Live to Shadow
-      await toggleTrading();
-      await toggleShadowLive();
+  const selectShadow = useCallback(async () => {
+    if (mode === 'SHADOW') return;
+    setPending(true);
+    try {
+      await setMode('SHADOW');
+    } finally {
+      setPending(false);
     }
-    setTimeout(() => {
-      refetch();
-    }, 500);
-  };
+  }, [mode, setMode]);
+
+  const selectLive = useCallback(async () => {
+    if (mode === 'LIVE') return;
+    const ok = window.confirm(
+      'Switch to LIVE mode? The bot will place real orders on Kraken with real funds.'
+    );
+    if (!ok) return;
+    setPending(true);
+    try {
+      await setMode('LIVE', 'ENABLE_LIVE_TRADING');
+    } finally {
+      setPending(false);
+    }
+  }, [mode, setMode]);
+
+  const busy = modeLoading || pending;
 
   return (
     <header className="border-b border-gray-800 bg-gray-900 px-4 py-2">
       <div className="flex flex-col gap-2">
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-4">
             <h1 className="text-xl font-bold text-white">Omni-Bot</h1>
-            
-            {/* ON/OFF Button */}
-            <ToggleButton
-              enabled={(trading?.enabled ?? false) || (shadowLive?.enabled ?? false)}
-              loading={tradingLoading || shadowLiveLoading}
-              onToggle={async () => {
-                if (trading?.enabled) {
-                  await toggleTrading();
-                }
-                if (shadowLive?.enabled) {
-                  await toggleShadowLive();
-                }
-                setTimeout(() => refetch(), 500);
-              }}
-              enabledText="ON"
-              disabledText="OFF"
-              enabledColor="bg-green-600 focus:ring-green-500"
-              disabledColor="bg-gray-600 focus:ring-gray-500"
-              ariaLabel={`Trading ${(trading?.enabled ?? false) || (shadowLive?.enabled ?? false) ? 'enabled' : 'disabled'}. Click to toggle.`}
-              title={(trading?.enabled ?? false) || (shadowLive?.enabled ?? false) ? 'Trading enabled. Click to disable.' : 'Trading disabled. Click to enable.'}
-            />
 
-            {/* Live/Shadow Button */}
-            <ToggleButton
-              enabled={isLiveMode ?? false}
-              loading={tradingLoading || shadowLiveLoading}
-              onToggle={handleLiveShadowToggle}
-              enabledText="LIVE"
-              disabledText="SHADOW"
-              enabledColor="bg-red-600 focus:ring-red-500"
-              disabledColor="bg-blue-600 focus:ring-blue-500"
-              ariaLabel={`Mode: ${isLiveMode ? 'Live' : isShadowMode ? 'Shadow' : 'Off'}. Click to toggle.`}
-              title={
-                isLiveMode
-                  ? 'Live Trading mode: Executes real orders on exchange. Click to switch to Shadow mode.'
-                  : isShadowMode
-                  ? 'Shadow mode: Logs ORDER_INTENT, STOP_INTENT, TAKE_PROFIT_INTENT without executing orders. Click to switch to Live Trading.'
-                  : 'Trading disabled. Click ON/OFF first, then toggle between Live/Shadow.'
-              }
-            />
+            <div className="flex flex-col gap-1">
+              <span className="text-xs font-medium uppercase tracking-wide text-gray-400">
+                Bot mode
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={selectShadow}
+                  className={`
+                    rounded-lg px-4 py-2 text-sm font-semibold transition-colors
+                    focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900
+                    ${
+                      mode === 'SHADOW'
+                        ? 'bg-slate-600 text-white ring-2 ring-blue-400'
+                        : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                    }
+                    ${busy ? 'opacity-50 cursor-not-allowed' : ''}
+                  `}
+                  aria-pressed={mode === 'SHADOW'}
+                >
+                  SHADOW
+                </button>
+                <span className="text-gray-500 text-xs">|</span>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={selectLive}
+                  className={`
+                    rounded-lg px-4 py-2 text-sm font-semibold transition-colors
+                    focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900
+                    ${
+                      mode === 'LIVE'
+                        ? 'bg-red-700 text-white ring-2 ring-red-400'
+                        : 'bg-slate-800 text-slate-300 hover:bg-red-900/40'
+                    }
+                    ${busy ? 'opacity-50 cursor-not-allowed' : ''}
+                  `}
+                  aria-pressed={mode === 'LIVE'}
+                >
+                  LIVE
+                </button>
+              </div>
+              {modeError && (
+                <span className="text-xs text-yellow-400 max-w-md">{modeError}</span>
+              )}
+            </div>
           </div>
           <div className="flex items-center gap-4">
-            <PanicButton onSuccess={refetch} />
+            <PanicButton onSuccess={() => void refetch()} />
             <StatusIndicator halted={halted} loading={loading} error={error} />
           </div>
         </div>

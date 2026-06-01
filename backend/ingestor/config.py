@@ -32,8 +32,12 @@ UNIVERSE_DROP_THRESHOLD_RANK = 30  # Must fall below rank 30 to be considered fo
 UNIVERSE_DROP_CONFIRMATIONS = 2    # Must be below rank 30 for 2 consecutive refreshes
 
 # Immediate drop conditions (hard failures - no confirmation needed)
-MIN_24H_VOLUME_USD = 100000.0  # Minimum 24h volume in USD (below this = immediate drop)
+# Default: $10M minimum (configurable via MIN_24H_VOLUME_USD env var)
+MIN_24H_VOLUME_USD = 10000000.0  # Minimum 24h volume in USD (below this = immediate drop)
 VOLUME_COLLAPSE_THRESHOLD = 0.1  # If volume drops below 10% of previous, immediate drop
+
+# Spread filtering threshold
+MAX_SPREAD_BPS = 15.0  # Maximum allowed bid-ask spread in basis points (default: 15 bps = 0.15%)
 
 # Minimum RVOL threshold (%) - symbols below this excluded unless owned
 MIN_RVOL_THRESHOLD = 100
@@ -42,8 +46,8 @@ MIN_RVOL_THRESHOLD = 100
 RVOL_CANDIDATE_LIMIT = 50
 
 # Default intervals for screening
-# 5m for MACD/Mean Reversion, 1h for Trend Following
-DEFAULT_INTERVALS = ["5m", "1h"]
+# 5m for MACD/Mean Reversion, 15m for VWAP/Volatility strategies, 1h for HTF Trend
+DEFAULT_INTERVALS = ["5m", "15m", "1h"]
 
 # Symbols are fetched dynamically at startup (None means fetch from Kraken)
 SYMBOLS: Optional[List[str]] = None
@@ -99,6 +103,17 @@ def get_symbols() -> Optional[List[str]]:
         return None  # Signal to fetch dynamically from Kraken
     symbols = [s.strip() for s in symbols_str.split(",") if s.strip()]
     return symbols if symbols else None
+
+
+def get_pinned_symbols() -> List[str]:
+    """
+    Get symbols that must always be ingested regardless of RVOL ranking.
+
+    Reads from INGESTOR_PINNED_SYMBOLS (comma-separated). Used to guarantee
+    data for runner strategies that require specific symbols (e.g. BTC/USD for HTF Trend).
+    """
+    raw = os.getenv("INGESTOR_PINNED_SYMBOLS", "")
+    return [s.strip() for s in raw.split(",") if s.strip()]
 
 
 def get_intervals() -> List[str]:
@@ -231,9 +246,23 @@ def get_min_24h_volume_usd() -> float:
     Symbols below this volume are immediately dropped (hard failure).
     
     Returns:
-        Minimum volume in USD (default: 100000.0)
+        Minimum volume in USD (default: 10000000.0 = $10M)
     """
-    return float(os.getenv("INGESTOR_MIN_24H_VOLUME_USD", str(MIN_24H_VOLUME_USD)))
+    return float(os.getenv("MIN_24H_VOLUME_USD", str(MIN_24H_VOLUME_USD)))
+
+
+def get_max_spread_bps() -> float:
+    """
+    Get maximum allowed bid-ask spread in basis points.
+    
+    Symbols with spread above this threshold are excluded from strategy evaluation.
+    
+    Returns:
+        Maximum spread in basis points (default: 15.0 = 0.15%)
+    """
+    return float(os.getenv("MAX_SPREAD_BPS", str(MAX_SPREAD_BPS)))
+
+
 
 
 def get_volume_collapse_threshold() -> float:
@@ -246,3 +275,16 @@ def get_volume_collapse_threshold() -> float:
         Volume collapse threshold (default: 0.1 = 10%)
     """
     return float(os.getenv("INGESTOR_VOLUME_COLLAPSE_THRESHOLD", str(VOLUME_COLLAPSE_THRESHOLD)))
+
+
+def get_enforce_whitelist_in_shadow() -> bool:
+    """
+    Get whether to enforce whitelist filtering in shadow mode.
+    
+    When True, only symbols in the live universe are allowed in shadow mode.
+    When False, shadow mode allows any symbol that passes liquidity/spread filters.
+    
+    Returns:
+        True if whitelist should be enforced in shadow mode (default: True)
+    """
+    return os.getenv("ENFORCE_WHITELIST_IN_SHADOW", "true").lower() in ("true", "1", "yes")

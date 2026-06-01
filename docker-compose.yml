@@ -39,7 +39,7 @@ services:
   api:
     build:
       context: .
-      dockerfile: infra/Dockerfile.api
+      dockerfile: research/infra/Dockerfile.api
     container_name: omni-bot-api
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-omni_bot}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-omni_bot}}
@@ -59,6 +59,13 @@ services:
       RISK_PCT_PER_TRADE: ${RISK_PCT_PER_TRADE:-2.0}
       STOP_LOSS_PCT: ${STOP_LOSS_PCT:-5.0}
       DAILY_LOSS_LIMIT: ${DAILY_LOSS_LIMIT:-10.0}
+      # Kraken CLI binary path (mounted from host)
+      KRAKEN_BIN: /usr/local/bin/kraken
+    volumes:
+      # Kraken CLI binary (read-only from host)
+      - ${HOME}/.cargo/bin/kraken:/usr/local/bin/kraken:ro
+      # Paper trading state (shared with runner — runner writes, api reads)
+      - kraken_paper_state:/root/.config/kraken
     ports:
       - "${API_PORT:-8001}:8000"
     depends_on:
@@ -73,21 +80,26 @@ services:
   ingestor:
     build:
       context: .
-      dockerfile: infra/Dockerfile.ingestor
+      dockerfile: research/infra/Dockerfile.ingestor
     container_name: omni-bot-ingestor
     environment:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       REDIS_MAX_CONNECTIONS: ${REDIS_MAX_CONNECTIONS:-50}
       # Empty = auto-fetch top 50 USD pairs by 24h volume from Kraken
       INGESTOR_SYMBOLS: ${INGESTOR_SYMBOLS:-}
-      INGESTOR_INTERVALS: ${INGESTOR_INTERVALS:-5m,1h}
+      INGESTOR_INTERVALS: ${INGESTOR_INTERVALS:-5m,15m,1h,4h}
+      INGESTOR_PINNED_SYMBOLS: ${INGESTOR_PINNED_SYMBOLS:-BTC/USD}
       INGESTOR_HEALTH_FILE: ${INGESTOR_HEALTH_FILE:-/tmp/ingestor.health}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # Kraken API credentials for querying owned symbols
       KRAKEN_API_KEY: ${KRAKEN_API_KEY:-}
       KRAKEN_API_SECRET: ${KRAKEN_API_SECRET:-}
+      # Kraken CLI binary path (mounted from host)
+      KRAKEN_BIN: /usr/local/bin/kraken
     volumes:
       - ingestor_health:/tmp
+      # Kraken CLI binary (read-only from host)
+      - ${HOME}/.cargo/bin/kraken:/usr/local/bin/kraken:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -100,7 +112,7 @@ services:
     container_name: omni-bot-frontend
     volumes:
       - ./frontend/dist:/usr/share/nginx/html:ro
-      - ./infra/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./research/infra/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
       - "${FRONTEND_PORT:-3001}:80"
     depends_on:
@@ -112,9 +124,10 @@ services:
   runner:
     build:
       context: .
-      dockerfile: infra/Dockerfile.runner
+      dockerfile: research/infra/Dockerfile.runner
     container_name: omni-bot-runner
     environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-omni_bot}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-omni_bot}}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       REDIS_MAX_CONNECTIONS: ${REDIS_MAX_CONNECTIONS:-50}
       RUNNER_STRATEGY_ID: ${RUNNER_STRATEGY_ID:-mean_reversion}
@@ -131,8 +144,37 @@ services:
       # Account & Risk (2% rule) - for signal recommendations
       ACCOUNT_EQUITY: ${ACCOUNT_EQUITY:-41.67}
       RISK_PCT_PER_TRADE: ${RISK_PCT_PER_TRADE:-2.0}
+      # Kraken CLI binary path (mounted from host)
+      KRAKEN_BIN: /usr/local/bin/kraken
     volumes:
       - runner_health:/tmp
+      # Kraken CLI binary (read-only from host)
+      - ${HOME}/.cargo/bin/kraken:/usr/local/bin/kraken:ro
+      # Paper trading state (runner is the sole writer; api mounts read-only view)
+      - kraken_paper_state:/root/.config/kraken
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - omni-bot-network
+    restart: unless-stopped
+
+  supervisor:
+    build:
+      context: .
+      dockerfile: research/infra/Dockerfile.supervisor
+    container_name: omni-bot-supervisor
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SUPERVISOR_INTERVAL_SEC: ${SUPERVISOR_INTERVAL_SEC:-28800}
+      SUPERVISOR_BACKTEST_DAYS: ${SUPERVISOR_BACKTEST_DAYS:-30}
+      SUPERVISOR_BACKTEST_INTERVAL: ${SUPERVISOR_BACKTEST_INTERVAL:-1h}
+      SUPERVISOR_TIMEOUT_SEC: ${SUPERVISOR_TIMEOUT_SEC:-1200}
+      SUPERVISOR_GATE_ENABLED: ${SUPERVISOR_GATE_ENABLED:-1}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs/supervisor:/app/logs/supervisor
+      - supervisor_cache:/app/backtest_cache
     depends_on:
       redis:
         condition: service_healthy
@@ -148,6 +190,12 @@ volumes:
   ingestor_health:
     driver: local
   runner_health:
+    driver: local
+  # Shared paper trading state between runner (write) and api (read)
+  kraken_paper_state:
+    driver: local
+  # Backtest OHLCV cache shared across supervisor cycles (avoids re-fetching from Kraken)
+  supervisor_cache:
     driver: local
 
 networks:

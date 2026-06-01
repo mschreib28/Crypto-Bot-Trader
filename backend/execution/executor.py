@@ -12,9 +12,9 @@ Flow for execute_trade:
 5. Return Fill object
 """
 
+import asyncio
 import logging
 import os
-import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, TYPE_CHECKING
@@ -28,15 +28,8 @@ from backend.risk.two_percent import TwoPercentRule
 from backend.risk.account import AccountTracker
 from backend.risk.sizing import PositionSizer
 from backend.execution.models import Fill
-from backend.execution.nonce import get_next_nonce
-from backend.execution.order_manager import (
-    convert_intent_to_order_params,
-    execute_order,
-    calculate_slippage,
-    _convert_symbol_to_kraken_pair,
-)
-from backend.execution.kraken_interface import KrakenClientInterface, KrakenClientStub, KrakenOrderResponse
-from backend.execution.kraken_rest import KrakenClient as RealKrakenClient
+from backend.execution.order_manager import calculate_slippage
+from backend.execution import kraken_cli
 from backend.db import get_session
 from backend.db.models import Signal
 from backend.positions.tracker import get_position_tracker
@@ -44,87 +37,16 @@ from backend.api.routes.events import log_activity
 
 logger = logging.getLogger(__name__)
 
-# Global lock for order serialization (only one order at a time)
-_execution_lock = threading.Lock()
-
-# Global Kraken client instance (will be set when Ticket 11 is implemented)
-_kraken_client: Optional[KrakenClientInterface] = None
+# Async lock for order serialization (one live order at a time)
+_execution_lock: Optional[asyncio.Lock] = None
 
 
-class KrakenClientAdapter(KrakenClientInterface):
-    """
-    Adapter that wraps RealKrakenClient to implement KrakenClientInterface.
-    
-    Translates parameter names and return types between the interface
-    (used by order_manager) and the actual Kraken REST client.
-    """
-    
-    def __init__(self):
-        self._client = RealKrakenClient()
-    
-    def add_order(
-        self,
-        pair: str,
-        type: str,
-        ordertype: str,
-        volume: float,
-        **kwargs
-    ) -> KrakenOrderResponse:
-        """
-        Place an order on Kraken.
-        
-        Translates interface parameters to KrakenClient parameters:
-        - pair -> symbol (with format conversion)
-        - type -> side
-        - ordertype -> order_type
-        """
-        # Convert Kraken pair format back to standard format
-        # XBTUSD -> BTC/USD, ETHUSD -> ETH/USD
-        symbol = self._convert_pair_to_symbol(pair)
-        
-        # Call the real client with translated params
-        result = self._client.add_order(
-            symbol=symbol,
-            side=type,  # "buy" or "sell"
-            order_type=ordertype,  # "market", "limit"
-            volume=float(volume),
-            **kwargs
-        )
-        
-        # Convert dict response to KrakenOrderResponse
-        error = result.get("error", [])
-        txid_list = result.get("result", {}).get("txid", [])
-        txid = txid_list[0] if txid_list else ""
-        descr = result.get("result", {}).get("descr", {})
-        
-        return KrakenOrderResponse(
-            txid=txid,
-            descr=descr,
-            error=error if error else None,
-        )
-    
-    def cancel_order(self, txid: str) -> Dict[str, Any]:
-        """Cancel an order on Kraken."""
-        return self._client.cancel_order(txid)
-    
-    def query_orders(self, txid: Optional[str] = None) -> Dict[str, Any]:
-        """Query order status from Kraken."""
-        result = self._client.query_orders(txid=txid)
-        return result.get("result", {})
-    
-    def _convert_pair_to_symbol(self, pair: str) -> str:
-        """Convert Kraken pair format to standard symbol format."""
-        # XBTUSD -> BTC/USD
-        if pair.startswith("XBT"):
-            pair = pair.replace("XBT", "BTC", 1)
-        
-        # Insert slash: ETHUSD -> ETH/USD
-        if len(pair) >= 6 and "/" not in pair:
-            base = pair[:-3]
-            quote = pair[-3:]
-            return f"{base}/{quote}"
-        
-        return pair
+def _get_execution_lock() -> asyncio.Lock:
+    """Lazily create the asyncio.Lock (must be inside the running event loop)."""
+    global _execution_lock
+    if _execution_lock is None:
+        _execution_lock = asyncio.Lock()
+    return _execution_lock
 
 
 # 2% rule position sizing components (Ticket 35)
@@ -157,38 +79,11 @@ def _get_position_sizer() -> PositionSizer:
     return _position_sizer
 
 
-def set_kraken_client(client: KrakenClientInterface) -> None:
-    """
-    Set the Kraken client instance.
-    
-    This should be called by Ticket 11 implementation to register the client.
-    
-    Args:
-        client: Kraken REST API client instance
-    """
-    global _kraken_client
-    _kraken_client = client
-    logger.info("Kraken client registered")
-
-
-def get_kraken_client() -> KrakenClientInterface:
-    """
-    Get the Kraken client instance.
-    
-    Returns:
-        Kraken client instance (adapter wrapping the real KrakenClient)
-    """
-    global _kraken_client
-    if _kraken_client is None:
-        # Auto-initialize with adapter wrapping the real Kraken client
-        _kraken_client = KrakenClientAdapter()
-        logger.info("Kraken client initialized with KrakenClientAdapter")
-    return _kraken_client
-
 
 async def execute_trade(
     intent: "TradeIntent",
     current_price: float,
+    live: bool = False,
 ) -> Optional[Fill]:
     """
     Execute trade with 2% rule position sizing.
@@ -205,19 +100,66 @@ async def execute_trade(
     Args:
         intent: TradeIntent from strategy signal
         current_price: Current market price for the symbol
+        live: True = real Kraken orders; False = paper/shadow execution path
         
     Returns:
         Fill object if trade executed, None if rejected
     """
+    # SECURITY: live=True only when canonical bot mode is LIVE (defense in depth).
+    try:
+        from backend.api.routes.trading import get_bot_mode
+
+        if live and get_bot_mode() != "LIVE":
+            logger.warning(
+                f"execute_trade(..., live=True) for {intent.symbol} but bot mode is not LIVE — aborting."
+            )
+            return None
+    except Exception as _gate_err:
+        logger.error(
+            f"execute_trade() cannot verify bot mode gate: {_gate_err}. "
+            f"Aborting trade for {intent.symbol} (fail-safe)."
+        )
+        return None
+
+    use_paper = not live
+    metadata = intent.metadata or {}
+    strategy_canonical = metadata.get("strategy_canonical")
+
     # Get risk components
     two_percent_rule = _get_two_percent_rule()
     account_tracker = _get_account_tracker()
     position_sizer = _get_position_sizer()
-    
+
     # 1. Get account equity
     equity = account_tracker.current_equity
     risk_pct = float(os.getenv("RISK_PCT_PER_TRADE", "2.0"))
     stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", "5.0"))
+
+    # TICKET-708 / Task 3: paper sizing uses global shadow balance or per-strategy SIM balance
+    shadow_equity = equity  # Default to account equity
+    if use_paper:
+        try:
+            if strategy_canonical:
+                from backend.supervisor.store import ensure_strategy_sim_balance
+
+                bal = ensure_strategy_sim_balance(strategy_canonical)
+                shadow_equity = float(bal.get("total_usd", 500.0))
+            else:
+                from backend.redis import get_redis_client
+                from backend.redis.keys import SHADOW_BALANCE_KEY
+                import json
+
+                redis_client = get_redis_client()
+                shadow_balance_json = redis_client.get(SHADOW_BALANCE_KEY)
+
+                if shadow_balance_json:
+                    shadow_balance = json.loads(shadow_balance_json)
+                    shadow_equity = shadow_balance.get("total_usd", 31.80)
+                else:
+                    shadow_equity = 31.80
+        except Exception as e:
+            logger.warning(f"Failed to get paper sizing equity: {e}, using default")
+            shadow_equity = 31.80 if not strategy_canonical else 500.0
     
     # For SELL orders: use actual held quantity, not calculated size
     if intent.side == "sell":
@@ -243,19 +185,48 @@ async def execute_trade(
         if position.stop_loss_order_id:
             try:
                 logger.info(f"Cancelling stop-loss order {position.stop_loss_order_id} before SELL")
-                client = get_kraken_client()
-                client.cancel_order(position.stop_loss_order_id)
+                await kraken_cli.cancel_order(position.stop_loss_order_id)
                 logger.info(f"Stop-loss order cancelled: {position.stop_loss_order_id}")
             except Exception as e:
                 logger.warning(f"Failed to cancel stop-loss order: {e} (may already be filled/cancelled)")
         
-        # Use actual held quantity for sell
+        # Use actual held quantity for sell (never recalculate from risk sizing)
+        from backend.positions.quantity import floor_qty_8dp, is_valid_position_quantity
+
         sell_quantity = position.quantity
+        if not is_valid_position_quantity(sell_quantity):
+            logger.error(
+                f"SELL rejected: invalid/dust position quantity "
+                f"({sell_quantity!r}) for {intent.symbol} — purging"
+            )
+            tracker.purge_corrupted_position(
+                intent.symbol, reason="invalid_quantity_before_sell"
+            )
+            return None
+
+        sell_quantity = floor_qty_8dp(sell_quantity)
         position_value_usd = sell_quantity * current_price
-        
+
+        # Validate sell sizing inputs before proceeding
+        if sell_quantity <= 0:
+            logger.error(
+                f"SELL rejected: position quantity is non-positive "
+                f"({sell_quantity}) for {intent.symbol}"
+            )
+            tracker.purge_corrupted_position(
+                intent.symbol, reason="zero_quantity_after_floor"
+            )
+            return None
+        if position_value_usd <= 0:
+            logger.error(
+                f"SELL rejected: computed position value is non-positive "
+                f"(qty={sell_quantity}, price={current_price}) for {intent.symbol}"
+            )
+            return None
+
         # Get stop_loss_price from position if available
         stop_loss_price = position.stop_loss_price if position.stop_loss_price else None
-        
+
         # Calculate stop_loss_pct from position's stop_loss_price if available
         if stop_loss_price and position.entry_price:
             if position.side == "long":
@@ -264,14 +235,14 @@ async def execute_trade(
                 stop_loss_pct_calc = ((stop_loss_price - position.entry_price) / position.entry_price) * 100.0
         else:
             stop_loss_pct_calc = 0.0  # Use 0.0 when no stop_loss_price available
-        
+
         max_risk_usd = position_value_usd * (stop_loss_pct_calc / 100.0) if stop_loss_pct_calc > 0 else 0.0
-        
+
         logger.info(
             f"SELL order: using actual position qty={sell_quantity} "
             f"for {intent.symbol} (value=${position_value_usd:.2f})"
         )
-        
+
         # Create a simple sizing object for sell (matching PositionSize structure)
         # Ensure all attributes match PositionSize dataclass structure
         class SellSizing:
@@ -282,6 +253,37 @@ async def execute_trade(
         sizing.max_risk_usd = max_risk_usd
         sizing.stop_loss_price = stop_loss_price  # None if not available
         sizing.stop_loss_pct = stop_loss_pct_calc  # 0.0 if no stop_loss_price
+        
+        # TICKET-706: For SELL orders in shadow mode, log ORDER_INTENT early
+        if use_paper:
+            metadata = intent.metadata or {}
+            bar_timestamp = metadata.get("bar_timestamp") or metadata.get("timestamp")
+            strategy_interval = metadata.get("timeframe") or metadata.get("interval") or "15m"
+            candle_tag = f"candle={bar_timestamp} tf={strategy_interval}" if bar_timestamp else ""
+            
+            log_activity(
+                activity_type="ORDER_INTENT",
+                message=f"Order intent: {intent.side.upper()} {sizing.quantity} {intent.symbol} @ ${current_price:.2f} {candle_tag}".strip(),
+                details={
+                    "symbol": intent.symbol,
+                    "side": intent.side,
+                    "quantity": sizing.quantity,
+                    "price": current_price,
+                    "position_size_usd": sizing.position_size_usd,
+                    "max_risk_usd": sizing.max_risk_usd,
+                    "stop_loss_price": sizing.stop_loss_price,
+                    "stop_loss_pct": sizing.stop_loss_pct,
+                    "strategy": intent.strategy_id,
+                    "equity": shadow_equity,
+                    "mode": "shadow_live",
+                    "bar_timestamp": bar_timestamp,
+                    "timeframe": strategy_interval,
+                },
+            )
+            logger.info(
+                f"[SHADOW-LIVE] ORDER_INTENT logged (SELL): {intent.side.upper()} {sizing.quantity} {intent.symbol} "
+                f"@ ${current_price:.2f}"
+            )
     else:
         # BUY orders: use equity-based 2% rule sizing or Scout sizing
         # Extract metadata first
@@ -332,120 +334,81 @@ async def execute_trade(
             )
         else:
             # 2. Calculate position size (with micro mode checks or Scout sizing)
-            sizing = position_sizer.calculate(
-                account_equity=equity,
-                risk_pct=risk_pct,
-                entry_price=current_price,
-                stop_loss_pct=stop_loss_pct,
-                strategy_id=intent.strategy_id,  # Pass strategy_id for adaptive sizing
-                atr=atr_value,  # Pass ATR for micro mode stop distance check
-                stop_loss_price=explicit_stop_loss_price,  # Use explicit stop if provided
-                use_scout_sizing=use_scout_sizing,  # Use Scout sizing if equity < $50
-            )
-        
-        # Micro mode may return None to skip trade
+            # TICKET-706, 708: In shadow mode, use shadow equity and handle sizing failures gracefully
+            sizing = None
+            sizing_error = None
+            
+            try:
+                # Use shadow equity in shadow mode, account equity otherwise
+                sizing_equity = shadow_equity if use_paper else equity
+                # Ensure minimum equity for calculation
+                sizing_equity = max(sizing_equity, 10.0) if use_paper else sizing_equity
+                
+                sizing = position_sizer.calculate(
+                    account_equity=sizing_equity,
+                    risk_pct=risk_pct,
+                    entry_price=current_price,
+                    stop_loss_pct=stop_loss_pct,
+                    strategy_id=intent.strategy_id,
+                    atr=atr_value,
+                    stop_loss_price=explicit_stop_loss_price,
+                    symbol=intent.symbol,
+                )
+            except Exception as e:
+                sizing_error = str(e)
+                logger.warning(f"Position sizing failed: {e}")
+
         if sizing is None:
             logger.warning(
-                f"Trade skipped (micro mode): equity=${equity:.2f} < $250 threshold. "
-                f"Check stop distance or notional requirements."
+                f"Trade skipped: sizing returned no position for {intent.symbol}. "
+                f"{f'Error: {sizing_error}' if sizing_error else 'Check micro mode or minimum notional in logs.'}"
             )
             log_activity(
-                activity_type="warning",
-                message=f"BUY {intent.symbol} skipped - Micro mode active (equity=${equity:.2f})",
+                activity_type="error",
+                message=f"Sizing rejected {intent.symbol}: below minimum notional",
                 details={
                     "symbol": intent.symbol,
                     "strategy": intent.strategy_id,
-                    "reason": "micro_mode_skip",
-                    "equity": equity,
+                    "reason": sizing_error or "sizing_skip",
+                    "equity": shadow_equity if use_paper else equity,
                 },
             )
             return None
         
-        # 2.5 Check available USD balance - can't buy more than we have
-        try:
-            from backend.execution.kraken_rest import KrakenClient
-            kraken = KrakenClient()
-            balance = kraken.get_balance()
-            # Get USD balance (Kraken uses ZUSD)
-            available_usd = float(balance.get("ZUSD", balance.get("USD", 0)))
-            
-            if sizing.position_size_usd > available_usd:
-                if available_usd < 1.0:  # Minimum $1 trade
-                    logger.warning(
-                        f"BUY rejected: insufficient USD balance. "
-                        f"Need ${sizing.position_size_usd:.2f}, have ${available_usd:.2f}"
-                    )
-                    log_activity(
-                        activity_type="warning",
-                        message=f"BUY {intent.symbol} rejected - insufficient USD (${available_usd:.2f})",
-                        details={
-                            "symbol": intent.symbol,
-                            "strategy": intent.strategy_id,
-                            "reason": "insufficient_usd",
-                            "needed": sizing.position_size_usd,
-                            "available": available_usd,
-                        },
-                    )
-                    return None
-                
-                # Reduce position to available balance (leave $0.50 buffer for fees)
-                adjusted_usd = available_usd - 0.50
-                adjusted_qty = adjusted_usd / current_price
+        # BUG3: Hard cap max risk to 1% of equity to prevent catastrophic sizing.
+        # 2% rule on $500 → $200 position with 5% stop → $10 max loss. But if price
+        # blows past the stop before invalidation fires, the actual loss can be 2-3×.
+        # Capping at 1% ($5 max risk on $500) limits position to $100 at 5% stop.
+        if sizing is not None and getattr(sizing, "max_risk_usd", 0) > 0:
+            _sizing_equity_cap = shadow_equity if use_paper else equity
+            _max_risk_cap = _sizing_equity_cap * 0.01
+            if _max_risk_cap > 0 and sizing.max_risk_usd > _max_risk_cap:
+                _scale = _max_risk_cap / sizing.max_risk_usd
+                sizing.max_risk_usd = _max_risk_cap
+                sizing.position_size_usd = sizing.position_size_usd * _scale
+                sizing.quantity = sizing.quantity * _scale
                 logger.info(
-                    f"BUY: Reducing position from ${sizing.position_size_usd:.2f} to "
-                    f"${adjusted_usd:.2f} (available=${available_usd:.2f})"
+                    f"1% risk cap applied for {intent.symbol}: "
+                    f"max_risk=${_max_risk_cap:.2f}, "
+                    f"position=${sizing.position_size_usd:.2f}, qty={sizing.quantity:.6f}"
                 )
-                sizing.position_size_usd = adjusted_usd
-                sizing.quantity = adjusted_qty
-                sizing.max_risk_usd = adjusted_usd * (stop_loss_pct / 100.0)
-        except Exception as e:
-            logger.warning(f"Failed to check USD balance, proceeding with calculated size: {e}")
-        
-        # 3. Validate 2% rule (only for BUY - we're not risking more on sells)
-        approved, reason = two_percent_rule.validate_trade(
-            trade_risk=sizing.max_risk_usd,
-            account_equity=equity,
-        )
-        if not approved:
-            logger.warning(f"Trade rejected by 2% rule: {reason}")
-            return None
-        
-        # 4. Validate Kraken minimum
-        valid, reason = position_sizer.validate_minimum(sizing.position_size_usd)
-        if not valid:
-            logger.warning(f"Trade rejected: {reason}")
-            return None
-    
-    # 5. Check daily loss limit (applies to both BUY and SELL)
-    daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "10.0"))
-    if account_tracker.daily_pnl <= -daily_loss_limit:
-        logger.error(
-            f"Daily loss limit reached: ${account_tracker.daily_pnl:.2f} "
-            f"exceeds -${daily_loss_limit:.2f} limit. Halting."
-        )
-        return None
-    
-    # Check for shadow-live mode (simulate execution without placing orders)
-    # Read from Redis (set via frontend toggle) with env var fallback
-    try:
-        from backend.redis import get_redis_client
-        from backend.redis.keys import SHADOW_LIVE_MODE_KEY
-        redis_client = get_redis_client()
-        shadow_value = redis_client.get(SHADOW_LIVE_MODE_KEY)
-        if shadow_value is not None:
-            shadow_live_mode = shadow_value.lower() == "true"
-        else:
-            # Fallback to env var if Redis key not set
-            shadow_live_mode = os.getenv("SHADOW_LIVE_MODE", "false").lower() == "true"
-    except Exception as e:
-        logger.warning(f"Failed to read shadow-live mode from Redis: {e}. Falling back to env var.")
-        shadow_live_mode = os.getenv("SHADOW_LIVE_MODE", "false").lower() == "true"
-    
-    if shadow_live_mode:
-        # TICKET-612: Check shadow balance before execution in shadow mode
-        if intent.side == "buy":
+
+        # Supervisor size factor: applied after 1% cap so REDUCED never exceeds ACTIVE risk
+        _supervisor_factor = float(metadata.get("supervisor_size_factor", 1.0))
+        if sizing is not None and _supervisor_factor != 1.0:
+            sizing.max_risk_usd *= _supervisor_factor
+            sizing.position_size_usd *= _supervisor_factor
+            sizing.quantity *= _supervisor_factor
+            logger.info(
+                f"Supervisor scaled position by {_supervisor_factor}× → "
+                f"position=${sizing.position_size_usd:.2f}, qty={sizing.quantity:.6f}"
+            )
+
+        # 2.5 Check available USD balance - can't buy more than we have
+        # TICKET-708: In shadow mode, check shadow balance instead of account balance
+        if use_paper:
+            # Shadow mode: check shadow balance
             try:
-                from backend.redis import get_redis_client
                 from backend.redis.keys import SHADOW_BALANCE_KEY
                 import json
                 redis_client = get_redis_client()
@@ -453,71 +416,137 @@ async def execute_trade(
                 
                 if shadow_balance_json:
                     shadow_balance = json.loads(shadow_balance_json)
-                    available_usd = shadow_balance.get("available_usd", 0.0)
-                    position_cost = sizing.position_size_usd + (sizing.position_size_usd * 0.0026)  # Add estimated fees
-                    
-                    if available_usd < position_cost:
+                    available_usd = shadow_balance.get("available_usd", shadow_equity)
+                else:
+                    available_usd = shadow_equity
+                
+                position_cost = sizing.position_size_usd + (sizing.position_size_usd * 0.0026)  # Add estimated fees
+                
+                if available_usd < position_cost:
+                    # TICKET-706: Still log ORDER_INTENT even if balance insufficient
+                    logger.warning(
+                        f"[SHADOW-LIVE] Shadow balance insufficient: available=${available_usd:.2f}, "
+                        f"required=${position_cost:.2f}. Will log ORDER_INTENT with adjusted size."
+                    )
+                    # Adjust sizing to available balance
+                    adjusted_usd = max(1.0, available_usd - 0.50)  # Leave $0.50 buffer, min $1
+                    adjusted_qty = adjusted_usd / current_price
+                    sizing.position_size_usd = adjusted_usd
+                    sizing.quantity = adjusted_qty
+                    sizing.max_risk_usd = adjusted_usd * (stop_loss_pct / 100.0)
+            except Exception as e:
+                logger.warning(f"Failed to check shadow balance: {e}, proceeding with calculated size")
+        else:
+            # Live mode: check account balance via CLI
+            try:
+                from backend.execution.kraken_cli import get_balance_sync, _USD_ASSETS
+                _raw_bal = get_balance_sync()
+                available_usd = sum(
+                    float(v) for k, v in _raw_bal.items() if k in _USD_ASSETS
+                )
+                
+                if sizing.position_size_usd > available_usd:
+                    if available_usd < 1.0:  # Minimum $1 trade
                         logger.warning(
-                            f"Shadow balance insufficient: available=${available_usd:.2f}, "
-                            f"required=${position_cost:.2f}. Rejecting trade."
+                            f"BUY rejected: insufficient USD balance. "
+                            f"Need ${sizing.position_size_usd:.2f}, have ${available_usd:.2f}"
                         )
                         log_activity(
                             activity_type="warning",
-                            message=f"Trade rejected: Insufficient shadow balance for {intent.symbol}",
+                            message=f"BUY {intent.symbol} rejected - insufficient USD (${available_usd:.2f})",
                             details={
                                 "symbol": intent.symbol,
-                                "available_usd": available_usd,
-                                "required_usd": position_cost,
-                                "reason": "insufficient_shadow_balance",
+                                "strategy": intent.strategy_id,
+                                "reason": "insufficient_usd",
+                                "needed": sizing.position_size_usd,
+                                "available": available_usd,
                             },
                         )
                         return None
+                    
+                    # Reduce position to available balance (leave $0.50 buffer for fees)
+                    adjusted_usd = available_usd - 0.50
+                    adjusted_qty = adjusted_usd / current_price
+                    logger.info(
+                        f"BUY: Reducing position from ${sizing.position_size_usd:.2f} to "
+                        f"${adjusted_usd:.2f} (available=${available_usd:.2f})"
+                    )
+                    sizing.position_size_usd = adjusted_usd
+                    sizing.quantity = adjusted_qty
+                    sizing.max_risk_usd = adjusted_usd * (stop_loss_pct / 100.0)
             except Exception as e:
-                logger.warning(f"Failed to check shadow balance: {e}, proceeding")
+                logger.warning(f"Failed to check USD balance, proceeding with calculated size: {e}")
         
-        # Shadow-live mode: Log order intents without executing
-        logger.info(
-            f"[SHADOW-LIVE] ORDER_INTENT: {intent.side.upper()} {sizing.quantity} {intent.symbol} "
-            f"@ ${current_price:.2f} (risk: ${sizing.max_risk_usd:.2f}, equity: ${equity:.2f})"
-        )
-        
-        # Get metadata (must be before using it)
-        metadata = intent.metadata or {}
-        
-        # Get bar timestamp and timeframe from metadata for candle tagging
-        bar_timestamp = metadata.get("bar_timestamp") or metadata.get("timestamp")
-        strategy_interval = metadata.get("timeframe") or metadata.get("interval") or "15m"
-        
-        # Log ORDER_INTENT to activity feed with full execution details
-        # Include candle boundary tagging for shadow mode
-        candle_tag = f"candle={bar_timestamp} tf={strategy_interval}" if bar_timestamp else ""
-        log_activity(
-            activity_type="ORDER_INTENT",
-            message=f"Order intent: {intent.side.upper()} {sizing.quantity} {intent.symbol} @ ${current_price:.2f} {candle_tag}".strip(),
-            details={
-                "symbol": intent.symbol,
-                "side": intent.side,
-                "quantity": sizing.quantity,
-                "price": current_price,
-                "position_size_usd": sizing.position_size_usd,
-                "max_risk_usd": sizing.max_risk_usd,
-                "stop_loss_price": sizing.stop_loss_price,
-                "stop_loss_pct": sizing.stop_loss_pct,
-                "strategy": intent.strategy_id,
-                "equity": equity,
-                "mode": "shadow_live",
-                "bar_timestamp": bar_timestamp,
-                "timeframe": strategy_interval,
-                "tp1_price": metadata.get("tp1_price"),
-                "tp2_price": metadata.get("tp2_price"),
-                "tp1_R": metadata.get("tp1_R"),
-                "tp2_R": metadata.get("tp2_R"),
-            },
-        )
-        
-        # Log STOP_INTENT if stop-loss is configured
+        # 3. Validate 2% rule (only for BUY - we're not risking more on sells)
+        # TICKET-706: Skip validations in shadow mode, but log ORDER_INTENT first
+        if use_paper:
+            # TICKET-706: Log ORDER_INTENT early in shadow mode (before validations that could fail)
+            bar_timestamp = metadata.get("bar_timestamp") or metadata.get("timestamp")
+            strategy_interval = metadata.get("timeframe") or metadata.get("interval") or "15m"
+            candle_tag = f"candle={bar_timestamp} tf={strategy_interval}" if bar_timestamp else ""
+            
+            log_activity(
+                activity_type="ORDER_INTENT",
+                message=f"Order intent: {intent.side.upper()} {sizing.quantity} {intent.symbol} @ ${current_price:.2f} {candle_tag}".strip(),
+                details={
+                    "symbol": intent.symbol,
+                    "side": intent.side,
+                    "quantity": sizing.quantity,
+                    "price": current_price,
+                    "position_size_usd": sizing.position_size_usd,
+                    "max_risk_usd": sizing.max_risk_usd,
+                    "stop_loss_price": sizing.stop_loss_price,
+                    "stop_loss_pct": sizing.stop_loss_pct,
+                    "strategy": intent.strategy_id,
+                    "equity": shadow_equity,
+                    "mode": "shadow_live",
+                    "bar_timestamp": bar_timestamp,
+                    "timeframe": strategy_interval,
+                    "tp1_price": metadata.get("tp1_price"),
+                    "tp2_price": metadata.get("tp2_price"),
+                    "tp1_R": metadata.get("tp1_R"),
+                    "tp2_R": metadata.get("tp2_R"),
+                    "sizing_error": sizing_error,  # Include if sizing failed
+                },
+            )
+            logger.info(
+                f"[SHADOW-LIVE] ORDER_INTENT logged: {intent.side.upper()} {sizing.quantity} {intent.symbol} "
+                f"@ ${current_price:.2f} (risk: ${sizing.max_risk_usd:.2f}, equity: ${shadow_equity:.2f})"
+            )
+        else:
+            # Live mode: enforce validations
+            approved, reason = two_percent_rule.validate_trade(
+                trade_risk=sizing.max_risk_usd,
+                account_equity=equity,
+            )
+            if not approved:
+                logger.warning(f"Trade rejected by 2% rule: {reason}")
+                return None
+            
+            # 4. Validate Kraken minimum
+            valid, reason = position_sizer.validate_minimum(sizing.position_size_usd)
+            if not valid:
+                logger.warning(f"Trade rejected: {reason}")
+                return None
+    
+    # 5. Check daily loss limit (applies to both BUY and SELL)
+    # TICKET-706: Skip in shadow mode (shadow balance tracks P&L separately)
+    if not use_paper:
+        daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "10.0"))
+        if account_tracker.daily_pnl <= -daily_loss_limit:
+            logger.error(
+                f"Daily loss limit reached: ${account_tracker.daily_pnl:.2f} "
+                f"exceeds -${daily_loss_limit:.2f} limit. Halting."
+            )
+            return None
+    
+    if use_paper:
+        # Paper mode execution via Kraken CLI — ORDER_INTENT already logged above.
+        # Log stop/TP intents before placing the order.
         stop_loss_price = metadata.get("stop_loss_price") or sizing.stop_loss_price
         if stop_loss_price:
+            # Use the actual position entry price (not current market price) for correct pct display
+            _entry_for_log = position.entry_price if intent.side == "sell" and position else current_price
             log_activity(
                 activity_type="STOP_INTENT",
                 message=f"Stop-loss intent: SELL {sizing.quantity} {intent.symbol} @ ${stop_loss_price:.2f}",
@@ -525,20 +554,19 @@ async def execute_trade(
                     "symbol": intent.symbol,
                     "stop_loss_price": stop_loss_price,
                     "stop_loss_pct": sizing.stop_loss_pct,
-                    "entry_price": current_price,
+                    "entry_price": _entry_for_log,
                     "risk_usd": sizing.max_risk_usd,
                     "strategy": intent.strategy_id,
-                    "mode": "shadow_live",
+                    "mode": "paper",
                 },
             )
-        
-        # Log TAKE_PROFIT_INTENT if configured
+
         tp1_price = metadata.get("tp1_price")
         tp2_price = metadata.get("tp2_price")
         if tp1_price:
             log_activity(
                 activity_type="TAKE_PROFIT_INTENT",
-                message=f"Take-profit intent: TP1 @ ${tp1_price:.2f}, TP2 @ ${tp2_price:.2f if tp2_price else 'N/A'}",
+                message=f"Take-profit intent: TP1 @ ${tp1_price:.2f}, TP2 @ {f'${tp2_price:.2f}' if tp2_price else 'N/A'}",
                 details={
                     "symbol": intent.symbol,
                     "tp1_price": tp1_price,
@@ -547,56 +575,166 @@ async def execute_trade(
                     "tp2_R": metadata.get("tp2_R"),
                     "entry_price": current_price,
                     "strategy": intent.strategy_id,
-                    "mode": "shadow_live",
+                    "mode": "paper",
                 },
             )
-        
-        # In shadow mode, create simulated position even though no real execution happens
-        # This ensures shadow positions are created on ORDER_INTENT (as required)
+
+        # Execute via Kraken CLI paper trading
         try:
             from backend.execution.models import Fill
-            from datetime import datetime, timezone
-            
-            # Create a simulated Fill for shadow position tracking
-            simulated_fill = Fill(
-                order_id=f"shadow_{intent.symbol}_{intent.side}_{datetime.now(timezone.utc).timestamp()}",
+            from backend.execution.kraken_cli import (
+                paper_buy,
+                paper_sell,
+                paper_ensure_init,
+                symbol_to_cli_pair,
+                KrakenCLIError,
+            )
+
+            cli_pair = symbol_to_cli_pair(intent.symbol)
+            _is_forced_exit = (intent.metadata or {}).get("forced_exit", False)
+
+            # Ensure paper account is initialised (no-op if already done)
+            await paper_ensure_init(balance=shadow_equity)
+
+            if intent.side == "buy":
+                # Always use market orders in paper/shadow mode — limit orders leave tokens
+                # in a "pending" state in the CLI paper account, causing subsequent sell
+                # attempts to fail with "Insufficient balance" until the order fills.
+                paper_fill = await paper_buy(
+                    pair=cli_pair,
+                    quantity=sizing.quantity,
+                    order_type="market",
+                    price=None,
+                )
+            else:
+                paper_fill = await paper_sell(pair=cli_pair, quantity=sizing.quantity)
+
+            if paper_fill is None:
+                _paper_err = (
+                    "buy_skipped_zero_quantity"
+                    if intent.side == "buy"
+                    else "paper_sell_skipped_zero_quantity"
+                )
+                if intent.side == "sell":
+                    get_position_tracker().purge_corrupted_position(
+                        intent.symbol,
+                        reason="paper_sell_zero_quantity",
+                    )
+                log_activity(
+                    activity_type="error",
+                    message=(
+                        f"Paper order failed: {intent.side.upper()} {intent.symbol} — "
+                        "quantity skipped (non-finite, rounds to zero at 8dp, or below "
+                        "minimum viable base size); see runner logs"
+                    ),
+                    details={
+                        "symbol": intent.symbol,
+                        "side": intent.side,
+                        "error": _paper_err,
+                        "mode": "paper",
+                    },
+                )
+                return None
+
+            fill = Fill(
+                order_id=paper_fill.order_id,
                 symbol=intent.symbol,
                 side=intent.side,
-                executed_price=current_price,
-                quantity=sizing.quantity,
-                fees=0.0,  # No fees in shadow mode
-                slippage=0.0,  # No slippage in shadow mode
-                exchange_order_id=None,  # No exchange order in shadow mode
+                executed_price=paper_fill.price,
+                quantity=paper_fill.volume,
+                fees=paper_fill.fee,
+                slippage=0.0,
+                exchange_order_id=None,
                 timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             )
-            
-            # Record fill to position tracker (creates shadow position)
+
+            if intent.side == "buy":
+                try:
+                    from backend.analytics.store import capture_entry_snapshot
+
+                    capture_entry_snapshot(
+                        symbol=intent.symbol,
+                        strategy=intent.strategy_id or "unknown",
+                        entry_price=fill.executed_price,
+                        quantity=fill.quantity,
+                        metadata=intent.metadata,
+                    )
+                except Exception as e:
+                    logger.debug(f"Trade analytics capture failed: {e}")
+
+            # Record fill to Redis position tracker (dashboard reads from here)
             tracker = get_position_tracker()
             strategy_id = intent.strategy_id if intent.side == "buy" else None
-            tracker.record_fill(simulated_fill, strategy_id=strategy_id)
-            
-            # Store TP1 price in Redis if available in metadata (for shadow mode)
-            if intent.side == "buy":
-                metadata = intent.metadata or {}
-                tp1_price = metadata.get("tp1_price")
-                if tp1_price:
-                    from backend.redis import get_redis_client
-                    from backend.redis.keys import POSITION_TP1_PRICE_KEY
-                    redis_client = get_redis_client()
-                    tp1_key = POSITION_TP1_PRICE_KEY.format(symbol=intent.symbol)
-                    redis_client.set(tp1_key, str(tp1_price))
-                    logger.debug(f"[SHADOW-LIVE] Stored TP1 price for {intent.symbol}: ${tp1_price:.2f}")
-            
-            logger.info(
-                f"[SHADOW-LIVE] Simulated position created: {intent.side} {sizing.quantity} {intent.symbol} "
-                f"@ ${current_price:.2f}"
+            tracker.record_fill(
+                fill,
+                strategy_id=strategy_id,
+                execution_live=live,
+                strategy_canonical=strategy_canonical if intent.side == "buy" else None,
             )
-            
-            # Return the simulated fill (for consistency with live mode)
-            return simulated_fill
+
+            # BUG2/4: Persist stop_loss_price on the position so _check_stop_loss_exit
+            # can enforce the stop level in paper/shadow mode (no real exchange stop order).
+            if intent.side == "buy":
+                _sl_price = metadata.get("stop_loss_price") or getattr(sizing, "stop_loss_price", None)
+                if _sl_price:
+                    _paper_pos = tracker.get_position(intent.symbol)
+                    if _paper_pos:
+                        _paper_pos.stop_loss_price = float(_sl_price)
+                        from backend.redis import get_redis_client as _get_redis_sl
+                        from backend.redis.keys import POSITION_KEY as _PK
+                        _redis_sl = _get_redis_sl()
+                        _redis_sl.hset(_PK.format(symbol=intent.symbol), mapping=_paper_pos.to_dict())
+                        logger.debug(
+                            f"[PAPER] Stored stop_loss_price=${float(_sl_price):.4f} for {intent.symbol}"
+                        )
+
+            # Store TP1 price in Redis for paper positions (monitor uses this)
+            if intent.side == "buy" and tp1_price:
+                from backend.redis import get_redis_client
+                from backend.redis.keys import POSITION_TP1_PRICE_KEY
+                _redis = get_redis_client()
+                _redis.set(POSITION_TP1_PRICE_KEY.format(symbol=intent.symbol), str(tp1_price))
+                logger.debug(f"[PAPER] Stored TP1 price for {intent.symbol}: ${tp1_price:.2f}")
+
+            # BUG6: Capture exit_reason from intent metadata for TRADE_PLACED log
+            _exit_reason = metadata.get("exit_reason")
+
+            log_activity(
+                activity_type="TRADE_PLACED",
+                message=(
+                    f"Trade placed: {intent.side.upper()} {paper_fill.volume} {intent.symbol} "
+                    f"@ ${paper_fill.price:.2f} (fee=${paper_fill.fee:.4f})"
+                ),
+                details={
+                    "symbol": intent.symbol,
+                    "side": intent.side,
+                    "quantity": paper_fill.volume,
+                    "price": paper_fill.price,
+                    "cost": paper_fill.cost,
+                    "fees": paper_fill.fee,
+                    "order_id": paper_fill.order_id,
+                    "strategy": intent.strategy_id,
+                    "mode": "paper",
+                    "exit_reason": _exit_reason,
+                },
+            )
+
+            logger.info(
+                f"[PAPER] Order filled: {intent.side.upper()} {paper_fill.volume} {intent.symbol} "
+                f"@ ${paper_fill.price:.2f} via {paper_fill.order_id}"
+            )
+            return fill
+
+        except KrakenCLIError as e:
+            logger.error(f"[PAPER] CLI error executing {intent.side} {intent.symbol}: {e}", exc_info=True)
+            log_activity(
+                activity_type="error",
+                message=f"Paper order failed: {intent.side.upper()} {intent.symbol} — {e}",
+                details={"symbol": intent.symbol, "side": intent.side, "error": str(e), "mode": "paper"},
+            )
+            return None
         except Exception as e:
-            logger.error(f"[SHADOW-LIVE] Failed to create simulated position: {e}", exc_info=True)
-            # Still return None on error (don't break execution flow)
+            logger.error(f"[PAPER] Unexpected error executing {intent.side} {intent.symbol}: {e}", exc_info=True)
             return None
     
     # 6. Execute on Kraken (live mode)
@@ -605,17 +743,11 @@ async def execute_trade(
         f"@ ${current_price:.2f} (risk: ${sizing.max_risk_usd:.2f})"
     )
     
-    # TICKET-610: Live Execution Preview (only in live mode, not shadow mode)
-    # Check if we're in live trading mode (not shadow mode)
+    # TICKET-610: Live Execution Preview (only in live mode, not paper mode)
     try:
-        from backend.redis import get_redis_client
-        from backend.redis.keys import SHADOW_LIVE_MODE_KEY
-        redis_client = get_redis_client()
-        shadow_value = redis_client.get(SHADOW_LIVE_MODE_KEY)
-        is_shadow_mode = shadow_value is not None and shadow_value.lower() == "true"
         live_trading = os.getenv("LIVE_TRADING", "false").lower() == "true"
-        
-        if live_trading and not is_shadow_mode:
+
+        if live_trading and live:
             # Log PREVIEW event before execution
             metadata = intent.metadata or {}
             soldier_scale_in = metadata.get("soldier_scale_in", False)
@@ -700,23 +832,21 @@ async def execute_trade(
             )
             # Fail-open: If DB check fails, proceed with execution (don't block on DB issues)
     
-    # Serialize order execution
-    with _execution_lock:
-        logger.debug("Acquired execution lock for 2% rule trade")
-        
+    # Serialize order execution (async lock — safe across awaits)
+    async with _get_execution_lock():
+        logger.debug("Acquired execution lock for live trade")
+
         try:
-            # Get next nonce
-            nonce = get_next_nonce()
-            logger.debug(f"Generated nonce: {nonce}")
-            
-            # Convert to Kraken order params
-            kraken_pair = _convert_symbol_to_kraken_pair(intent.symbol)
-            
-            # Validate costmin before executing order
+            # Convert to Kraken CLI pair format (BTC/USD → BTCUSD)
+            kraken_pair = kraken_cli.symbol_to_cli_pair(intent.symbol)
+
+            # Validate costmin — use Redis cache only ($0.50 default if not cached)
             try:
-                from backend.execution.kraken_rest import KrakenClient
-                kraken_client = KrakenClient()
-                costmin = kraken_client.get_costmin(intent.symbol)
+                from backend.redis import get_redis_client as _get_redis
+                from backend.redis.keys import ASSET_PAIRS_CACHE_KEY
+                _rc = _get_redis()
+                _pair_cache = _rc.hgetall(ASSET_PAIRS_CACHE_KEY.format(pair=intent.symbol))
+                costmin = float(_pair_cache.get(b"costmin", _pair_cache.get("costmin", 0.50))) if _pair_cache else 0.50
                 
                 # Validate position size meets costmin requirement
                 if sizing.position_size_usd < costmin:
@@ -744,53 +874,58 @@ async def execute_trade(
                 logger.warning(f"Failed to validate costmin: {e}, proceeding with order execution")
                 # Don't block execution if costmin check fails - use default behavior
             
-            order_params = {
-                "pair": kraken_pair,
-                "type": intent.side,
-                "ordertype": "market",
-                "volume": str(sizing.quantity),
-            }
-            
-            # Execute order
-            client = get_kraken_client()
+            # Use limit orders for BUY entries to qualify for maker fee (0.16% vs taker 0.26%).
+            # Forced exits (stop-loss, invalidation, max_hold) stay as market orders for speed.
+            is_forced_exit = (intent.metadata or {}).get("forced_exit", False)
+            if intent.side == "buy" and not is_forced_exit:
+                order_type = "limit"
+                # Set limit at current price — fills immediately at maker rate if resting,
+                # or as taker if the book crosses. Either way cheaper than pure market.
+                limit_price = str(round(current_price, 8))
+            else:
+                order_type = "market"
+                limit_price = None
+
+            # Execute order via Kraken CLI
             try:
-                order_response = execute_order(client, order_params)
-            except Exception as e:
-                # TICKET-605: Classify and log order failure
+                order_result = await kraken_cli.place_order(
+                    pair=kraken_pair,
+                    side=intent.side,
+                    quantity=float(sizing.quantity),
+                    order_type=order_type,
+                    price=float(limit_price) if limit_price is not None else None,
+                )
+            except kraken_cli.KrakenCLIError as e:
                 error_str = str(e)
-                error_parts = error_str.split(":", 1)
-                if len(error_parts) == 2:
-                    error_type = error_parts[0].strip()
-                    error_message = error_parts[1].strip()
-                else:
-                    from backend.execution.order_manager import classify_kraken_error
-                    error_type = classify_kraken_error(error_str)
-                    error_message = error_str
-                
-                logger.error(f"Order failed: {intent.symbol} - {error_type}: {error_message}")
+                from backend.execution.order_manager import classify_kraken_error
+                error_type = classify_kraken_error(error_str)
+                logger.error(f"Order failed: {intent.symbol} - {error_type}: {error_str}")
                 log_activity(
                     activity_type="error",
-                    message=f"Order failed: {intent.symbol} - {error_type}: {error_message}",
+                    message=f"Order failed: {intent.symbol} - {error_type}: {error_str}",
                     details={
                         "symbol": intent.symbol,
                         "side": intent.side,
                         "strategy": intent.strategy_id,
                         "error_type": error_type,
-                        "error_message": error_message,
-                        "order_params": order_params,
+                        "error_message": error_str,
+                        "pair": kraken_pair,
+                        "order_type": order_type,
                     },
                 )
                 raise
-            
+
             # Generate internal order_id
             order_id = str(uuid.uuid4())
-            exchange_order_id = order_response.txid
-            
+            txid_raw = order_result.get("txid", "")
+            exchange_order_id = txid_raw[0] if isinstance(txid_raw, list) else str(txid_raw)
+
             # Query order status for execution details
             try:
-                order_status = client.query_orders(txid=exchange_order_id)
-                executed_price = order_status.get("price", current_price)
-                fees = order_status.get("fee", 0.0)
+                order_status_raw = await kraken_cli.query_order(exchange_order_id)
+                order_info = order_status_raw.get(exchange_order_id, {})
+                executed_price = float(order_info.get("price", current_price))
+                fees = float(order_info.get("fee", 0.0))
             except Exception as e:
                 logger.warning(f"Failed to query order status: {e}. Using market price.")
                 executed_price = current_price
@@ -865,7 +1000,12 @@ async def execute_trade(
             # Pass strategy_id for buy orders (opening/adding to positions)
             tracker = get_position_tracker()
             strategy_id = intent.strategy_id if intent.side == "buy" else None
-            tracker.record_fill(fill, strategy_id=strategy_id)
+            tracker.record_fill(
+                fill,
+                strategy_id=strategy_id,
+                execution_live=live,
+                strategy_canonical=strategy_canonical if intent.side == "buy" else None,
+            )
             
             # Set scout_entry_price for Scout entries (equity < $50)
             if intent.side == "buy" and use_scout_sizing:
@@ -888,14 +1028,13 @@ async def execute_trade(
             if strategy_id and intent.side == "buy":
                 try:
                     from backend.performance.monitor import get_performance_monitor
-                    from datetime import datetime
                     perf_monitor = get_performance_monitor()
                     # Initial P&L is 0 (just opened)
                     perf_monitor.update_trade_outcome(
                         strategy_id=strategy_id,
                         symbol=intent.symbol,
                         pnl=0.0,  # Will be updated when position closes or P&L updates
-                        entry_time=datetime.now(),
+                        entry_time=datetime.now(timezone.utc),
                     )
                 except Exception as e:
                     logger.debug(f"Failed to update performance metrics: {e}")
@@ -916,16 +1055,16 @@ async def execute_trade(
                         f"rounded from ${stop_loss_price:.4f})"
                     )
                     
-                    # Place stop-loss sell order on Kraken
-                    stop_loss_response = client.add_order(
+                    # Place stop-loss sell order via Kraken CLI
+                    stop_loss_result = await kraken_cli.place_order(
                         pair=kraken_pair,
-                        type="sell",
-                        ordertype="stop-loss",
-                        volume=float(sizing.quantity),
-                        price=stop_loss_price_rounded,  # Trigger price for stop-loss (rounded to 3 decimals)
+                        side="sell",
+                        quantity=float(sizing.quantity),
+                        order_type="stop-loss",
+                        price=stop_loss_price_rounded,
                     )
-                    
-                    stop_loss_txid = stop_loss_response.txid
+                    txid_raw = stop_loss_result.get("txid", "")
+                    stop_loss_txid = txid_raw[0] if isinstance(txid_raw, list) else str(txid_raw)
                     logger.info(f"Stop-loss order placed: txid={stop_loss_txid}")
                     
                     # Update position with stop-loss info
@@ -1032,129 +1171,66 @@ def get_trade_intent_from_signal(intent_id: str) -> Optional[Dict[str, Any]]:
         session.close()
 
 
-def execute_approved_intent(risk_decision: RiskDecision) -> Fill:
+async def execute_approved_intent(risk_decision: RiskDecision) -> Fill:
     """
-    Execute an approved TradeIntent and return a Fill object.
-    
-    This function:
-    1. Validates that the RiskDecision is approved
-    2. Retrieves TradeIntent from Signal table using intent_id
-    3. Converts TradeIntent to Kraken order parameters
-    4. Executes order with serialized nonce handling (prevents collisions)
-    5. Creates and returns Fill object matching contract schema
-    
+    Execute an approved TradeIntent and return a Fill object (CLI-backed).
+
     Args:
         risk_decision: RiskDecision with approved=True
-        
+
     Returns:
         Fill object with execution details
-        
-    Raises:
-        ValueError: If RiskDecision is not approved
-        RuntimeError: If TradeIntent cannot be retrieved
-        Exception: If order execution fails
-        
-    Notes:
-        - Order execution is serialized (only one order at a time)
-        - Nonce is generated atomically using Redis
-        - Handles partial fills and order rejections gracefully
     """
-    # Validate that decision is approved
     if not risk_decision.approved:
         raise ValueError(
             f"Cannot execute rejected intent. "
             f"intent_id={risk_decision.intent_id}, "
             f"rejection_reason={risk_decision.rejection_reason}"
         )
-    
+
     logger.info(f"Executing approved intent: intent_id={risk_decision.intent_id}")
-    
-    # Retrieve TradeIntent from Signal table
+
     trade_intent_data = get_trade_intent_from_signal(risk_decision.intent_id)
     if trade_intent_data is None:
         raise RuntimeError(
             f"Failed to retrieve TradeIntent for intent_id: {risk_decision.intent_id}"
         )
-    
-    # Serialize order execution (only one order at a time)
-    with _execution_lock:
+
+    async with _get_execution_lock():
         logger.debug("Acquired execution lock")
-        
         try:
-            # Get next nonce (atomic operation)
-            nonce = get_next_nonce()
-            logger.debug(f"Generated nonce for order: {nonce}")
-            
-            # Get total equity for volume calculation
-            total_equity_decimal = get_current_equity()
-            total_equity = float(total_equity_decimal)
-            
-            # Get current price from metadata or market data
-            # For market orders, we don't need it upfront, but it's useful for volume calculation
-            current_price = trade_intent_data.get("metadata", {}).get("current_price")
-            
-            # Convert TradeIntent to Kraken order parameters
-            order_params = convert_intent_to_order_params(
-                symbol=trade_intent_data["symbol"],
+            current_price = trade_intent_data.get("metadata", {}).get("current_price") or 0.0
+            total_equity = float(get_current_equity())
+            risk_amount = (trade_intent_data["notional_risk_pct"] / 100.0) * total_equity
+            if current_price <= 0:
+                raise ValueError(f"Cannot calculate volume: current_price={current_price}")
+            quantity = risk_amount / current_price
+
+            kraken_pair = kraken_cli.symbol_to_cli_pair(trade_intent_data["symbol"])
+
+            order_result = await kraken_cli.place_order(
+                pair=kraken_pair,
                 side=trade_intent_data["side"],
-                intent_type=trade_intent_data["intent_type"],
-                notional_risk_pct=trade_intent_data["notional_risk_pct"],
-                current_price=current_price,
-                total_equity=total_equity,
+                quantity=quantity,
+                order_type="market",
             )
-            
-            # Validate that volume was calculated
-            if "volume" not in order_params or float(order_params["volume"]) <= 0:
-                raise ValueError(
-                    f"Cannot calculate order volume. "
-                    f"Required: current_price and total_equity. "
-                    f"Got: current_price={current_price}, total_equity={total_equity}"
-                )
-            
-            # Execute order
-            client = get_kraken_client()
-            order_response = execute_order(client, order_params)
-            
-            # Generate internal order_id
+
             order_id = str(uuid.uuid4())
-            
-            # Extract exchange order ID
-            exchange_order_id = order_response.txid
-            
-            # Query order status to get execution details
-            # Note: This is a placeholder - actual implementation will parse Kraken response
-            # For market orders, we need to query the order status to get executed price
+            txid_raw = order_result.get("txid", "")
+            exchange_order_id = txid_raw[0] if isinstance(txid_raw, list) else str(txid_raw)
+
             try:
-                order_status = client.query_orders(txid=exchange_order_id)
-                # Parse order status to extract executed_price, quantity, fees
-                # This is a placeholder - actual parsing depends on Kraken API response format
-                executed_price = order_status.get("price", 0.0)  # Placeholder
-                quantity = float(order_params.get("volume", 0))  # Use requested volume for now
-                fees = order_status.get("fee", 0.0)  # Placeholder
-                
-                # If order status doesn't have execution details, we'll need to wait or poll
-                if executed_price == 0.0:
-                    logger.warning(
-                        f"Order {exchange_order_id} executed but execution details not yet available. "
-                        f"Using placeholder values. This should be replaced with actual order status parsing."
-                    )
-                    # For now, use a reasonable default (this should be replaced)
-                    executed_price = current_price if current_price else 0.0
+                order_status_raw = await kraken_cli.query_order(exchange_order_id)
+                order_info = order_status_raw.get(exchange_order_id, {})
+                executed_price = float(order_info.get("price", current_price))
+                fees = float(order_info.get("fee", 0.0))
             except Exception as e:
-                logger.warning(
-                    f"Failed to query order status for {exchange_order_id}: {e}. "
-                    f"Using placeholder values."
-                )
-                # Fallback to placeholder values
-                executed_price = current_price if current_price else 0.0
-                quantity = float(order_params.get("volume", 0))
+                logger.warning(f"Failed to query order status: {e}. Using market price.")
+                executed_price = current_price
                 fees = 0.0
-            
-            # Calculate slippage (only if we have both intended and executed prices)
-            intended_price = current_price
-            slippage = calculate_slippage(intended_price, executed_price, trade_intent_data["side"])
-            
-            # Create Fill object
+
+            slippage = calculate_slippage(current_price, executed_price, trade_intent_data["side"])
+
             fill = Fill(
                 order_id=order_id,
                 symbol=trade_intent_data["symbol"],
@@ -1166,17 +1242,15 @@ def execute_approved_intent(risk_decision: RiskDecision) -> Fill:
                 exchange_order_id=exchange_order_id,
                 timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             )
-            
+
             logger.info(
-                f"Order executed successfully: order_id={order_id}, "
-                f"exchange_order_id={exchange_order_id}, "
-                f"quantity={quantity}, price={executed_price}"
+                f"Order executed: order_id={order_id}, exchange_order_id={exchange_order_id}, "
+                f"qty={quantity}, price=${executed_price:.2f}"
             )
-            
-            # Log to activity feed
             log_activity(
                 activity_type="order",
-                message=f"Order filled: {trade_intent_data['side'].upper()} {quantity} {trade_intent_data['symbol']} @ ${executed_price:.2f}",
+                message=f"Order filled: {trade_intent_data['side'].upper()} {quantity} "
+                        f"{trade_intent_data['symbol']} @ ${executed_price:.2f}",
                 details={
                     "order_id": order_id,
                     "exchange_order_id": exchange_order_id,
@@ -1188,22 +1262,26 @@ def execute_approved_intent(risk_decision: RiskDecision) -> Fill:
                     "strategy": trade_intent_data["strategy_id"],
                 },
             )
-            
-            # Record fill to position tracker
-            # Pass strategy_id for buy orders (opening/adding to positions)
+
             tracker = get_position_tracker()
             strategy_id = (
-                trade_intent_data["strategy_id"]
-                if trade_intent_data["side"] == "buy"
-                else None
+                trade_intent_data["strategy_id"] if trade_intent_data["side"] == "buy" else None
             )
-            tracker.record_fill(fill, strategy_id=strategy_id)
-            
+            _meta = trade_intent_data.get("metadata") or {}
+            _sc = _meta.get("strategy_canonical")
+            from backend.api.routes.trading import get_bot_mode as _gbm
+
+            _legacy_live = _gbm() == "LIVE"
+            tracker.record_fill(
+                fill,
+                strategy_id=strategy_id,
+                execution_live=_legacy_live,
+                strategy_canonical=_sc if trade_intent_data["side"] == "buy" else None,
+            )
             return fill
-            
+
         except Exception as e:
             logger.error(f"Order execution failed: {e}")
-            # Log error to activity feed
             log_activity(
                 activity_type="error",
                 message=f"Order execution failed for {trade_intent_data['symbol']}",

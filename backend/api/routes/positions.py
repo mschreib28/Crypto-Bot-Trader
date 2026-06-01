@@ -26,13 +26,13 @@ async def list_positions():
         tracker = get_position_tracker()
         positions = tracker.get_all_positions()
         
-        # Get strategy name mapping for display
+        # Get strategy name mapping for display (use display name for UI consistency)
         from backend.db import get_session
-        from backend.db.models import Strategy
+        from backend.db.models import Strategy, get_strategy_display_name
         session = get_session()
         try:
             db_strategies = session.query(Strategy).all()
-            uuid_to_name = {str(s.id): s.name for s in db_strategies}
+            uuid_to_name = {str(s.id): get_strategy_display_name(s) for s in db_strategies}
         finally:
             session.close()
         
@@ -126,7 +126,7 @@ async def sync_positions():
     """
     try:
         tracker = get_position_tracker()
-        result = tracker.sync_from_kraken()
+        result = await tracker.sync_from_kraken()
         logger.info(f"Manual position sync completed: {result}")
         return result
     except Exception as e:

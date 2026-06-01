@@ -1,11 +1,15 @@
 import { useState, useCallback } from 'react';
 import { BalanceData } from './useBalance';
 
+interface ShadowBalanceResponse extends BalanceData {
+  positions_closed?: number;
+}
+
 interface UseShadowBalanceReturn {
   shadowBalance: BalanceData | null;
   loading: boolean;
   error: string | null;
-  setShadowBalance: (totalUsd: number, availableUsd?: number) => Promise<boolean>;
+  setShadowBalance: (totalUsd: number, availableUsd?: number) => Promise<ShadowBalanceResponse | null>;
   fetchShadowBalance: () => Promise<void>;
 }
 
@@ -35,7 +39,7 @@ export function useShadowBalance(): UseShadowBalanceReturn {
   const setShadowBalance = useCallback(async (
     totalUsd: number,
     availableUsd?: number
-  ): Promise<boolean> => {
+  ): Promise<ShadowBalanceResponse | null> => {
     setLoading(true);
     setError(null);
     try {
@@ -55,13 +59,13 @@ export function useShadowBalance(): UseShadowBalanceReturn {
         throw new Error(errorData.detail || `HTTP ${response.status}`);
       }
 
-      const data: BalanceData = await response.json();
+      const data: ShadowBalanceResponse = await response.json();
       setShadowBalanceState(data);
-      return true;
+      return data;
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to set shadow balance';
       setError(message);
-      return false;
+      return null;
     } finally {
       setLoading(false);
     }

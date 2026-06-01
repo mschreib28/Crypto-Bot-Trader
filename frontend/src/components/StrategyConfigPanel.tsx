@@ -1,39 +1,45 @@
 import { useState, useEffect } from 'react';
 import { useStrategies } from '../hooks/useStrategies';
+import { getStrategyDisplayName, RETIRED_STRATEGY_SLUGS } from '../utils/strategyLabels';
 import { useStrategyConfig, StrategyConfig, StrategyFilters } from '../hooks/useStrategyConfig';
 
 interface ConfigField {
   key: string;
   label: string;
   shortLabel: string;
-  format: (value: number | undefined | null) => string;
+  format: (value: unknown) => string;
   min?: number;
   max?: number;
   step?: number;
+  options?: readonly string[];
 }
 
-function formatVolume(vol: number | undefined | null): string {
+function formatVolume(vol: unknown): string {
   if (vol == null) return '—';
-  if (vol >= 1e9) return `${(vol / 1e9).toFixed(1)}B`;
-  if (vol >= 1e6) return `${(vol / 1e6).toFixed(1)}M`;
-  if (vol >= 1e3) return `${(vol / 1e3).toFixed(0)}K`;
-  return String(vol);
+  const n = typeof vol === 'number' ? vol : parseFloat(String(vol));
+  if (Number.isNaN(n)) return typeof vol === 'string' ? vol : '—';
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)}K`;
+  return String(n);
 }
 
-function formatSupply(val: number | undefined | null): string {
+function formatSupply(val: unknown): string {
   if (val == null) return '—';
-  if (val >= 1e12) return `${(val / 1e12).toFixed(1)}T`;
-  if (val >= 1e9) return `${(val / 1e9).toFixed(1)}B`;
-  if (val >= 1e6) return `${(val / 1e6).toFixed(1)}M`;
-  if (val >= 1e3) return `${(val / 1e3).toFixed(0)}K`;
-  return String(val);
+  const n = typeof val === 'number' ? val : parseFloat(String(val));
+  if (Number.isNaN(n)) return typeof val === 'string' ? val : '—';
+  if (n >= 1e12) return `${(n / 1e12).toFixed(1)}T`;
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)}K`;
+  return String(n);
 }
 
-const formatNum = (v: number | undefined | null) => v != null ? String(v) : '—';
+const formatNum = (v: unknown) => v != null ? String(v) : '—';
 
 // Format helpers for new A+ parameters
-const formatPct = (v: number | undefined | null) => v != null ? `${v}%` : '—';
-const formatRatio = (v: number | undefined | null) => v != null ? `${Math.round(v * 100)}%` : '—';
+const formatPct = (v: unknown) => (v != null && typeof v === 'number') ? `${v}%` : (typeof v === 'string' ? v : '—');
+const formatRatio = (v: unknown) => (v != null && typeof v === 'number') ? `${Math.round(v * 100)}%` : (typeof v === 'string' ? v : '—');
 
 const STRATEGY_FIELDS: Record<string, ConfigField[]> = {
   mean_reversion: [
@@ -75,10 +81,14 @@ const STRATEGY_FIELDS: Record<string, ConfigField[]> = {
   ],
 };
 
+const GRADE_OPTIONS = ['A+', 'A', 'B', 'C', 'D', 'F'] as const;
+const formatGrade = (v: unknown) => (v != null ? String(v) : '—');
+
 const FILTER_FIELDS: ConfigField[] = [
   { key: 'min_volume_24h', label: 'Min 24h Volume', shortLabel: 'Min Vol', format: formatVolume, min: 0, step: 100000 },
-  { key: 'confidence_buy', label: 'Buy Confidence %', shortLabel: 'Buy Conf %', format: formatPct, min: 50, max: 100, step: 1 },
-  { key: 'confidence_sell', label: 'Sell Confidence %', shortLabel: 'Sell Conf %', format: formatPct, min: 50, max: 100, step: 1 },
+  { key: 'confidence_buy', label: 'Min Signal Strength (Buy) %', shortLabel: 'Buy Strength %', format: formatPct, min: 50, max: 100, step: 1 },
+  { key: 'confidence_sell', label: 'Min Signal Strength (Sell) %', shortLabel: 'Sell Strength %', format: formatPct, min: 50, max: 100, step: 1 },
+  { key: 'min_allowed_grade', label: 'Min Allowed Grade', shortLabel: 'Min Grade', format: formatGrade, options: GRADE_OPTIONS },
   { key: 'min_change_24h_pct', label: 'Min 24h Change %', shortLabel: 'Min 24H %', format: formatPct, min: -50, max: 50, step: 0.1 },
   { key: 'max_change_24h_pct', label: 'Max 24h Change %', shortLabel: 'Max 24H %', format: formatPct, min: -50, max: 50, step: 0.1 },
   { key: 'min_circulating_supply', label: 'Min Circulating Supply', shortLabel: 'Min Supply', format: formatSupply, min: 0, step: 1000000 },
@@ -115,13 +125,19 @@ export function StrategyConfigPanel({ onConfigSaved }: StrategyConfigPanelProps)
   const [saving, setSaving] = useState(false);
   const [filterErrors, setFilterErrors] = useState<Record<string, string>>({});
 
-  const enabledStrategies = strategies.filter((s) => s.enabled);
+  const activeStrategiesForSetup = strategies.filter(
+    (s) => s.status === 'active' && !RETIRED_STRATEGY_SLUGS.has(s.name),
+  );
 
   useEffect(() => {
-    if (!selectedStrategyId && enabledStrategies.length > 0) {
-      setSelectedStrategyId(enabledStrategies[0].strategy_id);
+    if (activeStrategiesForSetup.length === 0) return;
+    const valid =
+      selectedStrategyId &&
+      activeStrategiesForSetup.some((s) => s.strategy_id === selectedStrategyId);
+    if (!valid) {
+      setSelectedStrategyId(activeStrategiesForSetup[0].strategy_id);
     }
-  }, [enabledStrategies, selectedStrategyId]);
+  }, [activeStrategiesForSetup, selectedStrategyId]);
 
   const { config, loading, error, updateConfig } = useStrategyConfig(selectedStrategyId);
 
@@ -195,6 +211,14 @@ export function StrategyConfigPanel({ onConfigSaved }: StrategyConfigPanelProps)
     }
   };
 
+  const handleFilterSelectChange = (key: keyof StrategyFilters, value: string) => {
+    if (!editedConfig) return;
+    setEditedConfig({
+      ...editedConfig,
+      filters: { ...editedConfig.filters, [key]: value },
+    });
+  };
+
   const handleStrategyChange = (strategyId: string) => {
     setSelectedStrategyId(strategyId || undefined);
     setEditMode(false);
@@ -206,7 +230,7 @@ export function StrategyConfigPanel({ onConfigSaved }: StrategyConfigPanelProps)
 
   return (
     <section
-      className="bg-gray-800 rounded-lg p-3 border border-gray-700"
+      className="bg-gray-800 rounded-lg p-3 border border-gray-700 flex flex-col min-h-0 overflow-hidden"
       aria-labelledby="strategy-config-title"
     >
       <div className="flex items-center justify-between mb-2">
@@ -219,17 +243,17 @@ export function StrategyConfigPanel({ onConfigSaved }: StrategyConfigPanelProps)
         <select
           value={selectedStrategyId || ''}
           onChange={(e) => handleStrategyChange(e.target.value)}
-          disabled={strategiesLoading || enabledStrategies.length === 0}
+          disabled={strategiesLoading || activeStrategiesForSetup.length === 0}
           className="bg-gray-700 text-gray-200 text-xs rounded px-1.5 py-0.5 border border-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-500"
           aria-label="Select strategy"
         >
           {strategiesLoading && <option value="">Loading...</option>}
-          {!strategiesLoading && enabledStrategies.length === 0 && (
+          {!strategiesLoading && activeStrategiesForSetup.length === 0 && (
             <option value="">None</option>
           )}
-          {enabledStrategies.map((strategy) => (
+          {activeStrategiesForSetup.map((strategy) => (
             <option key={strategy.strategy_id} value={strategy.strategy_id}>
-              {strategy.name}
+              {getStrategyDisplayName(strategy.name)}
             </option>
           ))}
         </select>
@@ -248,7 +272,8 @@ export function StrategyConfigPanel({ onConfigSaved }: StrategyConfigPanelProps)
       )}
 
       {!loading && displayConfig && (
-        <div className="space-y-1.5">
+        <div className="flex flex-col min-h-0">
+          <div className="min-h-0 max-h-32 overflow-y-auto pr-1 space-y-1.5">
           {/* Strategy Settings Section */}
           <div className="text-[10px] text-blue-400 uppercase tracking-wide mb-1 font-semibold">Strategy Settings</div>
           
@@ -300,26 +325,40 @@ export function StrategyConfigPanel({ onConfigSaved }: StrategyConfigPanelProps)
             const filterValue = displayConfig.filters?.[field.key as keyof StrategyFilters];
             const editedFilterValue = editedConfig?.filters?.[field.key as keyof StrategyFilters];
             const hasError = filterErrors[field.key];
+            const isSelect = field.options != null;
             return (
               <div key={field.key} className="flex flex-col text-xs">
                 <div className="flex justify-between items-center">
-                  <span className="text-gray-500">{field.shortLabel}</span>
+                  <span className="text-gray-500" title={field.label}>{field.shortLabel}</span>
                   {editMode ? (
-                    <input
-                      type="number"
-                      value={editedFilterValue ?? ''}
-                      onChange={(e) => handleFilterChange(field.key as keyof StrategyFilters, e.target.value)}
-                      min={field.min}
-                      max={field.max}
-                      step={field.step}
-                      className={`bg-gray-700 text-gray-200 text-xs font-mono rounded px-1.5 py-0.5 w-20 border focus:outline-none focus:ring-1 text-right ${
-                        hasError
-                          ? 'border-red-500 focus:ring-red-500'
-                          : 'border-gray-600 focus:ring-blue-500'
-                      }`}
-                      aria-label={field.label}
-                      aria-invalid={!!hasError}
-                    />
+                    isSelect ? (
+                      <select
+                        value={String(editedFilterValue ?? field.options?.[0] ?? '')}
+                        onChange={(e) => handleFilterSelectChange(field.key as keyof StrategyFilters, e.target.value)}
+                        className="bg-gray-700 text-gray-200 text-xs rounded px-1.5 py-0.5 border border-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                        aria-label={field.label}
+                      >
+                        {field.options?.map((opt) => (
+                          <option key={opt} value={opt}>{opt}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        type="number"
+                        value={editedFilterValue ?? ''}
+                        onChange={(e) => handleFilterChange(field.key as keyof StrategyFilters, e.target.value)}
+                        min={field.min}
+                        max={field.max}
+                        step={field.step}
+                        className={`bg-gray-700 text-gray-200 text-xs font-mono rounded px-1.5 py-0.5 w-20 border focus:outline-none focus:ring-1 text-right ${
+                          hasError
+                            ? 'border-red-500 focus:ring-red-500'
+                            : 'border-gray-600 focus:ring-blue-500'
+                        }`}
+                        aria-label={field.label}
+                        aria-invalid={!!hasError}
+                      />
+                    )
                   ) : (
                     <span className="text-gray-300 font-mono">
                       {field.format(filterValue)}
@@ -332,8 +371,9 @@ export function StrategyConfigPanel({ onConfigSaved }: StrategyConfigPanelProps)
               </div>
             );
           })}
+          </div>
 
-          <div className="flex justify-end gap-1.5 pt-2 border-t border-gray-700 mt-2">
+          <div className="flex shrink-0 justify-end gap-1.5 pt-2 border-t border-gray-700 mt-2">
             {editMode ? (
               <>
                 <button

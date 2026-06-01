@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 
-from backend.execution.auth import get_auth_headers, generate_nonce, KRAKEN_API_URL
+# auth/nonce replaced by kraken_cli.get_balance_sync()
 from backend.ingestor.config import (
     get_symbol_limit,
     get_max_total_symbols,
@@ -272,6 +272,26 @@ def fetch_top_usd_pairs_by_volume(limit: Optional[int] = None) -> List[str]:
         last_price = float(ticker_data.get("c", [0, 0])[0])  # 'c' is [price, lot volume]
         volume_24h_usd = volume_24h_base * last_price
         
+        # Extract bid/ask for spread calculation
+        # Kraken ticker format: 'a' = ask array [price, whole_lot_volume], 'b' = bid array [price, whole_lot_volume]
+        bid_price = None
+        ask_price = None
+        spread_bps = None
+        try:
+            ask_data = ticker_data.get("a")
+            bid_data = ticker_data.get("b")
+            if ask_data and isinstance(ask_data, list) and len(ask_data) > 0:
+                ask_price = float(ask_data[0] if isinstance(ask_data[0], list) else ask_data[0])
+            if bid_data and isinstance(bid_data, list) and len(bid_data) > 0:
+                bid_price = float(bid_data[0] if isinstance(bid_data[0], list) else bid_data[0])
+            
+            # Calculate spread in basis points: ((ask - bid) / mid_price) * 10000
+            if bid_price and ask_price and bid_price > 0 and ask_price > bid_price:
+                mid_price = (ask_price + bid_price) / 2.0
+                spread_bps = ((ask_price - bid_price) / mid_price) * 10000.0
+        except (ValueError, TypeError, IndexError) as e:
+            logger.debug(f"Could not calculate spread for {pair_name}: {e}")
+        
         # Get 24h change percentage
         # Kraken REST API ticker fields:
         # 'p' = volume weighted average price [today, last24h] - p[1] is 24h VWAP
@@ -335,6 +355,7 @@ def fetch_top_usd_pairs_by_volume(limit: Optional[int] = None) -> List[str]:
         volume_data[normalized] = {
             "volume_24h": volume_24h_usd,
             "change_24h_pct": change_24h_pct,
+            "last_price": last_price if last_price > 0 else None,
         }
     
     # Sort by volume descending and take top N
@@ -376,6 +397,14 @@ def _store_volume_data(volume_data: Dict[str, Dict[str, float]]) -> None:
                 "change_24h_pct": change_24h_pct,
                 "updated_at": timestamp,
             }
+            # Add bid/ask/spread if available in data_dict
+            if isinstance(data_dict, dict):
+                if "bid" in data_dict:
+                    store_data["bid"] = data_dict["bid"]
+                if "ask" in data_dict:
+                    store_data["ask"] = data_dict["ask"]
+                if "spread_bps" in data_dict:
+                    store_data["spread_bps"] = data_dict["spread_bps"]
             data_json = json.dumps(store_data)
             pipeline.hset(SYMBOL_VOLUME_KEY, symbol, data_json)
         pipeline.execute()
@@ -397,12 +426,62 @@ def get_symbol_volume(symbol: str) -> Optional[float]:
     """
     try:
         client = get_redis_client()
-        data = client.hget(SYMBOL_VOLUME_KEY, symbol)
+        # Normalize symbol before lookup to match stored format
+        normalized_symbol = normalize_symbol(symbol)
+        data = client.hget(SYMBOL_VOLUME_KEY, normalized_symbol)
         if data:
             parsed = json.loads(data)
             return parsed.get("volume_24h")
     except Exception as e:
         logger.debug(f"Failed to get volume for {symbol}: {e}")
+    return None
+
+
+def get_symbol_price(symbol: str) -> Optional[float]:
+    """
+    Get last trade price for a symbol.
+
+    Priority:
+    1. OHLCV stream last close (most current — updated every tick)
+    2. market:volume last_price (from ticker refresh)
+    3. market:volume bid/ask mid-price (fallback, may be stale)
+
+    Args:
+        symbol: Trading pair (e.g., "BTC/USD")
+
+    Returns:
+        Last trade price or None if not available
+    """
+    try:
+        client = get_redis_client()
+        normalized_symbol = normalize_symbol(symbol)
+
+        # Priority 1: OHLCV stream close price (always fresh when ingestor is running)
+        for interval in ("5m", "15m", "1h"):
+            stream_key = f"market:ohlcv:{normalized_symbol}:{interval}"
+            try:
+                entries = client.xrevrange(stream_key, count=1)
+                if entries:
+                    _, fields = entries[0]
+                    close = fields.get(b"close") or fields.get("close")
+                    if close is not None:
+                        return float(close)
+            except Exception:
+                continue
+
+        # Priority 2 & 3: market:volume (ticker data — may be stale)
+        data = client.hget(SYMBOL_VOLUME_KEY, normalized_symbol)
+        if data:
+            parsed = json.loads(data)
+            last_price = parsed.get("last_price")
+            if last_price is not None:
+                return float(last_price)
+            bid = parsed.get("bid")
+            ask = parsed.get("ask")
+            if bid is not None and ask is not None:
+                return (float(bid) + float(ask)) / 2.0
+    except Exception as e:
+        logger.debug(f"Failed to get price for {symbol}: {e}")
     return None
 
 
@@ -505,6 +584,26 @@ def refresh_ticker_data() -> None:
             last_price = float(ticker_data.get("c", [0, 0])[0])  # 'c' is [price, lot volume]
             volume_24h_usd = volume_24h_base * last_price
             
+            # Extract bid/ask for spread calculation
+            # Kraken ticker format: 'a' = ask array [price, whole_lot_volume], 'b' = bid array [price, whole_lot_volume]
+            bid_price = None
+            ask_price = None
+            spread_bps = None
+            try:
+                ask_data = ticker_data.get("a")
+                bid_data = ticker_data.get("b")
+                if ask_data and isinstance(ask_data, list) and len(ask_data) > 0:
+                    ask_price = float(ask_data[0] if isinstance(ask_data[0], list) else ask_data[0])
+                if bid_data and isinstance(bid_data, list) and len(bid_data) > 0:
+                    bid_price = float(bid_data[0] if isinstance(bid_data[0], list) else bid_data[0])
+                
+                # Calculate spread in basis points: ((ask - bid) / mid_price) * 10000
+                if bid_price and ask_price and bid_price > 0 and ask_price > bid_price:
+                    mid_price = (ask_price + bid_price) / 2.0
+                    spread_bps = ((ask_price - bid_price) / mid_price) * 10000.0
+            except (ValueError, TypeError, IndexError) as e:
+                logger.debug(f"Could not calculate spread for {pair_name}: {e}")
+            
             # Calculate 24h change percentage (same logic as fetch_top_usd_pairs_by_volume)
             change_24h_pct = None
             try:
@@ -549,7 +648,15 @@ def refresh_ticker_data() -> None:
             volume_data[normalized] = {
                 "volume_24h": volume_24h_usd,
                 "change_24h_pct": change_24h_pct,
+                "last_price": last_price if last_price > 0 else None,
             }
+            # Add bid/ask/spread if available
+            if bid_price is not None:
+                volume_data[normalized]["bid"] = bid_price
+            if ask_price is not None:
+                volume_data[normalized]["ask"] = ask_price
+            if spread_bps is not None:
+                volume_data[normalized]["spread_bps"] = spread_bps
         
         # Store all ticker data in Redis
         if volume_data:
@@ -558,6 +665,29 @@ def refresh_ticker_data() -> None:
         
     except Exception as e:
         logger.error(f"Error refreshing ticker data: {e}", exc_info=True)
+
+
+def get_symbol_spread(symbol: str) -> Optional[float]:
+    """
+    Get bid-ask spread in basis points for a symbol from Redis.
+    
+    Args:
+        symbol: Trading pair (e.g., "BTC/USD")
+        
+    Returns:
+        Spread in basis points or None if not available
+    """
+    try:
+        client = get_redis_client()
+        # Normalize symbol before lookup to match stored format
+        normalized_symbol = normalize_symbol(symbol)
+        data = client.hget(SYMBOL_VOLUME_KEY, normalized_symbol)
+        if data:
+            parsed = json.loads(data)
+            return parsed.get("spread_bps")
+    except Exception as e:
+        logger.debug(f"Failed to get spread for {symbol}: {e}")
+    return None
 
 
 def get_symbol_change_24h_pct(symbol: str) -> Optional[float]:
@@ -652,79 +782,52 @@ def get_owned_symbols() -> List[str]:
         Returns empty list if API call fails or no credentials configured.
     """
     logger.info("Fetching owned symbols from Kraken balance...")
-    
+
     try:
-        # Prepare request
-        uri_path = "/0/private/Balance"
-        post_data = {"nonce": generate_nonce()}
-        
-        try:
-            headers = get_auth_headers(uri_path, post_data)
-        except ValueError as e:
-            logger.warning(f"Kraken API credentials not configured: {e}")
-            return []
-        
-        url = f"{KRAKEN_API_URL}{uri_path}"
-        
-        response = requests.post(url, headers=headers, data=post_data, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get("error"):
-            errors = data["error"]
-            if errors:
-                logger.warning(f"Kraken Balance API error: {errors}")
-                return []
-        
-        result = data.get("result", {})
-        if not result:
-            logger.info("No balance data returned from Kraken")
-            return []
-        
-        owned_symbols: List[str] = []
-        
-        for asset, balance_str in result.items():
-            try:
-                balance = float(balance_str)
-            except (ValueError, TypeError):
-                continue
-            
-            # Skip zero or near-zero balances
-            if balance <= 0.0:
-                continue
-            
-            # Normalize asset name (remove leading X/Z for crypto/fiat)
-            symbol = asset
-            if len(asset) == 4 and asset[0] in ("X", "Z"):
-                symbol = asset[1:]
-            
-            # Convert XBT to BTC
-            if symbol == "XBT":
-                symbol = "BTC"
-            
-            # Skip excluded assets (stablecoins, fiat)
-            if asset in EXCLUDED_ASSETS or symbol in EXCLUDED_ASSETS:
-                continue
-            
-            # Form USD pair
-            pair = f"{symbol}/USD"
-            
-            # Double-check: skip stablecoin pairs (even if not in EXCLUDED_ASSETS)
-            if is_stablecoin_pair(pair):
-                logger.debug(f"Skipping stablecoin pair from owned symbols: {pair}")
-                continue
-            
-            owned_symbols.append(pair)
-        
-        logger.info(f"Found {len(owned_symbols)} owned symbols: {owned_symbols}")
-        return owned_symbols
-        
-    except requests.RequestException as e:
-        logger.warning(f"Failed to fetch balance from Kraken: {e}")
-        return []
+        from backend.execution.kraken_cli import get_balance_sync, KrakenCLIError
+        result = get_balance_sync()
     except Exception as e:
-        logger.warning(f"Unexpected error fetching owned symbols: {e}")
+        logger.warning(f"Failed to fetch balance via CLI: {e}")
         return []
+
+    if not result:
+        logger.info("No balance data returned from Kraken CLI")
+        return []
+
+    owned_symbols: List[str] = []
+
+    for asset, balance_str in result.items():
+        try:
+            balance = float(balance_str)
+        except (ValueError, TypeError):
+            continue
+
+        if balance <= 0.0:
+            continue
+
+        # Normalize asset name (remove leading X/Z for crypto/fiat)
+        symbol = asset
+        if len(asset) == 4 and asset[0] in ("X", "Z"):
+            symbol = asset[1:]
+
+        # Convert XBT to BTC
+        if symbol == "XBT":
+            symbol = "BTC"
+
+        # Skip excluded assets (stablecoins, fiat)
+        if asset in EXCLUDED_ASSETS or symbol in EXCLUDED_ASSETS:
+            continue
+
+        pair = f"{symbol}/USD"
+
+        if is_stablecoin_pair(pair):
+            logger.debug(f"Skipping stablecoin pair from owned symbols: {pair}")
+            continue
+
+        owned_symbols.append(pair)
+
+    logger.info(f"Found {len(owned_symbols)} owned symbols: {owned_symbols}")
+    return owned_symbols
 
 
 def get_dynamic_symbols(limit: Optional[int] = None) -> List[str]:
@@ -912,6 +1015,24 @@ def fetch_symbols_by_rvol(
         last_price = float(ticker_data.get("c", [0, 0])[0])
         volume_24h_usd = volume_24h_base * last_price
         
+        # Extract bid/ask for spread calculation (same as refresh_ticker_data)
+        bid_price = None
+        ask_price = None
+        spread_bps = None
+        try:
+            ask_data = ticker_data.get("a")
+            bid_data = ticker_data.get("b")
+            if ask_data and isinstance(ask_data, list) and len(ask_data) > 0:
+                ask_price = float(ask_data[0] if isinstance(ask_data[0], list) else ask_data[0])
+            if bid_data and isinstance(bid_data, list) and len(bid_data) > 0:
+                bid_price = float(bid_data[0] if isinstance(bid_data[0], list) else bid_data[0])
+            
+            if bid_price and ask_price and bid_price > 0 and ask_price > bid_price:
+                mid_price = (ask_price + bid_price) / 2.0
+                spread_bps = ((ask_price - bid_price) / mid_price) * 10000.0
+        except (ValueError, TypeError, IndexError) as e:
+            logger.debug(f"Could not calculate spread for {pair_name}: {e}")
+        
         # Get 24h change percentage
         # Use same calculation method as fetch_top_usd_pairs_by_volume for consistency
         change_24h_pct = None
@@ -959,11 +1080,18 @@ def fetch_symbols_by_rvol(
             continue
         
         usd_pairs.append((normalized, pair_name, volume_24h_usd))
-        # Store volume and change data for Redis
+        # Store volume, change, and spread data for Redis
         volume_change_data[normalized] = {
             "volume_24h": volume_24h_usd,
             "change_24h_pct": change_24h_pct,
         }
+        # Add bid/ask/spread if available
+        if bid_price is not None:
+            volume_change_data[normalized]["bid"] = bid_price
+        if ask_price is not None:
+            volume_change_data[normalized]["ask"] = ask_price
+        if spread_bps is not None:
+            volume_change_data[normalized]["spread_bps"] = spread_bps
     
     # Step 3: Sort by volume and take top candidates for RVOL calculation
     usd_pairs.sort(key=lambda x: x[2], reverse=True)
@@ -1003,6 +1131,31 @@ def fetch_symbols_by_rvol(
             logger.info(f"Stored volume and change data for {len(volume_change_data)} symbols in Redis")
         except Exception as e:
             logger.warning(f"Failed to store volume/change data: {e}")
+    
+    # Ross Cameron spec: Store "Top 10 Obvious" list in Redis cache
+    if top_results:
+        try:
+            from backend.redis import get_redis_client
+            from backend.redis.keys import TOP_10_OBVIOUS_KEY, TOP_10_OBVIOUS_TTL
+            import json
+            
+            redis_client = get_redis_client()
+            top_10_symbols = [symbol for symbol, rvol in top_results[:10]]
+            top_10_data = [
+                {"symbol": symbol, "rvol": rvol}
+                for symbol, rvol in top_results[:10]
+            ]
+            
+            redis_client.setex(
+                TOP_10_OBVIOUS_KEY,
+                TOP_10_OBVIOUS_TTL,
+                json.dumps(top_10_data)
+            )
+            logger.info(
+                f"Stored Top 10 Obvious symbols in Redis: {top_10_symbols}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to store Top 10 Obvious list: {e}")
     
     if top_results:
         logger.info(
@@ -1192,38 +1345,17 @@ def is_in_live_universe(symbol: str) -> bool:
     """
     Check if a symbol is in the live universe (allowed for live trading).
     
-    First checks Redis cache, then falls back to environment variable.
-    Normalizes the symbol before checking to ensure consistent matching.
+    DEPRECATED: All symbols from Kraken are considered live universe.
+    This function always returns True for backward compatibility.
     
     Args:
         symbol: Trading pair symbol (e.g., "BTC/USD", "XETHZ/USD")
         
     Returns:
-        True if symbol is in live universe, False otherwise
+        True (all symbols are considered live universe)
     """
-    # Normalize symbol for consistent matching
-    normalized = normalize_symbol(symbol)
-    
-    # Check Redis cache first (fastest)
-    try:
-        client = get_redis_client()
-        is_member = client.sismember(LIVE_UNIVERSE_KEY, normalized)
-        if is_member:
-            return True
-        
-        # If Redis set is empty, populate it from env and check again
-        set_size = client.scard(LIVE_UNIVERSE_KEY)
-        if set_size == 0:
-            live_universe = get_live_universe()
-            return normalized in live_universe
-        
-        return False
-    except Exception as e:
-        logger.debug(f"Failed to check live universe in Redis: {e}, falling back to env")
-    
-    # Fallback to environment variable
-    live_universe = get_live_universe()
-    return normalized in live_universe
+    # All symbols from Kraken are considered live universe
+    return True
 
 
 def update_universe_with_hysteresis(

@@ -13,7 +13,7 @@ class TestMeanReversionStrategy:
         """Test strategy initialization with default config."""
         strategy = MeanReversionStrategy()
         
-        assert strategy.strategy_id == "meanrev_eth"
+        assert strategy.strategy_id == "mean_reversion"
         assert strategy.config.symbol == "ETH/USD"
         assert strategy.config.lookback_period == 20
         assert strategy.config.rsi_period == 14
@@ -28,7 +28,7 @@ class TestMeanReversionStrategy:
         )
         strategy = MeanReversionStrategy(config)
         
-        assert strategy.strategy_id == "meanrev_eth"
+        assert strategy.strategy_id == "mean_reversion"
         assert strategy.config.lookback_period == 30
         assert strategy.config.rsi_period == 21
         assert strategy.config.notional_risk_pct == 1.5
@@ -237,14 +237,14 @@ class TestMeanReversionStrategy:
             
             # After enough data, we might get a buy signal
             if result is not None and result.side == "buy":
-                assert result.strategy_id == "meanrev_eth"
+                assert result.strategy_id == "mean_reversion"
                 assert result.symbol == "ETH/USD"
                 assert result.side == "buy"
                 assert result.intent_type == "enter"
                 assert result.notional_risk_pct == 2.0
                 assert "rsi" in result.metadata
                 assert "band_position" in result.metadata
-                assert result.metadata["rsi"] < 30.0
+                assert result.metadata["rsi"] < strategy.config.rsi_oversold_threshold
                 return
         
         # If we didn't get a signal, that's okay - it depends on the exact price pattern
@@ -276,7 +276,7 @@ class TestMeanReversionStrategy:
             
             # After enough data, we might get a sell signal
             if result is not None and result.side == "sell":
-                assert result.strategy_id == "meanrev_eth"
+                assert result.strategy_id == "mean_reversion"
                 assert result.symbol == "ETH/USD"
                 assert result.side == "sell"
                 assert result.intent_type == "enter"
@@ -390,7 +390,7 @@ class TestMeanReversionStrategy:
                 signal_generated = True
                 # Verify TradeIntent structure matches contracts/types.md
                 assert isinstance(result, TradeIntent)
-                assert result.strategy_id == "meanrev_eth"
+                assert result.strategy_id == "mean_reversion"
                 assert result.symbol == "ETH/USD"
                 assert result.side in ("buy", "sell")
                 assert result.intent_type == "enter"

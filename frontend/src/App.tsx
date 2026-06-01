@@ -1,12 +1,9 @@
 import { Dashboard } from './pages/Dashboard';
-import { ErrorBoundary } from './components/ErrorBoundary';
+import { MobileDashboard } from './pages/MobileDashboard';
 
 function App() {
-  return (
-    <ErrorBoundary>
-      <Dashboard />
-    </ErrorBoundary>
-  );
+  const isMobile = window.location.pathname.startsWith('/mobile');
+  return isMobile ? <MobileDashboard /> : <Dashboard />;
 }
 
 export default App;

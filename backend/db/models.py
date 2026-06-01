@@ -1,13 +1,23 @@
 """SQLAlchemy ORM models for Omni-Bot Trading Platform."""
 
+import uuid
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
+
 from sqlalchemy import Column, String, Numeric, DateTime, ForeignKey, CheckConstraint, Index, Boolean
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship, declarative_base
-import uuid
 
 Base = declarative_base()
+
+
+def get_strategy_display_name(strategy: Any) -> str:
+    """Return display name for UI: prefer config.name, else format strategy.name."""
+    if strategy.config:
+        name = strategy.config.get("name")
+        if name:
+            return name
+    return (strategy.name or "").replace("_", " ").title()
 
 
 class Strategy(Base):
@@ -98,9 +108,9 @@ class Order(Base):
 
 class EquityCurve(Base):
     """Portfolio snapshots every 15 minutes."""
-    
+
     __tablename__ = "equity_curve"
-    
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     timestamp = Column(DateTime(timezone=True), nullable=False)
     total_equity = Column(Numeric(20, 8), nullable=False)
@@ -108,7 +118,29 @@ class EquityCurve(Base):
     unrealized_pnl = Column(Numeric(20, 8), nullable=False, default=0)
     exposure_pct = Column(Numeric(10, 4), nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
-    
+
     __table_args__ = (
         Index("idx_equity_curve_timestamp", "timestamp"),
+    )
+
+
+class ActivityLog(Base):
+    """Persistent audit log of all log_activity() events."""
+
+    __tablename__ = "activity_log"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    timestamp = Column(DateTime(timezone=True), nullable=False)
+    type = Column(String(100), nullable=False)
+    message = Column(String, nullable=False)
+    details = Column(JSONB, nullable=True)
+    symbol = Column(String(50), nullable=True)
+    strategy = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_activity_log_timestamp", "timestamp"),
+        Index("idx_activity_log_type", "type"),
+        Index("idx_activity_log_symbol", "symbol"),
+        Index("idx_activity_log_type_timestamp", "type", "timestamp"),
     )

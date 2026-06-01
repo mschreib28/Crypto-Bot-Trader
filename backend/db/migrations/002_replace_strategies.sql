@@ -61,7 +61,7 @@ VALUES (
         'volume_threshold', 1.5,
         'parameters', jsonb_build_object(
             'squeeze_percentile', 10.0,
-            'squeeze_lookback_N', 200,
+            'squeeze_lookback_N', 100,
             'vol_compress_mult', 0.9,
             'vol_breakout_mult', 1.5,
             'retest_window_bars', 6,

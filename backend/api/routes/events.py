@@ -5,9 +5,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel
 
+from backend.db.audit import get_audit_writer
 from backend.redis import get_redis_client
 from backend.redis.keys import EVENTS_LOG_KEY
 
@@ -62,12 +63,18 @@ def log_activity(
         
         # LPUSH adds to front of list (newest first)
         client.lpush(EVENTS_LOG_KEY, json.dumps(entry))
-        
+
         # LTRIM keeps only the first N entries (0 to N-1)
         client.ltrim(EVENTS_LOG_KEY, 0, EVENTS_LOG_MAX - 1)
-        
+
         logger.debug(f"Activity logged: [{activity_type}] {message}")
-        
+
+        # Persist to PostgreSQL (non-blocking, fire-and-forget)
+        try:
+            get_audit_writer().enqueue(activity_type, message, details, timestamp)
+        except Exception as pg_err:
+            logger.warning(f"AuditWriter enqueue failed: {pg_err}")
+
     except Exception as e:
         logger.warning(f"Failed to log activity: {e}")
 
@@ -110,6 +117,45 @@ async def list_activity(
         logger.error(f"Error fetching activities: {e}", exc_info=True)
         # Return empty list on error rather than failing
         return ActivityResponse(activities=[])
+
+
+@router.get("/events/export", summary="Download full events log as JSON (attachment)")
+def export_events(
+    limit: int = Query(0, ge=0, description="Must be 0 — exports entire Redis list (no export-time cap)"),
+) -> Response:
+    """
+    Returns a downloadable JSON file (not inline JSON). Only limit=0 is supported.
+    """
+    if limit != 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Only limit=0 is supported (exports the entire Redis events list).",
+        )
+    try:
+        client = get_redis_client()
+        raw_entries = client.lrange(EVENTS_LOG_KEY, 0, -1)
+    except Exception as e:
+        logger.error(f"Error exporting events: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to export events") from e
+
+    rows: List[Dict[str, Any]] = []
+    for raw in raw_entries or []:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            rows.append(json.loads(raw))
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.warning(f"Failed to parse activity entry during export: {e}")
+            continue
+
+    body = json.dumps(rows).encode("utf-8")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"events_export_{ts}.json"
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.delete("/events", summary="Clear event log")

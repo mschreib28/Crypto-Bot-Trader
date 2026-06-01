@@ -57,46 +57,50 @@ async def get_metrics():
         
         for strategy in db_strategies:
             strategy_uuid = str(strategy.id)
-            
-            # Get performance data from recalculated results
-            perf = perf_results.get(strategy_uuid)
-            
-            # Debug: Check if UUID matches
-            if strategy_uuid not in perf_results:
-                logger.warning(f"Strategy UUID {strategy_uuid} not found in perf_results. Available keys: {list(perf_results.keys())}")
-            
-            if perf:
-                logger.info(f"Using performance data for {strategy_uuid}: P&L=${perf.total_pnl:.2f}")
-                # Use performance monitor data (most accurate)
-                logger.info(f"Strategy {strategy_uuid} ({strategy.name}): P&L=${perf.total_pnl:.2f}, trades={perf.total_trades}")
-                strategies[strategy_uuid] = StrategyMetricsItem(
-                    accuracy_pct=perf.win_rate,
-                    total_pnl=perf.total_pnl,
-                    win_count=perf.winning_trades,
-                    loss_count=perf.losing_trades,
-                    open_count=legacy_data["strategies"].get(strategy_uuid, {}).get("open_count", 0),
-                )
-                # Also add name mapping
-                strategies[strategy.name] = StrategyMetricsItem(
-                    accuracy_pct=perf.win_rate,
-                    total_pnl=perf.total_pnl,
-                    win_count=perf.winning_trades,
-                    loss_count=perf.losing_trades,
-                    open_count=legacy_data["strategies"].get(strategy_uuid, {}).get("open_count", 0),
-                )
-                total_pnl += perf.total_pnl
-                total_wins += perf.winning_trades
-                total_losses += perf.losing_trades
+
+            # Open-position unrealized P&L: recalculate_all_metrics keys may be name or UUID
+            perf = perf_results.get(strategy_uuid) or perf_results.get(strategy.name)
+            unrealized_pnl = perf.total_pnl if perf else 0.0
+
+            # Legacy metrics track closed trades: accuracy, win/loss counts, realized P&L
+            legacy_stats = legacy_data["strategies"].get(strategy_uuid, {})
+            if legacy_stats:
+                accuracy_pct = legacy_stats["accuracy_pct"]
+                win_count = legacy_stats["win_count"]
+                loss_count = legacy_stats["loss_count"]
+                realized_pnl = legacy_stats["total_pnl"]
+                open_count = legacy_stats["open_count"]
+            elif perf:
+                # No closed trades yet — use open-position data as best approximation
+                accuracy_pct = perf.win_rate
+                win_count = perf.winning_trades
+                loss_count = perf.losing_trades
+                realized_pnl = 0.0
+                open_count = perf.total_trades
+                unrealized_pnl = perf.total_pnl
             else:
-                logger.warning(f"No performance data found for strategy {strategy_uuid} ({strategy.name})")
-                # Fall back to legacy metrics if no performance data
-                legacy_stats = legacy_data["strategies"].get(strategy_uuid, {})
-                if legacy_stats:
-                    strategies[strategy_uuid] = StrategyMetricsItem(**legacy_stats)
-                    strategies[strategy.name] = StrategyMetricsItem(**legacy_stats)
-                    total_pnl += legacy_stats.get("total_pnl", 0.0)
-                    total_wins += legacy_stats.get("win_count", 0)
-                    total_losses += legacy_stats.get("loss_count", 0)
+                logger.debug(f"No metrics data for strategy {strategy_uuid} ({strategy.name})")
+                continue
+
+            combined_pnl = round(realized_pnl + unrealized_pnl, 4)
+            logger.info(
+                f"Strategy {strategy.name}: realized=${realized_pnl:.2f} "
+                f"unrealized=${unrealized_pnl:.2f} combined=${combined_pnl:.2f} "
+                f"accuracy={accuracy_pct:.1f}%"
+            )
+
+            item = StrategyMetricsItem(
+                accuracy_pct=accuracy_pct,
+                total_pnl=combined_pnl,
+                win_count=win_count,
+                loss_count=loss_count,
+                open_count=open_count,
+            )
+            strategies[strategy_uuid] = item
+            strategies[strategy.name] = item
+            total_pnl += combined_pnl
+            total_wins += win_count
+            total_losses += loss_count
         
         # Add any strategies from legacy metrics that aren't in performance monitor
         # Only add if not already present (performance monitor takes precedence)

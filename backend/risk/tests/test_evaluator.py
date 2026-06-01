@@ -1,9 +1,12 @@
 """Unit tests for the risk evaluator."""
 
+from unittest.mock import Mock, patch
+
 import pytest
 from datetime import datetime, timezone
 
 from backend.risk.evaluator import evaluate_intent, TradeIntent
+from backend.risk.micro_mode import check_entry_position_limits
 from backend.risk.models import RiskDecision
 
 
@@ -128,3 +131,52 @@ def test_evaluate_intent_returns_risk_decision():
         assert decision.rejection_reason is not None
     else:
         assert decision.rejection_reason is None
+
+
+def test_check_entry_position_limits_rejects_live_pending():
+    tracker = Mock()
+    tracker.get_position_status = Mock(return_value="PENDING")
+    ok, reason = check_entry_position_limits("BTC/USD", "htf_trend", tracker)
+    assert ok is False
+    assert reason is not None
+    assert "symbol_slot_occupied" in reason
+
+
+def test_check_entry_position_limits_shadow_ignores_total_count():
+    tracker = Mock()
+    tracker.get_position_status = Mock(return_value="SCANNING")
+    tracker.get_all_positions = Mock(return_value=[Mock(), Mock(), Mock()])
+    with patch("backend.api.routes.trading.get_bot_mode", return_value="SHADOW"):
+        with patch(
+            "backend.supervisor.store.get_effective_mode", return_value=("LIVE", 1.0)
+        ):
+            ok, reason = check_entry_position_limits("ALT/USD", "htf_trend", tracker)
+    assert ok is True
+    assert reason is None
+
+
+def test_check_entry_position_limits_live_live_caps_total():
+    tracker = Mock()
+    tracker.get_position_status = Mock(return_value="SCANNING")
+    tracker.get_all_positions = Mock(return_value=[Mock(), Mock()])
+    with patch("backend.api.routes.trading.get_bot_mode", return_value="LIVE"):
+        with patch(
+            "backend.supervisor.store.get_effective_mode", return_value=("LIVE", 1.0)
+        ):
+            ok, reason = check_entry_position_limits("ALT/USD", "htf_trend", tracker)
+    assert ok is False
+    assert reason is not None
+    assert "max_positions_reached" in reason
+
+
+def test_check_entry_position_limits_sim_strategy_ignores_total():
+    tracker = Mock()
+    tracker.get_position_status = Mock(return_value="SCANNING")
+    tracker.get_all_positions = Mock(return_value=[Mock(), Mock()])
+    with patch("backend.api.routes.trading.get_bot_mode", return_value="LIVE"):
+        with patch(
+            "backend.supervisor.store.get_effective_mode", return_value=("SIM", 1.0)
+        ):
+            ok, reason = check_entry_position_limits("ALT/USD", "htf_trend", tracker)
+    assert ok is True
+    assert reason is None

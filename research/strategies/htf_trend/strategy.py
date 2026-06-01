@@ -10,9 +10,14 @@ Strategy 3: HTF Trend Pullback Continuation
 import logging
 from collections import deque
 from datetime import datetime, timezone
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from research.strategies.base import BaseStrategy
+from research.strategies.btc_daily_regime import (
+    btc_daily_bars_pass_bull_filter_at_ts,
+    fetch_btc_daily_bars,
+    slice_btc_daily_bars_up_to_ts,
+)
 from research.strategies.indicators import (
     calculate_adx_full,
     calculate_atr,
@@ -52,6 +57,7 @@ class HTFTrendStrategy(BaseStrategy):
         # In-memory state
         self._bars: Deque[MarketDataEvent] = deque(maxlen=200)
         self._htf_bars: Deque[MarketDataEvent] = deque(maxlen=200)
+        self._btc_daily_cache: List[MarketDataEvent] = []
         
         logger.info(
             f"Initialized HTFTrendStrategy: "
@@ -131,7 +137,34 @@ class HTFTrendStrategy(BaseStrategy):
         except Exception as e:
             logger.error(f"Error qualifying trend: {e}", exc_info=True)
             return (None, f"trend_qualification_error: {str(e)}")
-    
+
+    def _ensure_btc_daily_cache(self) -> None:
+        need = self.config.btc_ema_period + 50
+        if len(self._btc_daily_cache) >= need:
+            return
+        self._btc_daily_cache = fetch_btc_daily_bars(
+            self.strategy_id, count=max(400, need)
+        )
+
+    def _passes_btc_bull_market(self, entry_ts: Any) -> bool:
+        if not self.config.require_btc_bull_market:
+            return True
+        self._ensure_btc_daily_cache()
+        if len(self._btc_daily_cache) < self.config.btc_ema_period:
+            logger.debug("BTC bull gate: insufficient Redis 1d BTC history")
+            return False
+        sub = slice_btc_daily_bars_up_to_ts(self._btc_daily_cache, entry_ts)
+        ok = btc_daily_bars_pass_bull_filter_at_ts(
+            sub, entry_ts, self.config.btc_ema_period
+        )
+        if not ok:
+            logger.debug(
+                "BTC bull gate: close not above EMA(%s) at %s",
+                self.config.btc_ema_period,
+                entry_ts,
+            )
+        return ok
+
     def _check_late_entry_filter(
         self,
         bars: List[MarketDataEvent],
@@ -323,7 +356,10 @@ class HTFTrendStrategy(BaseStrategy):
         # Check entry confirmation
         if not self._check_entry_confirmation(bar, trend_direction, ema20):
             return None
-        
+
+        if trend_direction == "bullish" and not self._passes_btc_bull_market(bar.timestamp):
+            return None
+
         # Calculate ATR
         atr = calculate_atr(highs, lows, closes, period=self.config.atr_period)
         if atr is None or atr == 0:
@@ -498,13 +534,22 @@ class HTFTrendStrategy(BaseStrategy):
                     # Pullback detected
                     pullback_score = 30.0
                     confidence += pullback_score
-                    
+
                     # Entry confirmation (check last bar)
                     last_bar = bar_events[-1] if bar_events else None
-                    if last_bar and self._check_entry_confirmation(last_bar, trend_direction, ema20):
-                        confirmation_score = 30.0
-                        confidence += confirmation_score
-                        signal_type = "BUY" if trend_direction == 'bullish' else "SELL"
+                    if last_bar and self._check_entry_confirmation(
+                        last_bar, trend_direction, ema20
+                    ):
+                        if trend_direction == "bullish" and not self._passes_btc_bull_market(
+                            last_bar.timestamp
+                        ):
+                            signal_type = "NONE"
+                        else:
+                            confirmation_score = 30.0
+                            confidence += confirmation_score
+                            signal_type = (
+                                "BUY" if trend_direction == "bullish" else "SELL"
+                            )
             
             return SignalResult(
                 symbol=symbol,

@@ -36,6 +36,7 @@ from backend.risk.micro_mode import (
     check_min_stop_distance,
     check_min_notional,
     check_max_positions,
+    check_entry_position_limits,
     get_micro_mode_status,
 )
 
@@ -75,5 +76,6 @@ __all__ = [
     "check_min_stop_distance",
     "check_min_notional",
     "check_max_positions",
+    "check_entry_position_limits",
     "get_micro_mode_status",
 ]

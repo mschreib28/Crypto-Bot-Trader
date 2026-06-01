@@ -34,7 +34,7 @@ async def panic():
     """
     try:
         logger.warning("Panic endpoint called")
-        result = execute_panic_sequence()
+        result = await execute_panic_sequence()
         return result
     except Exception as e:
         logger.error(f"Unexpected error in panic endpoint: {e}")

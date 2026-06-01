@@ -1,6 +1,7 @@
-import { useState, useMemo, memo, useCallback } from 'react';
-import { useScreener, ScreenerSignal, SignalType } from '../hooks/useScreener';
+import { useState, useMemo, memo, useCallback, useRef, useEffect } from 'react';
+import { useScreener, ScreenerSignal, ScreenerIndicators } from '../hooks/useScreener';
 import { useRealtimePositions } from '../hooks/useRealtimePositions';
+import { CriteriaModal } from './CriteriaModal';
 
 // Formatting helpers
 function formatTimestamp(isoString: string | null): string {
@@ -17,40 +18,25 @@ function formatTimestamp(isoString: string | null): string {
   }
 }
 
-function getSignalColor(signal: SignalType): string {
-  switch (signal) {
-    case 'BUY':
-      return 'text-green-400';
-    case 'SELL':
-      return 'text-red-400';
-    case 'NONE':
-    default:
-      return 'text-gray-500';
-  }
-}
+// Removed unused getSignalColor - using getSignalStrengthColor instead
 
 function getSignalStrengthColor(confidence: number | undefined, signalType: string | undefined): string {
   if (confidence === undefined || confidence === null || isNaN(confidence)) {
     return 'text-gray-500';
   }
-  
-  // Low confidence (< 50%): Dark grey, low visibility
+  // Low Conviction (< 50%): Grey
   if (confidence < 50) {
     return 'text-gray-600';
   }
-  
-  // Medium confidence (50-79%): Muted color (Yellow/Grey)
-  if (confidence < 80) {
-    return 'text-yellow-500';
-  }
-  
-  // High confidence (>= 80%): High-visibility color based on signal type
+  // Buy Signal (50%+): Green
   if (signalType === 'BUY') {
-    return 'text-green-400'; // Neon Green for BUY
-  } else if (signalType === 'SELL') {
-    return 'text-red-400'; // Red for SELL
+    return 'text-green-400';
   }
-  
+  // Sell Signal (50%+): Red
+  if (signalType === 'SELL') {
+    return 'text-red-400';
+  }
+  // NONE or unknown with 50%+: default to grey (no direction)
   return 'text-gray-500';
 }
 
@@ -115,13 +101,66 @@ function getStatusBadgeColor(status: string | undefined): string {
   }
 }
 
+// ── Pillar mini-badges ────────────────────────────────────────────────────────
+// Shows 7 colored dots (S1 S2 S3 / D1 D2 D3 D4) representing each pipeline pillar.
+// Green = pass, Red = fail, Gray = no data
+const PILLAR_ORDER = ['s1_supply', 's2_price', 's3_listing', 'd1_rvol', 'd2_momentum', 'd3_volume', 'd4_btc'] as const;
+const PILLAR_LABELS: Record<string, string> = {
+  s1_supply: 'S', s2_price: 'P', s3_listing: 'L',
+  d1_rvol: 'V', d2_momentum: 'M', d3_volume: '$', d4_btc: 'B',
+};
+const PILLAR_TITLES: Record<string, string> = {
+  s1_supply: 'S1: Circulating Supply <5B',
+  s2_price: 'S2: Price $0.005–$10',
+  s3_listing: 'S3: Active 20+ of last 30 days',
+  d1_rvol: 'D1: RVOL >3× (relative volume)',
+  d2_momentum: 'D2: Momentum +8%/24h or +5%/4h',
+  d3_volume: 'D3: Volume $500K–$50M',
+  d4_btc: 'D4: BTC not down >4%/4h',
+};
+
+function PillarBadges({ pillars }: { pillars?: ScreenerIndicators['pillars'] }) {
+  if (!pillars) return null;
+  return (
+    <div className="flex gap-0.5 mt-0.5 justify-end">
+      {PILLAR_ORDER.map((key) => {
+        const p = pillars[key];
+        const bg = !p
+          ? 'bg-gray-700'
+          : p.pass
+            ? 'bg-green-500'
+            : 'bg-red-600';
+        const title = `${PILLAR_TITLES[key]}: ${!p ? 'N/A' : p.pass ? 'Pass' : 'Fail'}${p?.value != null ? ` (${String(p.value)})` : ''}`;
+        return (
+          <span
+            key={key}
+            title={title}
+            className={`inline-flex items-center justify-center w-3 h-3 rounded-sm text-[6px] font-bold text-white leading-none ${bg}`}
+          >
+            {PILLAR_LABELS[key]}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+const DEFAULT_COL_WIDTHS: Record<string, number> = {
+  score: 72, symbol: 88, price: 80, rvol: 80, market_cap: 90, supply_ratio: 72, spread_bps: 80,
+  change_24h_pct: 90, vwap_dist_pct: 95, hod_dist_pct: 95, htf_trend: 80,
+  signal_lead: 110, signal_strength: 100, status: 90,
+};
+
+const MIN_COL_WIDTH = 48;
+
 interface SignalRowProps {
   signal: ScreenerSignal;
   isEven: boolean;
   realtimePosition?: { current_pnl_pct?: number; time_minutes?: number; status?: string };
+  colWidths?: Record<string, number>;
 }
 
-const SignalRow = memo(function SignalRow({ signal: data, isEven, realtimePosition }: SignalRowProps) {
+const SignalRow = memo(function SignalRow({ signal: data, isEven, realtimePosition, colWidths }: SignalRowProps) {
   // Handle rvol: prefer rvol_pct if available (already percentage), otherwise use rvol (decimal) and multiply by 100
   const rvolPct = data.indicators.rvol_pct as number | undefined;
   const rvolDecimal = data.indicators.rvol as number | undefined;
@@ -134,31 +173,37 @@ const SignalRow = memo(function SignalRow({ signal: data, isEven, realtimePositi
 
   // Visual logic
   const scoreHighlight = score > 0.85 ? 'border-l-4 border-l-green-500 shadow-[0_0_10px_rgba(34,197,94,0.3)]' : '';
-  const rvolBold = (rvol ?? 0) > 5.0 ? 'font-bold text-green-400' : 'text-gray-300';
+  const rvolBold = (rvol ?? 0) > 500 ? 'font-bold text-green-400' : 'text-gray-300';
   const spreadMuted = (data.indicators.spread_bps ?? 0) > 15 ? 'text-gray-400 opacity-60' : 'text-gray-300';
 
   const rowBg = isEven ? 'bg-gray-800/50' : 'bg-gray-850';
 
+  const cellStyle = (key: string) => colWidths ? { width: colWidths[key], minWidth: MIN_COL_WIDTH } : undefined;
+
   return (
     <tr className={`${rowBg} border-b border-gray-700/30 hover:bg-gray-700/50 transition-colors ${scoreHighlight}`}>
       {/* Pillars Group */}
-      <td className={`py-1.5 pr-2 font-semibold text-xs text-right ${getGradeColor(grade)}`}>
-        {grade || '—'}
+      <td style={cellStyle('score')} className={`py-1 pr-2 font-semibold text-xs text-right ${getGradeColor(grade)}`}>
+        <div>{grade || '—'}</div>
+        <PillarBadges pillars={data.indicators.pillars} />
       </td>
-      <td className="py-1.5 pl-2 pr-2 text-gray-200 font-medium text-xs">{data.symbol}</td>
-      <td className={`py-1.5 pr-2 font-mono text-xs text-right ${rvolBold}`}>
+      <td style={cellStyle('symbol')} className="py-1.5 pl-2 pr-2 text-gray-200 font-medium text-xs">{data.symbol}</td>
+      <td style={cellStyle('price')} className="py-1.5 pr-2 font-mono text-xs text-right text-gray-300">
+        {data.indicators.price != null ? `$${data.indicators.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: data.indicators.price < 1 ? 4 : 2 })}` : '—'}
+      </td>
+      <td style={cellStyle('rvol')} className={`py-1.5 pr-2 font-mono text-xs text-right ${rvolBold}`}>
         {rvol != null ? `${rvol.toFixed(0)}%` : '—'}
       </td>
-      <td className="py-1.5 pr-2 text-gray-300 font-mono text-xs text-right">
+      <td style={cellStyle('market_cap')} className="py-1.5 pr-2 text-gray-300 font-mono text-xs text-right">
         {formatMarketCap(data.indicators.market_cap)}
       </td>
-      <td className="py-1.5 pr-2 text-gray-300 font-mono text-xs text-right">
+      <td style={cellStyle('supply_ratio')} className="py-1.5 pr-2 text-gray-300 font-mono text-xs text-right">
         {formatSupplyRatio(data.indicators.supply_ratio)}
       </td>
-      <td className={`py-1.5 pr-2 font-mono text-xs text-right ${spreadMuted}`}>
+      <td style={cellStyle('spread_bps')} className={`py-1.5 pr-2 font-mono text-xs text-right ${spreadMuted}`}>
         {formatSpread(data.indicators.spread_bps)}
       </td>
-      <td className={`py-1.5 pr-2 font-mono text-xs text-right ${
+      <td style={cellStyle('change_24h_pct')} className={`py-1.5 pr-2 font-mono text-xs text-right ${
         typeof change24h === 'number' 
           ? change24h >= 0 ? 'text-green-400' : 'text-red-400'
           : 'text-gray-400'
@@ -169,13 +214,13 @@ const SignalRow = memo(function SignalRow({ signal: data, isEven, realtimePositi
       </td>
       
       {/* Strategies Group */}
-      <td className="py-1.5 pr-2 text-gray-300 font-mono text-xs text-right whitespace-nowrap">
+      <td style={cellStyle('vwap_dist_pct')} className="py-1.5 pr-2 text-gray-300 font-mono text-xs text-right whitespace-nowrap">
         {formatVwapDist(data.indicators.vwap_dist_pct)}
       </td>
-      <td className="py-1.5 pr-2 text-gray-300 font-mono text-xs text-right whitespace-nowrap">
+      <td style={cellStyle('hod_dist_pct')} className="py-1.5 pr-2 text-gray-300 font-mono text-xs text-right whitespace-nowrap">
         {formatHodDist(data.indicators.hod_dist_pct)}
       </td>
-      <td className="py-1.5 pr-2 text-center whitespace-nowrap">
+      <td style={cellStyle('htf_trend')} className="py-1.5 pr-2 text-center whitespace-nowrap">
         {data.indicators.htf_trend === 'UP' ? (
           <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-green-600/20 text-green-400 border border-green-600/50">
             UP
@@ -189,30 +234,33 @@ const SignalRow = memo(function SignalRow({ signal: data, isEven, realtimePositi
         )}
       </td>
       {/* Signal Lead - Strategy Name */}
-      <td className="py-1.5 pr-2 text-gray-300 text-xs whitespace-nowrap">
+      <td style={cellStyle('signal_lead')} className="py-1.5 pr-2 text-gray-300 text-xs whitespace-nowrap">
         <div className="max-w-[180px] truncate" title={(() => {
           const signalLead = data.indicators.signal_lead;
           if (!signalLead || signalLead === null || signalLead === undefined) return undefined;
           if (typeof signalLead === 'object' && signalLead !== null) {
-            const obj = signalLead as {strategy_name?: string; signal_type?: string; confidence?: number};
-            if (obj.strategy_name === 'Low Conviction' || obj.signal_type === 'NONE') {
-              return `Low Conviction (${obj.confidence?.toFixed(1) || 0}%)`;
+            const obj = signalLead as {strategy_name?: string; signal_type?: string; confidence?: number; all_signals?: Array<{strategy_name: string; confidence: number; signal_type: string}>};
+            // Show all strategies when available (e.g. "VWAP 7%, Volatility 4%")
+            if (Array.isArray(obj.all_signals) && obj.all_signals.length > 0) {
+              return obj.all_signals.map(s => `${s.strategy_name} ${Math.round(s.confidence)}%`).join(', ');
             }
-            return obj.strategy_name || undefined;
+            if (obj.strategy_name === 'Low Conviction') return `Low Conviction (${obj.confidence?.toFixed(1) || 0}%)`;
+            if (obj.strategy_name) return `${obj.strategy_name} (${obj.confidence?.toFixed(1) ?? 0}%)`;
+            return undefined;
           }
           return undefined;
         })()}>
           {(() => {
             const signalLead = data.indicators.signal_lead;
             if (!signalLead || signalLead === null || signalLead === undefined) {
-              return 'Neutral';
+              // B rank and below: show "—" (not calculated). A+ and A: show "Neutral"
+              const g = data.indicators.grade as string | undefined;
+              return (g === 'A+' || g === 'A') ? 'Neutral' : '—';
             }
             if (typeof signalLead === 'object' && signalLead !== null) {
               const obj = signalLead as {strategy_name?: string; signal_type?: string};
-              // Show "Low Conviction" or "Neutral" for weak signals
-              if (obj.strategy_name === 'Low Conviction' || obj.signal_type === 'NONE') {
-                return obj.strategy_name === 'Low Conviction' ? 'Low Conviction' : 'Neutral';
-              }
+              if (obj.strategy_name === 'Low Conviction') return 'Low Conviction';
+              // Always show strategy name when present (e.g. "VWAP Mean Reversion"), even for NONE signals
               return obj.strategy_name || 'Neutral';
             }
             return 'Neutral';
@@ -221,6 +269,7 @@ const SignalRow = memo(function SignalRow({ signal: data, isEven, realtimePositi
       </td>
       {/* Signal Strength - Confidence Percentage */}
       <td 
+        style={cellStyle('signal_strength')}
         className={`py-1.5 pr-2 font-semibold text-xs whitespace-nowrap ${
           (() => {
             const sl = data.indicators.signal_lead;
@@ -245,9 +294,14 @@ const SignalRow = memo(function SignalRow({ signal: data, isEven, realtimePositi
           const sl = data.indicators.signal_lead;
           if (!sl) return undefined;
           if (typeof sl === 'object' && sl !== null && 'signal_type' in sl && 'confidence' in sl) {
-            const obj = sl as {signal_type: string; confidence: number; meets_execution_threshold?: boolean};
+            const obj = sl as {signal_type: string; confidence: number; meets_execution_threshold?: boolean; all_signals?: Array<{strategy_name: string; confidence: number; signal_type: string}>};
             const threshold = obj.meets_execution_threshold ? ' (Meets threshold)' : ' (Below threshold)';
-            return `${obj.signal_type} ${obj.confidence}%${threshold}`;
+            const base = `${obj.signal_type} ${obj.confidence}%${threshold}`;
+            if (Array.isArray(obj.all_signals) && obj.all_signals.length > 1) {
+              const all = obj.all_signals.map(s => `${s.strategy_name}: ${Math.round(s.confidence)}%`).join(' | ');
+              return `${base}\n\nAll strategies: ${all}`;
+            }
+            return base;
           }
           return typeof sl === 'string' ? sl : undefined;
         })()}
@@ -267,10 +321,10 @@ const SignalRow = memo(function SignalRow({ signal: data, isEven, realtimePositi
           
           // Handle object format (new format)
           if (typeof signalLead === 'object' && signalLead !== null) {
-            const obj = signalLead as {confidence?: number; signal_type?: string; strategy_name?: string};
+            const obj = signalLead as {confidence?: number; signal_type?: string; strategy_name?: string; is_low_conviction?: boolean};
             if (typeof obj.confidence === 'number' && !isNaN(obj.confidence)) {
-              // Show "Low Conviction" text for confidence < 50%
-              if (obj.confidence < 50 || obj.strategy_name === 'Low Conviction' || obj.signal_type === 'NONE') {
+              // Show "Low Conviction (X%)" when explicitly marked or confidence < 50%
+              if (obj.is_low_conviction === true || obj.confidence < 50) {
                 return `Low Conviction (${Math.round(obj.confidence)}%)`;
               }
               return `${Math.round(obj.confidence)}%`;
@@ -283,7 +337,7 @@ const SignalRow = memo(function SignalRow({ signal: data, isEven, realtimePositi
       </td>
       
       {/* Active Trade Group */}
-      <td className="py-1.5 pr-2 whitespace-nowrap">
+      <td style={cellStyle('status')} className="py-1.5 pr-2 whitespace-nowrap">
         <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium ${getStatusBadgeColor(status)}`}>
           {status}
         </span>
@@ -292,12 +346,77 @@ const SignalRow = memo(function SignalRow({ signal: data, isEven, realtimePositi
   );
 });
 
+function ResizeHandle({
+  columnKey,
+  onResizeStart,
+  isResizing,
+}: {
+  columnKey: string;
+  onResizeStart: (e: React.MouseEvent) => void;
+  isResizing: boolean;
+}) {
+  const handleMouseDown = (e: React.MouseEvent) => {
+    onResizeStart(e);
+  };
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize column"
+      data-column={columnKey}
+      onMouseDown={handleMouseDown}
+      className={`absolute right-0 top-0 bottom-0 w-3 cursor-col-resize touch-none select-none z-30
+        hover:bg-blue-500/70 ${isResizing ? 'bg-blue-500' : ''}`}
+      style={{ marginRight: -12, minWidth: 12 }}
+    />
+  );
+}
+
 export function ScreenerPanel() {
   const [sortColumn, setSortColumn] = useState<string | null>('score');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
+  const [colWidths, setColWidths] = useState<Record<string, number>>(() => ({ ...DEFAULT_COL_WIDTHS }));
+  const [resizingColumn, setResizingColumn] = useState<string | null>(null);
+  const resizeRef = useRef<{ key: string; startX: number; startW: number } | null>(null);
+  const [criteriaModal, setCriteriaModal] = useState<{ symbol?: string; indicators?: ScreenerIndicators } | null>(null);
 
   const { signals, loading, error, lastScan } = useScreener({ topN: 100 });
 
+  const handleResizeStart = useCallback((key: string) => (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    resizeRef.current = { key, startX: e.clientX, startW: colWidths[key] ?? DEFAULT_COL_WIDTHS[key] };
+    setResizingColumn(key);
+  }, [colWidths]);
+
+  useEffect(() => {
+    if (!resizingColumn) return;
+    const onMove = (e: MouseEvent) => {
+      const r = resizeRef.current;
+      if (!r) return;
+      const delta = e.clientX - r.startX;
+      setColWidths((prev) => {
+        const next = { ...prev };
+        next[r.key] = Math.max(MIN_COL_WIDTH, r.startW + delta);
+        return next;
+      });
+    };
+    const onUp = () => {
+      resizeRef.current = null;
+      setResizingColumn(null);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    return () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+  }, [resizingColumn]);
+  
   // Get symbols with active positions for real-time polling
   const activeSymbols = useMemo(() => {
     return signals
@@ -311,6 +430,21 @@ export function ScreenerPanel() {
   const { positions: realtimePositions } = useRealtimePositions(activeSymbols);
 
   // Merge realtime position data into signals
+  const activeLeadStrategyName = useMemo(() => {
+    let best: string | undefined;
+    let bestConf = -1;
+    for (const s of signals) {
+      const lead = s.indicators?.signal_lead;
+      const name = lead?.strategy_name;
+      const c = typeof lead?.confidence === 'number' ? lead.confidence : -1;
+      if (name && c > bestConf) {
+        bestConf = c;
+        best = name;
+      }
+    }
+    return best ?? null;
+  }, [signals]);
+
   const enrichedSignals = useMemo(() => {
     return signals.map(signal => {
       const realtimePos = realtimePositions.get(signal.symbol);
@@ -369,27 +503,41 @@ export function ScreenerPanel() {
     }
   }, [sortColumn, sortDirection]);
 
+  // Active-position rank: symbols with an open trade always appear at the top
+  const isActivePosition = (signal: ScreenerSignal): boolean => {
+    const s = signal.indicators.status;
+    return s === 'LIVE' || s === 'PENDING' || s === 'EXITING';
+  };
+
   // Sort signals
   const sortedSignals = useMemo(() => {
-    if (!sortColumn) return enrichedSignals;
-    return [...enrichedSignals].sort((a, b) => {
-      const aVal = getSortValue(a, sortColumn);
-      const bVal = getSortValue(b, sortColumn);
-      
-      if (sortColumn === 'symbol') {
-        const multiplier = sortDirection === 'asc' ? 1 : -1;
-        return multiplier * String(aVal).localeCompare(String(bVal));
-      }
-      
-      if (sortColumn === 'signal_lead' || sortColumn === 'signal_strength') {
-        const multiplier = sortDirection === 'asc' ? 1 : -1;
-        return multiplier * ((aVal as number) - (bVal as number));
-      }
-      
-      const multiplier = sortDirection === 'asc' ? 1 : -1;
-      const numA = typeof aVal === 'number' ? aVal : 0;
-      const numB = typeof bVal === 'number' ? bVal : 0;
-      return multiplier * (numA - numB);
+    const baseList = !sortColumn
+      ? enrichedSignals
+      : [...enrichedSignals].sort((a, b) => {
+          const aVal = getSortValue(a, sortColumn);
+          const bVal = getSortValue(b, sortColumn);
+
+          if (sortColumn === 'symbol') {
+            const multiplier = sortDirection === 'asc' ? 1 : -1;
+            return multiplier * String(aVal).localeCompare(String(bVal));
+          }
+
+          if (sortColumn === 'signal_lead' || sortColumn === 'signal_strength') {
+            const multiplier = sortDirection === 'asc' ? 1 : -1;
+            return multiplier * ((aVal as number) - (bVal as number));
+          }
+
+          const multiplier = sortDirection === 'asc' ? 1 : -1;
+          const numA = typeof aVal === 'number' ? aVal : 0;
+          const numB = typeof bVal === 'number' ? bVal : 0;
+          return multiplier * (numA - numB);
+        });
+
+    // Pin in-position symbols to the top regardless of column sort
+    return [...baseList].sort((a, b) => {
+      const aActive = isActivePosition(a) ? 0 : 1;
+      const bActive = isActivePosition(b) ? 0 : 1;
+      return aActive - bActive;
     });
   }, [enrichedSignals, sortColumn, sortDirection, getSortValue]);
 
@@ -399,18 +547,37 @@ export function ScreenerPanel() {
       aria-labelledby="screener-panel-title"
     >
       <div className="flex items-center justify-between mb-2">
-        <h2
-          id="screener-panel-title"
-          className="text-base font-semibold text-white"
-        >
-          Scanner
-        </h2>
+        <div className="flex items-center gap-2">
+          <h2
+            id="screener-panel-title"
+            className="text-base font-semibold text-white"
+          >
+            Scanner
+          </h2>
+          <button
+            onClick={() => setCriteriaModal({})}
+            title="View scanner criteria and grading system"
+            className="flex items-center justify-center w-4 h-4 rounded-full border border-gray-500 text-gray-400 hover:text-gray-200 hover:border-gray-300 transition-colors text-[10px] font-bold leading-none"
+            aria-label="Scanner criteria info"
+          >
+            i
+          </button>
+        </div>
         {lastScan && (
           <span className="text-xs text-gray-500">
             Last: {formatTimestamp(lastScan)}
           </span>
         )}
       </div>
+
+      {criteriaModal !== null && (
+        <CriteriaModal
+          onClose={() => setCriteriaModal(null)}
+          symbol={criteriaModal.symbol}
+          indicators={criteriaModal.indicators}
+          activeLeadStrategyName={activeLeadStrategyName}
+        />
+      )}
 
       {loading && (
         <div className="flex-1 flex flex-col items-center justify-center text-gray-400">
@@ -437,11 +604,14 @@ export function ScreenerPanel() {
 
       {!loading && !error && sortedSignals.length > 0 && (
         <div className="overflow-auto flex-1">
-          <table className="w-full text-xs">
-            <thead className="sticky top-0 bg-gray-800">
+          <table className="w-full text-xs table-fixed">
+            <thead className="sticky top-0 bg-gray-800 z-10 [&_th]:overflow-visible">
               <tr className="border-b border-gray-600 text-gray-400 text-left">
                 {/* Pillars Group */}
-                <th className="py-1.5 pr-2 font-medium text-right border-r border-gray-600">
+                <th
+                  style={{ width: colWidths.score, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pr-2 font-medium text-right border-r border-gray-600 relative"
+                >
                   <div className="text-xs text-gray-500 mb-1">PILLARS</div>
                   <div 
                     className="cursor-pointer hover:bg-gray-700 transition-colors"
@@ -449,46 +619,93 @@ export function ScreenerPanel() {
                   >
                     A+ Score {sortColumn === 'score' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
                   </div>
+                  <ResizeHandle columnKey="score" onResizeStart={handleResizeStart('score')} isResizing={resizingColumn === 'score'} />
                 </th>
-                <th 
-                  className="py-1.5 pl-2 pr-2 font-medium cursor-pointer hover:bg-gray-700 transition-colors"
-                  onClick={() => handleSort('symbol')}
+                <th
+                  style={{ width: colWidths.symbol, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pl-2 pr-2 font-medium relative"
                 >
-                  Symbol {sortColumn === 'symbol' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  <div
+                    className="cursor-pointer hover:bg-gray-700 transition-colors"
+                    onClick={() => handleSort('symbol')}
+                  >
+                    Symbol {sortColumn === 'symbol' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  </div>
+                  <ResizeHandle columnKey="symbol" onResizeStart={handleResizeStart('symbol')} isResizing={resizingColumn === 'symbol'} />
                 </th>
-                <th 
-                  className="py-1.5 pr-2 font-medium text-right cursor-pointer hover:bg-gray-700 transition-colors"
-                  onClick={() => handleSort('rvol')}
+                <th
+                  style={{ width: colWidths.price, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pr-2 font-medium text-right relative"
                 >
-                  RVOL (1h) {sortColumn === 'rvol' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  <div>Price</div>
+                  <ResizeHandle columnKey="price" onResizeStart={handleResizeStart('price')} isResizing={resizingColumn === 'price'} />
                 </th>
-                <th 
-                  className="py-1.5 pr-2 font-medium text-right cursor-pointer hover:bg-gray-700 transition-colors"
-                  onClick={() => handleSort('market_cap')}
+                <th
+                  style={{ width: colWidths.rvol, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pr-2 font-medium text-right relative"
                 >
-                  Market Cap ($) {sortColumn === 'market_cap' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  <div
+                    className="cursor-pointer hover:bg-gray-700 transition-colors"
+                    onClick={() => handleSort('rvol')}
+                  >
+                    RVOL (D50) {sortColumn === 'rvol' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  </div>
+                  <ResizeHandle columnKey="rvol" onResizeStart={handleResizeStart('rvol')} isResizing={resizingColumn === 'rvol'} />
                 </th>
-                <th 
-                  className="py-1.5 pr-2 font-medium text-right cursor-pointer hover:bg-gray-700 transition-colors"
-                  onClick={() => handleSort('supply_ratio')}
+                <th
+                  style={{ width: colWidths.market_cap, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pr-2 font-medium text-right relative"
                 >
-                  Supply % {sortColumn === 'supply_ratio' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  <div
+                    className="cursor-pointer hover:bg-gray-700 transition-colors"
+                    onClick={() => handleSort('market_cap')}
+                  >
+                    Market Cap ($) {sortColumn === 'market_cap' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  </div>
+                  <ResizeHandle columnKey="market_cap" onResizeStart={handleResizeStart('market_cap')} isResizing={resizingColumn === 'market_cap'} />
                 </th>
-                <th 
-                  className="py-1.5 pr-2 font-medium text-right cursor-pointer hover:bg-gray-700 transition-colors"
-                  onClick={() => handleSort('spread_bps')}
+                <th
+                  style={{ width: colWidths.supply_ratio, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pr-2 font-medium text-right relative"
                 >
-                  Spread (bps) {sortColumn === 'spread_bps' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  <div
+                    className="cursor-pointer hover:bg-gray-700 transition-colors"
+                    onClick={() => handleSort('supply_ratio')}
+                  >
+                    Supply % {sortColumn === 'supply_ratio' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  </div>
+                  <ResizeHandle columnKey="supply_ratio" onResizeStart={handleResizeStart('supply_ratio')} isResizing={resizingColumn === 'supply_ratio'} />
                 </th>
-                <th 
-                  className="py-1.5 pr-2 font-medium text-right cursor-pointer hover:bg-gray-700 transition-colors"
-                  onClick={() => handleSort('change_24h_pct')}
+                <th
+                  style={{ width: colWidths.spread_bps, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pr-2 font-medium text-right relative"
                 >
-                  24h % Change {sortColumn === 'change_24h_pct' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  <div
+                    className="cursor-pointer hover:bg-gray-700 transition-colors"
+                    onClick={() => handleSort('spread_bps')}
+                  >
+                    Spread (bps) {sortColumn === 'spread_bps' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  </div>
+                  <ResizeHandle columnKey="spread_bps" onResizeStart={handleResizeStart('spread_bps')} isResizing={resizingColumn === 'spread_bps'} />
+                </th>
+                <th
+                  style={{ width: colWidths.change_24h_pct, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pr-2 font-medium text-right relative"
+                >
+                  <div
+                    className="cursor-pointer hover:bg-gray-700 transition-colors"
+                    onClick={() => handleSort('change_24h_pct')}
+                  >
+                    24h % Change {sortColumn === 'change_24h_pct' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  </div>
+                  <ResizeHandle columnKey="change_24h_pct" onResizeStart={handleResizeStart('change_24h_pct')} isResizing={resizingColumn === 'change_24h_pct'} />
                 </th>
                 
                 {/* Strategies Group */}
-                <th className="py-1.5 pr-2 font-medium text-right border-l border-r border-gray-600">
+                <th
+                  style={{ width: colWidths.vwap_dist_pct, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pr-2 font-medium text-right border-l border-r border-gray-600 relative"
+                >
                   <div className="text-xs text-gray-500 mb-1">STRATEGIES</div>
                   <div 
                     className="cursor-pointer hover:bg-gray-700 transition-colors whitespace-nowrap"
@@ -496,31 +713,60 @@ export function ScreenerPanel() {
                   >
                     VWAP Dist % {sortColumn === 'vwap_dist_pct' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
                   </div>
+                  <ResizeHandle columnKey="vwap_dist_pct" onResizeStart={handleResizeStart('vwap_dist_pct')} isResizing={resizingColumn === 'vwap_dist_pct'} />
                 </th>
-                <th 
-                  className="py-1.5 pr-2 font-medium text-right cursor-pointer hover:bg-gray-700 transition-colors whitespace-nowrap"
-                  onClick={() => handleSort('hod_dist_pct')}
+                <th
+                  style={{ width: colWidths.hod_dist_pct, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pr-2 font-medium text-right whitespace-nowrap relative"
                 >
-                  HOD Distance % {sortColumn === 'hod_dist_pct' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  <div
+                    className="cursor-pointer hover:bg-gray-700 transition-colors"
+                    onClick={() => handleSort('hod_dist_pct')}
+                  >
+                    HOD Distance % {sortColumn === 'hod_dist_pct' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  </div>
+                  <ResizeHandle columnKey="hod_dist_pct" onResizeStart={handleResizeStart('hod_dist_pct')} isResizing={resizingColumn === 'hod_dist_pct'} />
                 </th>
-                <th className="py-1.5 pr-2 font-medium text-center whitespace-nowrap">HTF Trend</th>
-                <th 
-                  className="py-1.5 pr-2 font-medium cursor-pointer hover:bg-gray-700 transition-colors whitespace-nowrap"
-                  onClick={() => handleSort('signal_lead')}
+                <th
+                  style={{ width: colWidths.htf_trend, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pr-2 font-medium text-center whitespace-nowrap relative"
                 >
-                  Signal Lead {sortColumn === 'signal_lead' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  <div>HTF Trend</div>
+                  <ResizeHandle columnKey="htf_trend" onResizeStart={handleResizeStart('htf_trend')} isResizing={resizingColumn === 'htf_trend'} />
                 </th>
-                <th 
-                  className="py-1.5 pr-2 font-medium cursor-pointer hover:bg-gray-700 transition-colors whitespace-nowrap"
-                  onClick={() => handleSort('signal_strength')}
+                <th
+                  style={{ width: colWidths.signal_lead, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pr-2 font-medium whitespace-nowrap relative"
                 >
-                  Signal Strength {sortColumn === 'signal_strength' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  <div
+                    className="cursor-pointer hover:bg-gray-700 transition-colors"
+                    onClick={() => handleSort('signal_lead')}
+                  >
+                    Signal Lead {sortColumn === 'signal_lead' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  </div>
+                  <ResizeHandle columnKey="signal_lead" onResizeStart={handleResizeStart('signal_lead')} isResizing={resizingColumn === 'signal_lead'} />
+                </th>
+                <th
+                  style={{ width: colWidths.signal_strength, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pr-2 font-medium whitespace-nowrap relative"
+                >
+                  <div
+                    className="cursor-pointer hover:bg-gray-700 transition-colors"
+                    onClick={() => handleSort('signal_strength')}
+                  >
+                    Signal Strength {sortColumn === 'signal_strength' && (sortDirection === 'asc' ? ' ↑' : ' ↓')}
+                  </div>
+                  <ResizeHandle columnKey="signal_strength" onResizeStart={handleResizeStart('signal_strength')} isResizing={resizingColumn === 'signal_strength'} />
                 </th>
                 
                 {/* Active Trade Group */}
-                <th className="py-1.5 pr-2 font-medium border-l border-r border-gray-600">
+                <th
+                  style={{ width: colWidths.status, minWidth: MIN_COL_WIDTH }}
+                  className="py-1.5 pr-2 font-medium border-l border-r border-gray-600 relative"
+                >
                   <div className="text-xs text-gray-500 mb-1">ACTIVE TRADE</div>
                   <div>Status</div>
+                  <ResizeHandle columnKey="status" onResizeStart={handleResizeStart('status')} isResizing={resizingColumn === 'status'} />
                 </th>
               </tr>
             </thead>
@@ -531,6 +777,7 @@ export function ScreenerPanel() {
                   signal={signal} 
                   isEven={idx % 2 === 0}
                   realtimePosition={realtimePositions.get(signal.symbol)}
+                  colWidths={colWidths}
                 />
               ))}
             </tbody>

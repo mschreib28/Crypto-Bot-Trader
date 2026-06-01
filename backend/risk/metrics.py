@@ -223,7 +223,22 @@ class StrategyMetrics:
             f"pnl={pnl:.4f} R={r_multiple:.2f} {'WIN' if is_win else 'LOSS'} "
             f"reason={exit_reason or 'unknown'}"
         )
-        
+
+        try:
+            from backend.analytics.store import finalize_trade
+
+            finalize_trade(
+                symbol=record.symbol,
+                strategy=record.strategy_id,
+                exit_price=exit_price,
+                pnl_usd=pnl,
+                r_multiple=r_multiple,
+                is_win=is_win,
+                exit_reason=exit_reason or "unknown",
+            )
+        except Exception as e:
+            logger.debug(f"Trade analytics finalize failed: {e}")
+
         # Check if strategy should be auto-disabled due to drawdown
         try:
             self.check_strategy_drawdown(record.strategy_id)
@@ -422,13 +437,21 @@ class StrategyMetrics:
             }
     
     def check_strategy_drawdown(self, strategy_id: str) -> bool:
-        """Check if strategy should be auto-disabled due to excessive drawdown."""
+        """Suspend strategy when cumulative R loss breaches threshold (sticky until cleared)."""
         try:
             from backend.db import get_session
             from backend.db.models import Strategy
             from backend.api.routes.events import log_activity
+            from backend.supervisor.store import (
+                canonical_name,
+                is_drawdown_suspended,
+                set_drawdown_suspended,
+                write_cumulative_r_loss,
+                write_verdict,
+            )
+            from datetime import datetime, timezone
             import uuid as uuid_module
-            
+
             session = get_session()
             try:
                 try:
@@ -436,51 +459,70 @@ class StrategyMetrics:
                     strategy = session.query(Strategy).filter(Strategy.id == strategy_uuid).first()
                 except ValueError:
                     strategy = session.query(Strategy).filter(Strategy.name == strategy_id).first()
-                
+
                 if not strategy or strategy.status != "active":
                     return False
-                
+
                 config = strategy.config or {}
                 max_drawdown_r = config.get("max_drawdown_r") or config.get("parameters", {}).get("max_drawdown_r", -5.0)
                 drawdown_window = config.get("drawdown_window_trades") or config.get("parameters", {}).get("drawdown_window_trades", 20)
-                
+
                 r_data = self.get_r_multiples(strategy_id, limit=drawdown_window)
                 r_multiples = r_data.get("r_multiples", [])
-                
+
                 if len(r_multiples) < 5:
                     return False
-                
+
                 negative_r = [r["r_multiple"] for r in r_multiples if r["r_multiple"] < 0]
                 cumulative_r_loss = sum(negative_r)
-                
+                canon = canonical_name(strategy.name)
+                write_cumulative_r_loss(canon, cumulative_r_loss)
+
                 if cumulative_r_loss <= max_drawdown_r:
-                    strategy.status = "paused"
-                    session.commit()
-                    
-                    disable_reason_key = STRATEGY_DISABLE_REASON_KEY.format(strategy_id=strategy_id)
-                    disable_reason = {
-                        "reason": "drawdown_exceeded",
-                        "cumulative_r_loss": cumulative_r_loss,
-                        "threshold": max_drawdown_r,
-                        "trades_in_window": len(r_multiples),
-                        "disabled_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                    }
-                    self._redis.setex(disable_reason_key, 604800, json.dumps(disable_reason))
-                    
-                    log_activity(
-                        activity_type="EXIT_FORCED",
-                        message=f"Strategy disabled: {strategy.name} - drawdown exceeded (cumulative R loss: {cumulative_r_loss:.2f}, threshold: {max_drawdown_r:.2f})",
-                        details={
-                            "strategy": strategy.name,
-                            "strategy_id": strategy_id,
-                            "reason": "strategy_disabled_drawdown",
-                            "cumulative_r_loss": cumulative_r_loss,
-                            "threshold": max_drawdown_r,
-                            "trades_in_window": len(r_multiples),
-                        },
-                    )
-                    
-                    logger.warning(f"Strategy {strategy.name} auto-disabled: cumulative R loss {cumulative_r_loss:.2f} <= threshold {max_drawdown_r:.2f}")
+                    already_suspended = is_drawdown_suspended(canon)
+
+                    if not already_suspended:
+                        set_drawdown_suspended(
+                            canon,
+                            reason=f"cumulative_r_loss={cumulative_r_loss:.2f}",
+                        )
+                        write_verdict(
+                            canon,
+                            {
+                                "strategy": canon,
+                                "status": "SUSPENDED",
+                                "size_factor": 0.0,
+                                "reason": "drawdown_breach",
+                                "cumulative_r_loss": cumulative_r_loss,
+                                "threshold": max_drawdown_r,
+                                "last_evaluated": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                        log_activity(
+                            activity_type="RISK_WARNING",
+                            message=(
+                                f"Strategy SUSPENDED (drawdown): {strategy.name} — "
+                                f"cumulative R loss {cumulative_r_loss:.2f} <= "
+                                f"threshold {max_drawdown_r:.2f}; new entries halted "
+                                f"until manual re-enable or backtest ACTIVE"
+                            ),
+                            details={
+                                "strategy": strategy.name,
+                                "strategy_id": strategy_id,
+                                "canonical": canon,
+                                "reason": "drawdown_threshold_exceeded",
+                                "cumulative_r_loss": cumulative_r_loss,
+                                "threshold": max_drawdown_r,
+                                "trades_in_window": len(r_multiples),
+                            },
+                        )
+                        logger.warning(
+                            "Strategy %s SUSPENDED: cumulative R loss %.2f <= "
+                            "threshold %.2f",
+                            strategy.name,
+                            cumulative_r_loss,
+                            max_drawdown_r,
+                        )
                     return True
             finally:
                 session.close()
@@ -597,3 +639,73 @@ def get_strategy_metrics() -> StrategyMetrics:
     if _metrics is None:
         _metrics = StrategyMetrics()
     return _metrics
+
+
+def delete_keys_by_pattern(redis, pattern: str) -> int:
+    """
+    Scan Redis for keys matching pattern and delete them in batches.
+
+    Returns:
+        Total number of keys removed (sum of redis.delete return values).
+    """
+    batch: list[str] = []
+    total_deleted = 0
+    batch_size = 500
+
+    for raw in redis.scan_iter(match=pattern):
+        key = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        batch.append(key)
+        if len(batch) >= batch_size:
+            total_deleted += int(redis.delete(*batch))
+            batch.clear()
+
+    if batch:
+        total_deleted += int(redis.delete(*batch))
+
+    return total_deleted
+
+
+def clear_all_strategy_metrics_and_r_multiples(redis) -> int:
+    """Delete metrics:strategy:*, strategy:r_multiples:*, and open-trades hash."""
+    n = delete_keys_by_pattern(redis, "metrics:strategy:*")
+    n += delete_keys_by_pattern(redis, "strategy:r_multiples:*")
+    n += int(redis.delete(METRICS_OPEN_TRADES_KEY))
+    if n:
+        logger.info(f"clear_all_strategy_metrics_and_r_multiples: deleted {n} key(s)")
+    return n
+
+
+def reset_strategy_metrics_for_ids(strategy_ids: list) -> int:
+    """
+    Clear all performance metrics Redis keys for the given strategy IDs or names.
+
+    Deletes legacy stats, R-multiples, drawdown data, disable reason, and
+    performance-monitor data so the widget starts fresh.
+
+    Args:
+        strategy_ids: List of strategy UUIDs and/or names to reset.
+
+    Returns:
+        Number of Redis keys deleted.
+    """
+    from backend.performance.monitor import PERFORMANCE_KEY_PATTERN
+
+    redis = get_redis_client()
+    keys_to_delete = []
+    for sid in set(strategy_ids):
+        keys_to_delete.extend([
+            METRICS_STRATEGY_STATS_KEY.format(strategy_id=sid),
+            STRATEGY_R_MULTIPLES_KEY.format(strategy_id=sid),
+            STRATEGY_DRAWDOWN_KEY.format(strategy_id=sid),
+            STRATEGY_DISABLE_REASON_KEY.format(strategy_id=sid),
+            STRATEGY_PEAK_EQUITY_KEY.format(strategy_id=sid),
+            STRATEGY_CURRENT_EQUITY_KEY.format(strategy_id=sid),
+            PERFORMANCE_KEY_PATTERN.format(strategy_id=sid),
+        ])
+
+    if not keys_to_delete:
+        return 0
+
+    deleted = redis.delete(*keys_to_delete)
+    logger.info(f"Reset metrics: deleted {deleted} keys for {len(set(strategy_ids))} strategy ID(s)")
+    return deleted

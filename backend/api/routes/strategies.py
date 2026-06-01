@@ -241,11 +241,15 @@ async def get_strategy_config(strategy_id: str) -> StrategyConfigResponse:
         if not schema:
             # Return minimal config if no schema available
             db_config = strategy.config or {}
+            filters = dict(db_config.get("filters", {}))
+            filters.setdefault("confidence_buy", 90)
+            filters.setdefault("confidence_sell", 90)
+            filters.setdefault("min_allowed_grade", "A+")
             return StrategyConfigResponse(
                 strategy_id=strategy.name,
                 strategy_type=strategy.name,
                 parameters=db_config.get("parameters", {}),
-                filters=db_config.get("filters", {}),
+                filters=filters,
                 description=db_config.get("description", f"Strategy: {strategy.name}"),
                 volume_threshold=db_config.get("volume_threshold"),
             )
@@ -260,6 +264,10 @@ async def get_strategy_config(strategy_id: str) -> StrategyConfigResponse:
         merged_filters = {**schema.get("filters", {})}
         if "filters" in db_config:
             merged_filters.update(db_config["filters"])
+        # Ensure screener defaults (signal strength + min grade)
+        merged_filters.setdefault("confidence_buy", 90)
+        merged_filters.setdefault("confidence_sell", 90)
+        merged_filters.setdefault("min_allowed_grade", "A+")
         
         return StrategyConfigResponse(
             strategy_id=strategy.name,
@@ -333,10 +341,18 @@ async def update_strategy_config(strategy_id: str, config_update: StrategyConfig
         flag_modified(strategy, "config")
         session.commit()
         
+        # Reset this strategy's metrics so P&L and accuracy reflect the new config
+        try:
+            from backend.risk.metrics import reset_strategy_metrics_for_ids
+            reset_strategy_metrics_for_ids([str(strategy.id), strategy.name])
+            logger.info(f"Reset metrics for strategy {strategy.name} after config update")
+        except Exception as e:
+            logger.warning(f"Failed to reset strategy metrics after config update: {e}")
+
         # Log to activity feed
         log_activity(
             activity_type="system",
-            message=f"Strategy config updated: {strategy.name}",
+            message=f"Strategy config updated: {strategy.name} (metrics reset)",
             details={
                 "strategy_id": str(strategy.id),
                 "strategy_name": strategy.name,
@@ -344,16 +360,20 @@ async def update_strategy_config(strategy_id: str, config_update: StrategyConfig
                 "updated_filters": config_update.filters,
             },
         )
-        
+
         # Return updated config using the GET logic
         schema = _get_strategy_config_schema(strategy.name)
         
         if not schema:
+            filters = dict(current_config.get("filters", {}))
+            filters.setdefault("confidence_buy", 90)
+            filters.setdefault("confidence_sell", 90)
+            filters.setdefault("min_allowed_grade", "A+")
             return StrategyConfigResponse(
                 strategy_id=strategy.name,
                 strategy_type=strategy.name,
                 parameters=current_config.get("parameters", {}),
-                filters=current_config.get("filters", {}),
+                filters=filters,
                 description=current_config.get("description", f"Strategy: {strategy.name}"),
                 volume_threshold=current_config.get("volume_threshold"),
             )
@@ -365,6 +385,9 @@ async def update_strategy_config(strategy_id: str, config_update: StrategyConfig
         merged_filters = {**schema.get("filters", {})}
         if "filters" in current_config:
             merged_filters.update(current_config["filters"])
+        merged_filters.setdefault("confidence_buy", 90)
+        merged_filters.setdefault("confidence_sell", 90)
+        merged_filters.setdefault("min_allowed_grade", "A+")
         
         return StrategyConfigResponse(
             strategy_id=strategy.name,

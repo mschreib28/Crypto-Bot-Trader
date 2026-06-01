@@ -27,52 +27,6 @@ class PositionSizer:
     def __init__(self, default_stop_loss_pct: float = None):
         self.default_stop_loss_pct = default_stop_loss_pct or float(os.getenv("STOP_LOSS_PCT", "5.0"))
 
-    def calculate_scout_size(
-        self,
-        entry_price: float,
-    ) -> PositionSize:
-        """
-        Calculate Scout entry size: Fixed $1.50 position size with 42% stop loss.
-        
-        TICKET-601: Hard-coded Scout sizing for accounts < $50.00.
-        - Fixed position size: $1.50 USD (not dynamic)
-        - Stop loss: 42% (maintains $0.63 risk = $1.50 × 0.42)
-        - Used for micro-precision execution when equity < $50
-        
-        Args:
-            entry_price: Entry price for the trade
-            
-        Returns:
-            PositionSize with fixed $1.50 position size and 42% stop
-        """
-        scout_stop_loss_pct = float(os.getenv("SCOUT_STOP_LOSS_PCT", "42.0"))
-        
-        # TICKET-601: Hard-code Scout size to $1.50 (no dynamic calculation)
-        scout_entry_size_usd = 1.50
-        
-        # Calculate stop loss price: entry_price × (1 - 0.42)
-        stop_loss_price = entry_price * (1 - scout_stop_loss_pct / 100.0)
-        quantity = scout_entry_size_usd / entry_price
-        
-        # Risk is: $1.50 × 42% = $0.63
-        max_risk_usd = scout_entry_size_usd * (scout_stop_loss_pct / 100.0)
-        
-        result = PositionSize(
-            max_risk_usd=round(max_risk_usd, 2),
-            position_size_usd=round(scout_entry_size_usd, 2),
-            quantity=round(quantity, 8),
-            stop_loss_price=round(stop_loss_price, 2),
-            stop_loss_pct=scout_stop_loss_pct,
-        )
-        
-        logger.info(
-            f"Scout sizing (TICKET-601): fixed ${scout_entry_size_usd:.2f}, entry=${entry_price:.2f} -> "
-            f"size=${result.position_size_usd:.2f}, stop={result.stop_loss_pct}%, "
-            f"stop_price=${result.stop_loss_price:.2f}, risk=${result.max_risk_usd:.2f}"
-        )
-        
-        return result
-
     def calculate(
         self,
         account_equity: float,
@@ -82,7 +36,7 @@ class PositionSizer:
         strategy_id: str = None,
         atr: Optional[float] = None,
         stop_loss_price: Optional[float] = None,
-        use_scout_sizing: bool = False,
+        symbol: Optional[str] = None,
     ) -> Optional[PositionSize]:
         """
         Calculate position size using: Position = Risk / Stop-Loss Distance
@@ -105,15 +59,11 @@ class PositionSizer:
             strategy_id: Strategy ID for adaptive sizing (optional)
             atr: ATR value for micro mode stop distance check (optional)
             stop_loss_price: Explicit stop loss price (optional, calculated if None)
-            use_scout_sizing: If True, use Scout sizing ($1.50 fixed, 42% stop) instead of 2% rule
-            
+            symbol: Pair symbol for logs (optional).
+
         Returns:
-            PositionSize if trade is valid, None if skipped (micro mode)
+            PositionSize if trade is valid, None if skipped (micro mode or below min notional).
         """
-        # Use Scout sizing if requested
-        if use_scout_sizing:
-            return self.calculate_scout_size(entry_price)
-        
         stop_loss_pct = stop_loss_pct or self.default_stop_loss_pct
         
         # Calculate stop loss price if not provided
@@ -163,8 +113,46 @@ class PositionSizer:
                 position_size_usd = adjusted_size
                 # Recalculate max_risk_usd based on adjusted size
                 max_risk_usd = position_size_usd * (stop_loss_pct / 100.0)
-        
-        quantity = position_size_usd / entry_price
+
+        if entry_price <= 0:
+            logger.warning(
+                "[sizing] Rejected %s: invalid entry_price=%.6f",
+                symbol or "?",
+                entry_price,
+            )
+            return None
+
+        stop_distance_pct = abs(entry_price - stop_loss_price) / entry_price
+        risk_budget = max_risk_usd
+        raw_quantity = position_size_usd / entry_price
+        sym = symbol or "?"
+
+        # Runner must set LOG_LEVEL=DEBUG to see this on corpus.
+        logger.debug(
+            "[sizing] %s entry=%.6f stop=%.6f stop_dist_pct=%.4f "
+            "risk_budget=%.4f raw_qty=%.10f",
+            sym,
+            entry_price,
+            stop_loss_price,
+            stop_distance_pct,
+            risk_budget,
+            raw_quantity,
+        )
+
+        if raw_quantity * entry_price < self.KRAKEN_MIN_ORDER_USD:
+            logger.warning(
+                "[sizing] Rejected %s: notional $%.4f below minimum $%.2f "
+                "(entry=%.6f qty=%.10f stop_dist=%.4f%%)",
+                sym,
+                raw_quantity * entry_price,
+                self.KRAKEN_MIN_ORDER_USD,
+                entry_price,
+                raw_quantity,
+                stop_distance_pct * 100,
+            )
+            return None
+
+        quantity = raw_quantity
 
         result = PositionSize(
             max_risk_usd=round(max_risk_usd, 2),

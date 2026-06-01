@@ -21,7 +21,32 @@ interface UseBalanceReturn {
 
 // UI refresh interval: 10 seconds for near-real-time balance updates
 // Matches backend POSITION_MONITOR_INTERVAL_SECONDS
-const REFRESH_INTERVAL_MS = 10000;
+const REFRESH_INTERVAL_MS = 5000;
+
+function normalizeBalancePayload(raw: unknown): BalanceData {
+  const data = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  const totalRaw = Number(data.total_usd);
+  const totalUsd = Number.isFinite(totalRaw) ? totalRaw : 0;
+  const availRaw = data.available_usd != null ? Number(data.available_usd) : totalUsd;
+  const availableUsd = Number.isFinite(availRaw) ? availRaw : totalUsd;
+  let holdings: Holding[] = [];
+  if (Array.isArray(data.holdings)) {
+    holdings = data.holdings.map((h: unknown) => {
+      if (!h || typeof h !== 'object') {
+        return { symbol: '', quantity: 0, value_usd: 0 };
+      }
+      const row = h as Record<string, unknown>;
+      const qty = Number(row.quantity);
+      const val = Number(row.value_usd);
+      return {
+        symbol: typeof row.symbol === 'string' ? row.symbol : String(row.symbol ?? ''),
+        quantity: Number.isFinite(qty) ? qty : 0,
+        value_usd: Number.isFinite(val) ? val : 0,
+      };
+    });
+  }
+  return { total_usd: totalUsd, available_usd: availableUsd, holdings };
+}
 
 export function useBalance(): UseBalanceReturn {
   const [balance, setBalance] = useState<BalanceData | null>(null);
@@ -34,8 +59,8 @@ export function useBalance(): UseBalanceReturn {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
-      const data: BalanceData = await response.json();
-      setBalance(data);
+      const raw = await response.json();
+      setBalance(normalizeBalancePayload(raw));
       setError(null);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to fetch balance';

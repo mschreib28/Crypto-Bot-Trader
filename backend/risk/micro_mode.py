@@ -3,8 +3,13 @@
 When account equity is below a threshold (default: $250), micro mode:
 - Enforces minimum stop distance (avoids tiny stops that cause constant stop-outs)
 - Enforces minimum notional logic (skip trade or use fixed minimal size)
-- Reduces frequency aggressively (max 1 position open total)
 - Makes position sizing more conservative
+
+Entry position *slots* (per-symbol and total concurrent) are enforced by
+``check_entry_position_limits`` using bot mode + effective strategy mode
+(SHADOW/SIM: unlimited symbols, one slot per symbol for LIVE/PENDING/EXITING; LIVE+LIVE: capped by LIVE_FULL_MAX_CONCURRENT_POSITIONS, min 1).
+``MICRO_MODE_MAX_POSITIONS`` / ``check_max_positions`` are legacy-only (no longer used
+by the risk evaluator for BUY gating).
 
 This prevents issues where:
 - Position sizing produces notional below Kraken minimums
@@ -14,7 +19,7 @@ This prevents issues where:
 
 import logging
 import os
-from typing import Tuple, Optional
+from typing import Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +32,24 @@ MICRO_MODE_MIN_STOP_ATR: float = float(os.getenv("MICRO_MODE_MIN_STOP_ATR", "2.0
 # Minimum notional size for micro mode (fixed minimal size)
 MICRO_MODE_MIN_NOTIONAL: float = float(os.getenv("MICRO_MODE_MIN_NOTIONAL", "5.0"))
 
-# Maximum positions in micro mode (aggressive reduction)
+# Maximum positions in micro mode (legacy; see check_entry_position_limits for BUY gating)
 MICRO_MODE_MAX_POSITIONS: int = int(os.getenv("MICRO_MODE_MAX_POSITIONS", "1"))
 
-# Live slots thresholds (for limiting concurrent live positions)
+# Max concurrent open positions when bot is LIVE and effective strategy mode is LIVE
+_LIVE_FULL_MAX_RAW = int(os.getenv("LIVE_FULL_MAX_CONCURRENT_POSITIONS", "2"))
+if _LIVE_FULL_MAX_RAW < 1:
+    logger.warning(
+        "LIVE_FULL_MAX_CONCURRENT_POSITIONS=%s is invalid (<1); clamping to 1",
+        _LIVE_FULL_MAX_RAW,
+    )
+LIVE_FULL_MAX_CONCURRENT_POSITIONS: int = max(1, _LIVE_FULL_MAX_RAW)
+
+# Legacy env vars (no longer used for slot max; see _entry_cap_display_for_api / check_entry_position_limits)
 LIVE_SLOTS_THRESHOLD_1: float = float(os.getenv("LIVE_SLOTS_THRESHOLD_1", "50.0"))
 LIVE_SLOTS_THRESHOLD_2: float = float(os.getenv("LIVE_SLOTS_THRESHOLD_2", "100.0"))
+
+# API display: SHADOW has no total concurrent cap (aligned with check_entry_position_limits)
+SHADOW_CONCURRENT_CAP_DISPLAY: int = 999
 
 
 def is_micro_mode(equity: float) -> bool:
@@ -130,6 +147,54 @@ def check_min_notional(
         return (False, None, f"below_min_notional: ${position_size_usd:.2f} < ${MICRO_MODE_MIN_NOTIONAL:.2f}")
 
 
+def check_entry_position_limits(
+    symbol: str,
+    strategy_canonical: str,
+    tracker: Any,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Gate new BUY entries by per-symbol slot and optional total cap.
+
+    - Rejects if tracker status for symbol is LIVE, PENDING, or EXITING (one slot per symbol).
+    - SHADOW bot or effective SIM: no total cap.
+    - LIVE bot + effective LIVE: at most LIVE_FULL_MAX_CONCURRENT_POSITIONS open positions.
+    """
+    try:
+        status = tracker.get_position_status(symbol)
+    except Exception as exc:
+        logger.warning(f"check_entry_position_limits: get_position_status failed: {exc}")
+        return (False, f"position_status_error: {exc}")
+
+    if status in ("LIVE", "PENDING", "EXITING"):
+        return (False, f"symbol_slot_occupied: {status}")
+
+    from backend.api.routes.trading import get_bot_mode
+    from backend.supervisor.store import get_effective_mode
+
+    bot_mode = get_bot_mode()
+    eff_mode, _ = get_effective_mode(strategy_canonical)
+
+    if bot_mode == "SHADOW" or eff_mode == "SIM":
+        return (True, None)
+
+    if bot_mode == "LIVE" and eff_mode == "LIVE":
+        try:
+            current_positions = tracker.get_all_positions()
+            position_count = len(current_positions)
+        except Exception as exc:
+            logger.warning(f"check_entry_position_limits: get_all_positions failed: {exc}")
+            return (False, f"position_count_error: {exc}")
+
+        if position_count >= LIVE_FULL_MAX_CONCURRENT_POSITIONS:
+            return (
+                False,
+                f"max_positions_reached: {position_count} >= "
+                f"{LIVE_FULL_MAX_CONCURRENT_POSITIONS}",
+            )
+
+    return (True, None)
+
+
 def check_max_positions(
     current_position_count: int
 ) -> Tuple[bool, Optional[str]]:
@@ -153,29 +218,46 @@ def check_max_positions(
     return (True, None)
 
 
-def get_micro_mode_status(equity: float) -> dict:
+def _entry_cap_display_for_api(bot_mode: Optional[str] = None) -> int:
+    """
+    Concurrent position cap for API display (micro_mode.max_positions, live_slots_max).
+
+    Matches check_entry_position_limits: SHADOW → effectively unlimited (sentinel 999);
+    LIVE → LIVE_FULL_MAX_CONCURRENT_POSITIONS.
+    """
+    if bot_mode is None:
+        from backend.api.routes.trading import get_bot_mode
+
+        bot_mode = get_bot_mode()
+    if bot_mode == "SHADOW":
+        return SHADOW_CONCURRENT_CAP_DISPLAY
+    return LIVE_FULL_MAX_CONCURRENT_POSITIONS
+
+
+def get_micro_mode_status(equity: float, bot_mode: Optional[str] = None) -> dict:
     """
     Get micro mode status information.
-    
+
     Args:
         equity: Current account equity
-        
+        bot_mode: Optional override; if None, uses get_bot_mode() for max_positions display.
+
     Returns:
         Dictionary with micro mode status and configuration
     """
     active = is_micro_mode(equity)
-    
+    cap = _entry_cap_display_for_api(bot_mode)
+
     return {
         "active": active,
         "equity": equity,
         "threshold": MICRO_MODE_THRESHOLD,
         "min_stop_atr": MICRO_MODE_MIN_STOP_ATR,
         "min_notional": MICRO_MODE_MIN_NOTIONAL,
-        "max_positions": MICRO_MODE_MAX_POSITIONS,
+        "max_positions": cap,
         "message": (
             f"Equity ${equity:.2f} < ${MICRO_MODE_THRESHOLD:.2f} threshold. "
-            f"Max {MICRO_MODE_MAX_POSITIONS} position, min stop {MICRO_MODE_MIN_STOP_ATR}ATR, "
-            f"min notional ${MICRO_MODE_MIN_NOTIONAL:.2f}"
+            f"Min stop {MICRO_MODE_MIN_STOP_ATR}ATR, min notional ${MICRO_MODE_MIN_NOTIONAL:.2f}"
             if active
             else None
         ),
@@ -184,25 +266,13 @@ def get_micro_mode_status(equity: float) -> dict:
 
 def get_live_slots_max(equity: float) -> int:
     """
-    Get maximum live slots based on account equity.
-    
-    Live slots limit concurrent live positions (excludes shadow positions).
-    
-    Args:
-        equity: Current account equity in USD
-        
-    Returns:
-        Maximum number of live slots:
-        - Balance < $50: 1 slot
-        - Balance >= $50: 2 slots (M2 milestone)
-        - Balance >= $100: 3 slots (future)
+    Maximum concurrent open positions for API display (matches micro_mode.max_positions).
+
+    Equity argument retained for backward compatibility; cap follows bot mode and
+    check_entry_position_limits (SHADOW sentinel 999, LIVE = LIVE_FULL_MAX_CONCURRENT_POSITIONS).
     """
-    if equity < LIVE_SLOTS_THRESHOLD_1:
-        return 1
-    elif equity < LIVE_SLOTS_THRESHOLD_2:
-        return 2
-    else:
-        return 3
+    _ = equity  # unused; legacy callers may still pass equity
+    return _entry_cap_display_for_api()
 
 
 def get_live_slots_status(equity: float) -> dict:
@@ -221,16 +291,17 @@ def get_live_slots_status(equity: float) -> dict:
         }
     """
     max_slots = get_live_slots_max(equity)
-    
-    # Get current live position count (excludes shadow positions)
+
+    # Align with check_entry_position_limits (len get_all_positions), not get_live_position_count
     try:
         from backend.positions.tracker import get_position_tracker
+
         tracker = get_position_tracker()
-        current_slots = tracker.get_live_position_count()
+        current_slots = len(tracker.get_all_positions())
     except Exception as e:
-        logger.warning(f"Failed to get live position count: {e}")
+        logger.warning(f"Failed to get open position count: {e}")
         current_slots = 0
-    
+
     available = current_slots < max_slots
     
     return {

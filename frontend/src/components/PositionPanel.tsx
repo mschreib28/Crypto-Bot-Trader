@@ -3,6 +3,7 @@ import { useAccount } from '../hooks/useAccount';
 import { useShadowLive } from '../hooks/useShadowLive';
 import { useTrading } from '../hooks/useTrading';
 import { Position } from '../types/position';
+import { getStrategyDisplayName } from '../utils/strategyLabels';
 
 function isValidNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
@@ -37,31 +38,48 @@ function PositionRow({ position, isEven, onClose, isShadowMode }: PositionRowPro
   const pnlColor = hasPnl ? (isProfit ? 'text-green-400' : 'text-red-400') : 'text-gray-400';
   const sideColor = side === 'long' ? 'text-green-400' : 'text-red-400';
   const rowBg = isEven ? 'bg-gray-800/50' : '';
-  
-  // Format strategy name for display (remove underscores, capitalize)
-  const displayStrategy = strategy_name 
-    ? strategy_name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())
-    : '—';
+  const totalCost = isValidNumber(quantity) && isValidNumber(entry_price) ? quantity * entry_price : null;
 
-  // Safe numeric values
-  const safeQuantity = isValidNumber(quantity) ? quantity : 0;
-  const safeEntryPrice = isValidNumber(entry_price) ? entry_price : 0;
+  const displayStrategy = strategy_name ? getStrategyDisplayName(strategy_name) : '—';
 
   return (
     <tr className={`border-b border-gray-700/30 ${rowBg}`}>
-      <td className="py-1.5 pr-2 text-gray-200 text-xs font-medium">{symbol.split('/')[0]}</td>
+      <td className="py-1.5 pr-2 text-gray-200 text-xs font-medium">
+        {(symbol || '').split('/')[0] || '—'}
+      </td>
       <td className={`py-1.5 pr-2 text-xs capitalize font-medium ${sideColor}`}>{side}</td>
-      <td className="py-1.5 pr-2 text-gray-300 text-xs text-right font-mono">{safeQuantity.toFixed(2)}</td>
-      <td className="py-1.5 pr-2 text-gray-300 text-xs text-right font-mono">{formatCurrency(safeEntryPrice)}</td>
+      <td className="py-1.5 pr-2 text-gray-300 text-xs text-right font-mono">
+        {isValidNumber(quantity) ? (
+          <>
+            <div>{quantity.toFixed(4)}</div>
+            <div className="text-[10px] text-gray-500">
+              @ {isValidNumber(entry_price) ? formatCurrency(entry_price) : '—'}
+            </div>
+          </>
+        ) : (
+          <>
+            <div>—</div>
+            <div className="text-[10px] text-gray-500">@ —</div>
+          </>
+        )}
+      </td>
+      <td className="py-1.5 pr-2 text-gray-200 text-xs text-right font-mono font-semibold">
+        {totalCost !== null ? formatCurrency(totalCost) : '—'}
+      </td>
       <td className={`py-1.5 pr-2 text-xs ${
-        strategy_name 
-          ? 'text-gray-200 font-medium' 
+        strategy_name
+          ? 'text-gray-200 font-medium'
           : 'text-gray-500 italic'
       }`}>
         {displayStrategy}
       </td>
       <td className={`py-1.5 pr-2 text-xs text-right font-mono font-semibold ${pnlColor}`}>
-        {formatPnlPercent(unrealized_pnl, entry_price, quantity)}
+        {hasPnl ? (
+          <>
+            <div>{unrealized_pnl >= 0 ? '+' : ''}{formatCurrency(unrealized_pnl)}</div>
+            <div className="text-[10px]">{formatPnlPercent(unrealized_pnl, entry_price, quantity)}</div>
+          </>
+        ) : '—'}
       </td>
       <td className="py-1.5 text-right">
         <button
@@ -134,28 +152,6 @@ export function PositionPanel() {
         </div>
       )}
 
-      {/* Live Slot Status */}
-      {!loading && !error && account && (
-        <div className="mb-3 pb-2 border-b border-gray-700 shrink-0">
-          <div className="flex items-center justify-between">
-            <span className="text-gray-500 text-xs">Live Slots:</span>
-            <span className={`text-xs font-semibold ${
-              account.live_slots_active !== undefined && account.live_slots_max !== undefined
-                ? account.live_slots_active < account.live_slots_max
-                  ? account.live_slots_active === account.live_slots_max - 1
-                    ? 'text-yellow-400'
-                    : 'text-green-400'
-                  : 'text-red-400'
-                : 'text-gray-400'
-            }`}>
-              {account.live_slots_active !== undefined && account.live_slots_max !== undefined
-                ? `${account.live_slots_active}/${account.live_slots_max} Active`
-                : '—'}
-            </span>
-          </div>
-        </div>
-      )}
-
       {!loading && !error && positions.length === 0 && (
         <div className="text-gray-400 text-xs flex-1">No positions</div>
       )}
@@ -167,8 +163,8 @@ export function PositionPanel() {
               <tr className="text-left text-gray-400 border-b border-gray-600">
                 <th className="pb-2 pr-2 font-semibold text-xs uppercase tracking-wide">Asset</th>
                 <th className="pb-2 pr-2 font-semibold text-xs uppercase tracking-wide">Side</th>
-                <th className="pb-2 pr-2 font-semibold text-xs uppercase tracking-wide text-right">Qty</th>
-                <th className="pb-2 pr-2 font-semibold text-xs uppercase tracking-wide text-right">Entry</th>
+                <th className="pb-2 pr-2 font-semibold text-xs uppercase tracking-wide text-right">Qty @ Entry</th>
+                <th className="pb-2 pr-2 font-semibold text-xs uppercase tracking-wide text-right">Cost</th>
                 <th className="pb-2 pr-2 font-semibold text-xs uppercase tracking-wide">Strategy</th>
                 <th className="pb-2 pr-2 font-semibold text-xs uppercase tracking-wide text-right">P&L</th>
                 <th className="pb-2 font-semibold text-xs uppercase tracking-wide text-right">Action</th>

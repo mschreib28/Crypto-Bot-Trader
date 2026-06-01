@@ -17,12 +17,12 @@ from typing import List, Optional
 from backend.ingestor.config import (
     get_health_check_file,
     get_intervals,
+    get_pinned_symbols,
     get_symbols,
     get_symbol_refresh_interval,
     get_universe_refresh_interval,
 )
-from backend.ingestor.kraken_ws import MultiConnectionManager
-from backend.ingestor.normalizer import Normalizer
+from backend.ingestor.cli_ws import MultiIntervalCLIIngestor
 from backend.ingestor.symbols import (
     fetch_usd_pairs,
     fetch_top_usd_pairs_by_volume,
@@ -40,7 +40,12 @@ from backend.ingestor.symbols import (
 )
 from backend.config import LOG_LEVEL
 from backend.redis import get_redis_client
-from backend.redis.keys import INGESTOR_ACTIVE_SYMBOLS_KEY
+from backend.redis.keys import (
+    INGESTOR_ACTIVE_SYMBOLS_KEY,
+    INGESTOR_HEARTBEAT_KEY,
+    INGESTOR_HEARTBEAT_TTL,
+    INGESTOR_SYMBOLS_COUNT_KEY,
+)
 
 # Error recovery settings
 MAX_CONSECUTIVE_ERRORS = 10
@@ -54,6 +59,17 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _publish_ingestor_heartbeat(symbols_count: int) -> None:
+    """Publish ingestor heartbeat and symbol count for API health checks."""
+    try:
+        client = get_redis_client()
+        timestamp = datetime.now(timezone.utc).isoformat()
+        client.setex(INGESTOR_HEARTBEAT_KEY, INGESTOR_HEARTBEAT_TTL, timestamp)
+        client.set(INGESTOR_SYMBOLS_COUNT_KEY, str(symbols_count))
+    except Exception as e:
+        logger.warning(f"Failed to publish ingestor heartbeat: {e}")
 
 
 def _publish_active_symbols(symbols: List[str]) -> None:
@@ -73,6 +89,7 @@ def _publish_active_symbols(symbols: List[str]) -> None:
         client = get_redis_client()
         client.set(INGESTOR_ACTIVE_SYMBOLS_KEY, json.dumps(normalized_symbols))
         logger.info(f"Published {len(normalized_symbols)} active symbols to Redis")
+        _publish_ingestor_heartbeat(len(normalized_symbols))
     except Exception as e:
         logger.warning(f"Failed to publish active symbols to Redis: {e}")
 
@@ -86,11 +103,19 @@ async def run_pipeline(symbols: List[str], intervals: List[str], use_dynamic_sym
         intervals: List of intervals for OHLCV aggregation
         use_dynamic_symbols: If True, refresh symbols hourly using RVOL ranking
     """
+    # Merge pinned symbols — always ingested regardless of RVOL ranking
+    pinned = get_pinned_symbols()
+    if pinned:
+        pinned_missing = [s for s in pinned if s not in symbols]
+        if pinned_missing:
+            symbols = list(symbols) + pinned_missing
+            logger.info(f"Pinned symbols added to universe: {pinned_missing}")
+
     logger.info(
         f"Starting ingestor pipeline: symbols={len(symbols)} pairs, intervals={intervals}"
     )
     logger.info(f"Symbols: {symbols[:10]}{'...' if len(symbols) > 10 else ''}")
-    
+
     # Publish initial symbols to Redis for other services (screener, etc.)
     _publish_active_symbols(symbols)
     
@@ -107,9 +132,8 @@ async def run_pipeline(symbols: List[str], intervals: List[str], use_dynamic_sym
     current_symbols = list(symbols)
     shutdown_requested = False
     reconnect_requested = False
-    ws_manager: Optional[MultiConnectionManager] = None
-    normalizer: Optional[Normalizer] = None
-    
+    ingestor: Optional[MultiIntervalCLIIngestor] = None
+
     def signal_handler(sig, frame):
         nonlocal shutdown_requested
         if shutdown_requested:
@@ -117,11 +141,8 @@ async def run_pipeline(symbols: List[str], intervals: List[str], use_dynamic_sym
             sys.exit(1)
         shutdown_requested = True
         logger.info("Received shutdown signal, cleaning up...")
-        # Schedule stop tasks
-        if ws_manager:
-            asyncio.get_event_loop().create_task(ws_manager.stop())
-        if normalizer:
-            asyncio.get_event_loop().create_task(normalizer.stop())
+        if ingestor:
+            asyncio.get_event_loop().create_task(ingestor.stop())
     
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
@@ -136,6 +157,15 @@ async def run_pipeline(symbols: List[str], intervals: List[str], use_dynamic_sym
             except Exception as e:
                 logger.warning(f"Could not update health check file: {e}")
                 await asyncio.sleep(30)
+
+    async def heartbeat_loop():
+        """Refresh Redis ingestor heartbeat every 30s."""
+        while not shutdown_requested:
+            try:
+                _publish_ingestor_heartbeat(len(current_symbols))
+            except Exception as e:
+                logger.warning(f"Heartbeat loop error: {e}")
+            await asyncio.sleep(30)
     
     # RVOL refresh interval (expensive operation - fetches OHLC data)
     rvol_refresh_interval = get_symbol_refresh_interval()  # Default: 1 hour
@@ -341,12 +371,18 @@ async def run_pipeline(symbols: List[str], intervals: List[str], use_dynamic_sym
                     f"time_taken_ms={time_taken_ms}"
                 )
                 
+                # Ensure pinned symbols are always present after refresh
+                _pinned = get_pinned_symbols()
+                for _ps in _pinned:
+                    if _ps not in new_symbols:
+                        new_symbols = list(new_symbols) + [_ps]
+
                 # Update current symbols
                 if set(new_symbols) != set(current_symbols):
                     current_symbols = new_symbols
                     _publish_active_symbols(current_symbols)
                     reconnect_requested = True
-                
+
                 # Mark refresh time after successful refresh
                 mark_universe_refresh_time()
                     
@@ -448,12 +484,18 @@ async def run_pipeline(symbols: List[str], intervals: List[str], use_dynamic_sym
                     f"time_taken_ms={time_taken_ms}"
                 )
                 
+                # Ensure pinned symbols survive RVOL refresh
+                _pinned = get_pinned_symbols()
+                for _ps in _pinned:
+                    if _ps not in new_symbols:
+                        new_symbols = list(new_symbols) + [_ps]
+
                 # Update current symbols
                 if set(new_symbols) != set(current_symbols):
                     current_symbols = new_symbols
                     _publish_active_symbols(current_symbols)
                     reconnect_requested = True
-                
+
                 # Mark refresh time after successful refresh
                 mark_rvol_refresh_time()
                     
@@ -465,6 +507,7 @@ async def run_pipeline(symbols: List[str], intervals: List[str], use_dynamic_sym
     
     # Initialize task variables to ensure they're always defined
     health_task = None
+    heartbeat_task = None
     universe_refresh_task = None
     rvol_refresh_task = None
     failed_check_task = None
@@ -472,6 +515,7 @@ async def run_pipeline(symbols: List[str], intervals: List[str], use_dynamic_sym
     # Create background tasks
     try:
         health_task = asyncio.create_task(update_health_check())
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
         if use_dynamic_symbols:
             universe_refresh_task = asyncio.create_task(refresh_universe())
             rvol_refresh_task = asyncio.create_task(refresh_symbols_rvol())
@@ -489,39 +533,38 @@ async def run_pipeline(symbols: List[str], intervals: List[str], use_dynamic_sym
             reconnect_requested = False
             
             try:
-                # Create managers for current symbols
-                ws_manager = MultiConnectionManager(symbols=current_symbols, intervals=intervals)
-                normalizer = Normalizer(symbols=current_symbols, intervals=intervals)
-                
-                logger.info(
-                    f"Subscribed to {len(current_symbols)} USD pairs across "
-                    f"{ws_manager.get_connection_count()} WebSocket connection(s)"
+                # Create CLI ingestor for current symbols
+                ingestor = MultiIntervalCLIIngestor(
+                    symbols=current_symbols, intervals=intervals
                 )
-                
+
+                logger.info(
+                    f"Subscribed to {len(current_symbols)} USD pairs via CLI WS, "
+                    f"{ingestor.get_connection_count()} interval worker(s)"
+                )
+
                 # Run until shutdown or reconnect requested
-                ws_task = asyncio.create_task(_run_websocket_manager(ws_manager))
-                norm_task = asyncio.create_task(_run_normalizer(normalizer))
-                
-                # Wait for either completion, shutdown, or reconnect
+                ingest_task = asyncio.create_task(_run_cli_ingestor(ingestor))
+
+                # Wait for completion, shutdown, or reconnect
                 while not shutdown_requested and not reconnect_requested:
                     done, _ = await asyncio.wait(
-                        [ws_task, norm_task],
+                        [ingest_task],
                         timeout=5.0,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
-                    
+
                     if done:
-                        # One of the tasks completed (likely error)
                         for task in done:
                             try:
                                 task.result()
-                                # Reset consecutive errors on success
                                 consecutive_errors = 0
                             except Exception as e:
                                 consecutive_errors += 1
-                                logger.error(f"Pipeline task error (consecutive: {consecutive_errors}): {e}")
-                                
-                                # Cooldown after too many consecutive errors
+                                logger.error(
+                                    f"Pipeline task error "
+                                    f"(consecutive: {consecutive_errors}): {e}"
+                                )
                                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                                     logger.warning(
                                         f"{consecutive_errors} consecutive errors, "
@@ -530,21 +573,15 @@ async def run_pipeline(symbols: List[str], intervals: List[str], use_dynamic_sym
                                     await asyncio.sleep(ERROR_COOLDOWN_SECONDS)
                                     consecutive_errors = 0
                         break
-                
-                # Stop current managers
-                logger.info("Stopping current WebSocket and normalizer...")
-                await ws_manager.stop()
-                await normalizer.stop()
-                
-                # Cancel and wait for tasks
-                ws_task.cancel()
-                norm_task.cancel()
+
+                # Stop ingestor
+                logger.info("Stopping CLI ingestor...")
+                await ingestor.stop()
+
+                # Cancel and await task
+                ingest_task.cancel()
                 try:
-                    await ws_task
-                except asyncio.CancelledError:
-                    pass
-                try:
-                    await norm_task
+                    await ingest_task
                 except asyncio.CancelledError:
                     pass
                 
@@ -574,6 +611,8 @@ async def run_pipeline(symbols: List[str], intervals: List[str], use_dynamic_sym
         # Cancel background tasks (check for None to handle initialization failures)
         if health_task:
             health_task.cancel()
+        if heartbeat_task:
+            heartbeat_task.cancel()
         if universe_refresh_task:
             universe_refresh_task.cancel()
         if rvol_refresh_task:
@@ -585,6 +624,12 @@ async def run_pipeline(symbols: List[str], intervals: List[str], use_dynamic_sym
         if health_task:
             try:
                 await health_task
+            except asyncio.CancelledError:
+                pass
+
+        if heartbeat_task:
+            try:
+                await heartbeat_task
             except asyncio.CancelledError:
                 pass
         
@@ -630,21 +675,12 @@ async def run_pipeline(symbols: List[str], intervals: List[str], use_dynamic_sym
         logger.info("Shutdown complete")
 
 
-async def _run_websocket_manager(manager: MultiConnectionManager) -> None:
-    """Run the WebSocket connection manager until shutdown."""
+async def _run_cli_ingestor(ingestor: MultiIntervalCLIIngestor) -> None:
+    """Run the CLI ingestor until shutdown or error."""
     try:
-        await manager.run()
+        await ingestor.run()
     except Exception as e:
-        logger.error(f"WebSocket manager error: {e}", exc_info=True)
-        raise
-
-
-async def _run_normalizer(normalizer: Normalizer) -> None:
-    """Run the normalizer until shutdown."""
-    try:
-        await normalizer.run()
-    except Exception as e:
-        logger.error(f"Normalizer error: {e}", exc_info=True)
+        logger.error(f"CLI ingestor error: {e}", exc_info=True)
         raise
 
 

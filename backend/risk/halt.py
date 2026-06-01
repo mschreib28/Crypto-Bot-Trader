@@ -44,8 +44,9 @@ def is_halted() -> bool:
     
     Returns:
         True if system is halted, False otherwise.
-        Defaults to False if Redis is unavailable or key doesn't exist
-        (fail-closed: assume not halted if we can't determine state).
+        Defaults to True if Redis is unavailable (fail-safe: block trades
+        when halt state cannot be verified). Returns False only when Redis
+        explicitly confirms the system is not halted.
         
     Note:
         The halt state is read from Redis key `system:halt`.
@@ -65,8 +66,8 @@ def is_halted() -> bool:
     except Exception as e:
         logger.warning(
             f"Failed to check halt state from Redis: {e}. "
-            f"Assuming not halted (fail-closed: allow evaluation to proceed)."
+            f"Assuming halted (fail-safe: block all trades when halt state is unverifiable)."
         )
-        # Fail-closed: if we can't determine halt state, assume not halted
-        # This allows evaluation to proceed, but evaluator will reject on other failures
-        return False
+        # Fail-safe: if we can't verify halt state, assume halted to prevent
+        # unintended trades when Redis is unavailable.
+        return True

@@ -1,6 +1,14 @@
 """Configuration for HTF Trend Pullback Continuation Strategy."""
 
+import os
 from dataclasses import dataclass
+
+
+def _parse_env_bool(name: str, unset_default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return unset_default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass
@@ -9,9 +17,9 @@ class HTFTrendConfig:
     
     strategy_id: str = "htf_trend_pullback"
     symbol: str = "BTC/USD"
-    interval: str = "1h"  # Entry timeframe
-    htf_interval: str = "4h"  # Higher timeframe for trend
-    notional_risk_pct: float = 1.0  # Risk per trade
+    interval: str = "5m"  # Entry timeframe (Ross Cameron spec: 5-minute pullback)
+    htf_interval: str = "1h"  # Higher timeframe for trend (Ross Cameron spec: 1-hour trend filter)
+    notional_risk_pct: float = 2.0  # Risk per trade (standardized to 2.0% for consistency with other strategies)
     
     # Trend qualification (HTF - 4h)
     htf_ema_slow: int = 200  # EMA200 for trend direction
@@ -35,9 +43,9 @@ class HTFTrendConfig:
     atr_stop_mult: float = 1.5  # Stop distance = ATR * this (minimum)
     swing_buffer_ATR: float = 0.15  # Buffer below swing low (in ATR units)
     
-    # Take-profit
-    tp1_R: float = 1.5  # First target in R-multiples
-    tp2_R: float = 3.0  # Second target in R-multiples
+    # Take-profit (Ross Cameron spec: 1:2 R/R = 1.5% stop, 3.0% take profit = 2.0 R)
+    tp1_R: float = 1.0  # First target in R-multiples (1.5% if stop is 1.5%)
+    tp2_R: float = 2.0  # Second target in R-multiples (3.0% if stop is 1.5%)
     tp1_partial_pct: float = 0.7  # Take 70% at TP1, move stop to breakeven
     
     # Trailing stop
@@ -46,7 +54,17 @@ class HTFTrendConfig:
     
     # Trend invalidation
     trend_invalidation_enabled: bool = True  # Exit if HTF closes below EMA200 (for longs)
-    
+
+    # RSI invalidation (parity with backtest.py HTF_TREND_DEFAULT_CONFIG / check_exits)
+    # invalidation_rsi_candles == min_hold_bars_before_rsi_exit in CLAUDE Pending Work naming
+    invalidation_rsi_candles: int = 6  # Min bars held before RSI invalidation can fire
+    invalidation_rsi_long_floor: int = 35  # Longs: exit when RSI below this (was 40 in older backtests)
+
+    # Macro: BTC daily close must be above BTC EMA(btc_ema_period) before long entries.
+    # Env HTF_REQUIRE_BTC_BULL unset → use field default; if set, parsed as bool (1/true/on).
+    require_btc_bull_market: bool = True
+    btc_ema_period: int = 200
+
     # Filters
     extension_ATR_mult: float = 3.0  # Skip if HTF price too extended from EMA20
     choppy_regime_adx_threshold: float = 15.0  # Skip if ADX too low (choppy)
@@ -60,6 +78,15 @@ class HTFTrendConfig:
     
     # ATR period
     atr_period: int = 14
-    
+
     # Swing detection
     swing_lookback_bars: int = 3
+
+    # Hold time limit (number of 1h candles before forced exit; matches DB config field)
+    max_hold_candles: int = 3
+
+    def __post_init__(self) -> None:
+        if os.environ.get("HTF_REQUIRE_BTC_BULL") is not None:
+            self.require_btc_bull_market = _parse_env_bool(
+                "HTF_REQUIRE_BTC_BULL", True
+            )

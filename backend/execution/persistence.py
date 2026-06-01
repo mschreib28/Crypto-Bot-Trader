@@ -18,7 +18,11 @@ from backend.execution.models import Fill
 logger = logging.getLogger(__name__)
 
 
-def persist_fill(fill: Fill, signal_id: Optional[str] = None) -> bool:
+def persist_fill(
+    fill: Fill,
+    signal_id: Optional[str] = None,
+    execution_live: Optional[bool] = None,
+) -> bool:
     """
     Persist a Fill object to the orders table and update signal status.
     
@@ -44,16 +48,19 @@ def persist_fill(fill: Fill, signal_id: Optional[str] = None) -> bool:
     try:
         session = get_session()
         
-        # TICKET-603: Detect shadow mode to set is_live and execution_mode
+        # TICKET-603 / Task 3: LIVE Kraken fills vs paper (optional override from caller)
         try:
-            from backend.api.routes.trading import get_shadow_live_mode
-            shadow_mode = get_shadow_live_mode()
-            is_live = not shadow_mode
-            execution_mode = 'shadow' if shadow_mode else 'live'
+            from backend.api.routes.trading import get_bot_mode
+
+            if execution_live is not None:
+                is_live = bool(execution_live)
+            else:
+                is_live = get_bot_mode() == "LIVE"
+            execution_mode = "live" if is_live else "shadow"
         except Exception as e:
-            logger.warning(f"Failed to detect shadow mode, defaulting to live: {e}")
-            is_live = True
-            execution_mode = 'live'
+            logger.warning(f"Failed to detect execution mode, defaulting to shadow: {e}")
+            is_live = False
+            execution_mode = "shadow"
         
         # Convert signal_id string to UUID if provided
         signal_uuid: Optional[uuid.UUID] = None
@@ -152,7 +159,11 @@ def persist_fill(fill: Fill, signal_id: Optional[str] = None) -> bool:
             session.close()
 
 
-def persist_fill_with_intent_id(fill: Fill, intent_id: str) -> bool:
+def persist_fill_with_intent_id(
+    fill: Fill,
+    intent_id: str,
+    execution_live: Optional[bool] = None,
+) -> bool:
     """
     Convenience wrapper that uses intent_id (from RiskDecision) as signal_id.
     
@@ -163,4 +174,4 @@ def persist_fill_with_intent_id(fill: Fill, intent_id: str) -> bool:
     Returns:
         True if persistence succeeded, False otherwise
     """
-    return persist_fill(fill, signal_id=intent_id)
+    return persist_fill(fill, signal_id=intent_id, execution_live=execution_live)

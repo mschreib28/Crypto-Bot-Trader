@@ -9,17 +9,13 @@ from sqlalchemy import text
 from backend.api.models import SystemStatus
 from backend.db import get_engine, get_session
 from backend.db.models import Strategy
+from backend.ingestor.health import is_ingestor_healthy
 from backend.redis import get_redis_client
 from backend.redis.keys import SYSTEM_HALT, PORTFOLIO_EXPOSURE_TOTAL
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-# Redis key for ingestor heartbeat (last timestamp when ingestor published data)
-INGESTOR_HEARTBEAT_KEY = "ingestor:heartbeat"
-# Maximum age in seconds for ingestor heartbeat to be considered healthy
-INGESTOR_HEARTBEAT_MAX_AGE_SECONDS = 60
 
 
 def _check_redis_connected() -> bool:
@@ -86,32 +82,6 @@ def _get_active_strategies_count() -> int:
             session.close()
 
 
-def _check_ingestor_healthy(client) -> bool:
-    """
-    Check if ingestor is healthy based on heartbeat timestamp.
-    
-    The ingestor is considered healthy if it has published a heartbeat
-    within the last INGESTOR_HEARTBEAT_MAX_AGE_SECONDS seconds.
-    """
-    try:
-        heartbeat = client.get(INGESTOR_HEARTBEAT_KEY)
-        if heartbeat is None:
-            # No heartbeat found - ingestor may not have started yet
-            # Return True to avoid false negatives on fresh deployments
-            return True
-        
-        # Parse timestamp and check age
-        heartbeat_time = datetime.fromisoformat(heartbeat.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        age_seconds = (now - heartbeat_time).total_seconds()
-        
-        return age_seconds <= INGESTOR_HEARTBEAT_MAX_AGE_SECONDS
-    except Exception as e:
-        logger.warning(f"Failed to check ingestor health: {e}")
-        # Return True to avoid false negatives if heartbeat parsing fails
-        return True
-
-
 @router.get("/status", summary="System status overview")
 async def get_status() -> SystemStatus:
     """
@@ -133,7 +103,7 @@ async def get_status() -> SystemStatus:
             client = get_redis_client()
             halted = _get_halted_status(client)
             portfolio_exposure = _get_portfolio_exposure(client)
-            ingestor_healthy = _check_ingestor_healthy(client)
+            ingestor_healthy = is_ingestor_healthy(client)
         except Exception as e:
             logger.error(f"Error fetching Redis data: {e}")
     

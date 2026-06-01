@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 
-interface ShadowLiveState {
+export interface ShadowLiveState {
   enabled: boolean;
   updatedAt: string | null;
 }
@@ -13,7 +13,7 @@ interface UseShadowLiveReturn {
   refetch: () => Promise<void>;
 }
 
-const POLL_INTERVAL_MS = 10000;
+const POLL_INTERVAL_MS = 30000;
 
 export function useShadowLive(): UseShadowLiveReturn {
   const [shadowLive, setShadowLive] = useState<ShadowLiveState | null>(null);

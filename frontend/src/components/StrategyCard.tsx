@@ -1,11 +1,14 @@
 import { useState } from 'react';
 import { Strategy } from '../types/strategy';
-import { useScreener } from '../hooks/useScreener';
-import { useMetrics } from '../hooks/useMetrics';
+import { getStrategyDisplayName } from '../utils/strategyLabels';
+import type { StrategyMetricsItem } from '../hooks/useMetrics';
 
 interface StrategyCardProps {
   strategy: Strategy;
   onToggle?: (strategyId: string, enabled: boolean) => Promise<boolean>;
+  totalScanned?: number;
+  screenerLoading?: boolean;
+  strategyMetrics?: StrategyMetricsItem;
 }
 
 const formatPnL = (pnl: number) => {
@@ -13,13 +16,15 @@ const formatPnL = (pnl: number) => {
   return `${sign}$${Math.abs(pnl).toFixed(2)}`;
 };
 
-export function StrategyCard({ strategy, onToggle }: StrategyCardProps) {
+export function StrategyCard({
+  strategy,
+  onToggle,
+  totalScanned = 0,
+  screenerLoading = false,
+  strategyMetrics,
+}: StrategyCardProps) {
   const { name, interval, max_risk_pct, enabled, strategy_id } = strategy;
-  const { totalScanned, loading } = useScreener({ strategyId: strategy_id });
-  const { metrics } = useMetrics();
   const [toggling, setToggling] = useState(false);
-
-  const strategyMetrics = metrics?.strategies[strategy_id];
   const accuracy = strategyMetrics?.accuracy_pct ?? 0;
   const pnl = strategyMetrics?.total_pnl ?? 0;
 
@@ -33,10 +38,7 @@ export function StrategyCard({ strategy, onToggle }: StrategyCardProps) {
     }
   };
 
-  // Format strategy name for better display
-  const displayName = name
-    .replace(/_/g, ' ')
-    .replace(/\b\w/g, (l) => l.toUpperCase());
+  const displayName = getStrategyDisplayName(name);
 
   return (
     <div className={`rounded-lg border ${
@@ -69,7 +71,7 @@ export function StrategyCard({ strategy, onToggle }: StrategyCardProps) {
 
       {/* Pairs count */}
       <div className="text-[10px] text-gray-500 mb-2">
-        {loading ? 'Scanning...' : `• ${totalScanned} pairs`}
+        {screenerLoading ? 'Scanning...' : `• ${totalScanned} pairs`}
       </div>
 
       {/* Metrics Grid - Compact */}

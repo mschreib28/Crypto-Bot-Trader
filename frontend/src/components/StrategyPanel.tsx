@@ -1,20 +1,29 @@
 import { StrategyCard } from './StrategyCard';
 import { Strategy } from '../types/strategy';
 
+import type { MetricsResponse } from '../hooks/useMetrics';
+
 interface StrategyPanelProps {
   strategies: Strategy[];
   loading?: boolean;
   error?: string | null;
   onToggle?: (strategyId: string, enabled: boolean) => Promise<boolean>;
+  totalScanned?: number;
+  screenerLoading?: boolean;
+  metrics?: MetricsResponse | null;
 }
 
-export function StrategyPanel({ strategies, loading = false, error = null, onToggle }: StrategyPanelProps) {
+export function StrategyPanel({
+  strategies,
+  loading = false,
+  error = null,
+  onToggle,
+  totalScanned = 0,
+  screenerLoading = false,
+  metrics = null,
+}: StrategyPanelProps) {
   return (
-    <section aria-labelledby="strategy-panel-title" className="flex flex-col min-h-0">
-      <h2 id="strategy-panel-title" className="mb-2 text-sm font-semibold text-gray-400 uppercase tracking-wide shrink-0">
-        Strategies
-      </h2>
-
+    <section aria-label="Strategy toggles" className="flex flex-col min-h-0">
       {loading && (
         <div className="text-gray-400 text-xs py-2">Loading...</div>
       )}
@@ -34,10 +43,13 @@ export function StrategyPanel({ strategies, loading = false, error = null, onTog
       {!loading && !error && strategies.length > 0 && (
         <div className="flex flex-col gap-2 overflow-y-auto min-h-0 max-h-[calc(100vh-600px)] pr-1">
           {strategies.map((strategy) => (
-            <StrategyCard 
-              key={strategy.strategy_id} 
-              strategy={strategy} 
+            <StrategyCard
+              key={strategy.strategy_id}
+              strategy={strategy}
               onToggle={onToggle}
+              totalScanned={totalScanned}
+              screenerLoading={screenerLoading}
+              strategyMetrics={metrics?.strategies[strategy.strategy_id]}
             />
           ))}
         </div>

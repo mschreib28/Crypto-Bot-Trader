@@ -204,6 +204,11 @@ class PerformanceMonitor:
             
             for key_bytes in redis.scan_iter(match="position:*"):
                 key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
+                # Skip sub-keys (cooldown, status, exit_reason, tp1, etc.) — actual
+                # position hashes have exactly one colon: "position:{symbol}".
+                # Sub-keys have more: "position:cooldown:{symbol}", etc.
+                if key.count(":") != 1:
+                    continue
                 try:
                     data = redis.hgetall(key)
                     if data:

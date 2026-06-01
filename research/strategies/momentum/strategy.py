@@ -66,6 +66,10 @@ class MomentumStrategy(BaseStrategy):
         # Used to calculate momentum indicators
         self._price_window: deque[float] = deque(maxlen=config.lookback_period + 1)
         
+        # Rolling window of bars for ATR calculation
+        # Need at least atr_period + 1 bars for ATR calculation
+        self._bars: deque[MarketDataEvent] = deque(maxlen=max(config.atr_period + 1, config.lookback_period + 1))
+        
         logger.info(
             f"Initialized MomentumStrategy: "
             f"lookback={config.lookback_period}, "
@@ -120,6 +124,9 @@ class MomentumStrategy(BaseStrategy):
         # Update price window with current bar's close price
         self._price_window.append(bar.close)
         
+        # Update bars window for ATR calculation
+        self._bars.append(bar)
+        
         # Calculate momentum indicator (ROC)
         roc = self._calculate_roc()
         
@@ -139,8 +146,8 @@ class MomentumStrategy(BaseStrategy):
                 f"Bullish momentum signal: ROC={roc:.2f}% >= "
                 f"threshold={self.config.roc_threshold}%"
             )
-        elif roc <= -self.config.roc_threshold:
-            # Bearish momentum: sell signal
+        elif not self.config.long_only and roc <= -self.config.roc_threshold:
+            # Bearish momentum: sell signal (disabled when long_only)
             signal_side = "sell"
             logger.info(
                 f"Bearish momentum signal: ROC={roc:.2f}% <= "
@@ -153,6 +160,28 @@ class MomentumStrategy(BaseStrategy):
                 f"[{-self.config.roc_threshold}%, {self.config.roc_threshold}%]"
             )
             return None
+        
+        # Calculate ATR for stop-loss calculation
+        bars_list = list(self._bars)
+        if len(bars_list) < self.config.atr_period + 1:
+            logger.debug("Insufficient bars for ATR calculation")
+            return None
+        
+        highs = [b.high for b in bars_list]
+        lows = [b.low for b in bars_list]
+        closes = [b.close for b in bars_list]
+        
+        atr = calculate_atr(highs, lows, closes, period=self.config.atr_period)
+        if atr is None or atr == 0:
+            logger.debug("Could not calculate ATR")
+            return None
+        
+        # Calculate stop-loss price
+        entry_price = bar.close
+        if signal_side == "buy":
+            stop_loss_price = entry_price - (atr * self.config.atr_stop_mult)
+        else:  # sell
+            stop_loss_price = entry_price + (atr * self.config.atr_stop_mult)
         
         # Create TradeIntent with indicator values in metadata
         intent = TradeIntent(
@@ -168,6 +197,9 @@ class MomentumStrategy(BaseStrategy):
                 "current_price": bar.close,
                 "bar_timestamp": bar.timestamp,
                 "interval": bar.interval,
+                "stop_loss_price": round(stop_loss_price, 8),
+                "atr": round(atr, 8),
+                "atr_stop_mult": self.config.atr_stop_mult,
             },
         )
         
@@ -375,7 +407,10 @@ class MomentumStrategy(BaseStrategy):
         # (confidence filtering is handled by _apply_confidence_threshold in screener)
         signal_type = "NONE"
         if roc_meets_threshold:
-            signal_type = "BUY" if direction == "bullish" else "SELL"
+            if direction == "bullish":
+                signal_type = "BUY"
+            elif not self.config.long_only:
+                signal_type = "SELL"
         
         return SignalResult(
             symbol=symbol,
