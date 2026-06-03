@@ -461,6 +461,21 @@ class Trade:
     bars_held: int = 0
     symbol: str = ""                 # pipeline mode only
     grade: str = ""                  # pipeline mode only
+    # Entry-time factor snapshot (CSV logging only; empty when unavailable)
+    entry_rvol: Optional[float] = None
+    entry_change_24h_pct: Optional[float] = None
+    entry_change_4h_pct: Optional[float] = None
+    entry_volume_24h_usd: Optional[float] = None
+    entry_market_cap_usd: Optional[float] = None
+    entry_float_turnover: Optional[float] = None
+    entry_btc_4h_change_pct: Optional[float] = None
+    entry_supply_pct: Optional[float] = None
+    entry_vwap_distance_pct: Optional[float] = None
+    entry_htf_rsi: Optional[float] = None
+    entry_atr_pct: Optional[float] = None
+    entry_utc_hour: Optional[int] = None
+    entry_day_of_week: Optional[int] = None
+    entry_year_month: Optional[str] = None
 
 
 # ─── OHLCV Fetcher (Binance klines → USDT bars; universe symbols stay Kraken) ─
@@ -1800,6 +1815,11 @@ def run_backtest(
     vb_btc_daily_bars: Optional[list[Bar]] = None,
     htf_btc_daily_bars: Optional[list[Bar]] = None,
     vwap_htf_bars: Optional[list[Bar]] = None,
+    symbol: str = "",
+    btc_bars: Optional[list[Bar]] = None,
+    supply: Optional[float] = None,
+    interval_min: int = 15,
+    rvol_lb_override: Optional[int] = None,
 ) -> tuple[list[Trade], list[float]]:
     """
     Bar-by-bar replay for a single symbol.
@@ -1891,6 +1911,19 @@ def run_backtest(
             if signal is not None:
                 counter       += 1
                 signal.trade_num = counter
+                if symbol:
+                    signal.symbol = symbol
+                _populate_trade_entry_log(
+                    signal,
+                    bars_so_far,
+                    btc_bars=btc_bars,
+                    interval_min=interval_min,
+                    supply=supply,
+                    cfg=cfg,
+                    strategy=strategy,
+                    rvol_lb_override=rvol_lb_override,
+                    htf_bars=vwap_htf_bars,
+                )
                 open_trade    = signal
 
         equity_curve.append(equity)
@@ -2291,6 +2324,25 @@ def run_pipeline_backtest(
                     signal.trade_num  = counter
                     signal.symbol     = best_symbol
                     signal.grade      = best_grade
+                    htf_for_log: Optional[list[Bar]] = None
+                    if strategy in ("vwap_meanrev", "vwap_meanrev_1h"):
+                        if vwap_htf_bars_by_symbol and best_symbol:
+                            raw_htf = vwap_htf_bars_by_symbol.get(best_symbol)
+                            if raw_htf:
+                                t_end = _sl[-1].timestamp
+                                htf_for_log = [b for b in raw_htf if b.timestamp <= t_end]
+                    _populate_trade_entry_log(
+                        signal,
+                        _sl,
+                        btc_bars=btc_bars[: i + 1] if btc_bars else None,
+                        interval_min=interval_min,
+                        supply=supplies.get(best_symbol),
+                        cfg=cfg,
+                        strategy=strategy,
+                        rvol_lb_override=rvol_lb,
+                        htf_bars=htf_for_log,
+                        relax=relax,
+                    )
                     active_trade      = signal
                     active_symbol     = best_symbol
 
@@ -2547,16 +2599,142 @@ def print_pipeline_calendar_year_breakdown(trades: list[Trade]) -> None:
     print("  " + "─" * w)
 
 
+# CSV columns appended after bars_held (entry-time factor snapshot)
+ENTRY_LOG_CSV_COLUMNS = [
+    "entry_rvol",
+    "entry_change_24h_pct",
+    "entry_change_4h_pct",
+    "entry_volume_24h_usd",
+    "entry_market_cap_usd",
+    "entry_float_turnover",
+    "entry_btc_4h_change_pct",
+    "entry_supply_pct",
+    "entry_vwap_distance_pct",
+    "entry_htf_rsi",
+    "entry_atr_pct",
+    "entry_utc_hour",
+    "entry_day_of_week",
+    "entry_year_month",
+]
+
+_VWAP_LOG_STRATEGIES = frozenset({"vwap_meanrev", "vwap_meanrev_1h", "pullback_vwap"})
+
+
+def _format_entry_log_cell(value: Any) -> str:
+    """Format one entry-log field for CSV; missing → empty string."""
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if value != value:
+            return ""
+        return f"{value:.6g}"
+    if isinstance(value, int):
+        return str(value)
+    return str(value)
+
+
+def _signed_vwap_distance_pct(bars: list[Bar], cfg: dict) -> Optional[float]:
+    """Signed % distance from VWAP (positive = above VWAP), screener convention."""
+    if len(bars) < 2:
+        return None
+    lookback = cfg.get("anchored_vwap_lookback", DEFAULT_CONFIG["anchored_vwap_lookback"])
+    session_vwap, anchored_vwap = _compute_vwap(bars, lookback)
+    vwap = anchored_vwap if anchored_vwap else session_vwap
+    if not vwap or vwap <= 0:
+        return None
+    price = bars[-1].close
+    return (price - vwap) / vwap * 100.0
+
+
+def _entry_atr_pct(bars: list[Bar], entry_price: float, cfg: dict) -> Optional[float]:
+    if not entry_price or entry_price <= 0 or len(bars) < 3:
+        return None
+    period = cfg.get("atr_period", DEFAULT_CONFIG["atr_period"])
+    closes = [b.close for b in bars]
+    highs = [b.high for b in bars]
+    lows = [b.low for b in bars]
+    atr = calculate_atr(highs, lows, closes, period=period)
+    if not atr:
+        return None
+    return atr / entry_price * 100.0
+
+
+def _apply_entry_time_derivatives(trade: Trade) -> None:
+    et = trade.entry_time
+    if et.tzinfo is None:
+        et = et.replace(tzinfo=timezone.utc)
+    else:
+        et = et.astimezone(timezone.utc)
+    trade.entry_utc_hour = et.hour
+    trade.entry_day_of_week = et.weekday()
+    trade.entry_year_month = et.strftime("%Y-%m")
+
+
+def _populate_trade_entry_log(
+    trade: Trade,
+    bars: list[Bar],
+    *,
+    btc_bars: Optional[list[Bar]],
+    interval_min: int,
+    supply: Optional[float],
+    cfg: dict,
+    strategy: str,
+    rvol_lb_override: Optional[int] = None,
+    htf_bars: Optional[list[Bar]] = None,
+    relax: bool = False,
+) -> None:
+    """
+    Fill Trade entry-log fields from OHLCV + pipeline grader (logging only).
+    market_cap, supply_ratio, float_turnover need external static data → left empty.
+    """
+    graded = _grade_pair_at_bar(
+        bars,
+        btc_bars or [],
+        interval_min,
+        supply,
+        relax=relax,
+        rvol_lb_override=rvol_lb_override,
+        pipeline_strategy=strategy if strategy == "meanrev" else None,
+    )
+    pillars = graded.get("pillars") or {}
+    d1 = pillars.get("d1_rvol") or {}
+    d2 = pillars.get("d2_momentum") or {}
+    d3 = pillars.get("d3_volume") or {}
+    d4 = pillars.get("d4_btc") or {}
+
+    trade.entry_rvol = d1.get("value")
+    trade.entry_change_24h_pct = d2.get("value")
+    trade.entry_change_4h_pct = d2.get("value_4h")
+    vol = d3.get("value")
+    trade.entry_volume_24h_usd = float(vol) if vol is not None else None
+    trade.entry_btc_4h_change_pct = d4.get("value")
+
+    trade.entry_market_cap_usd = None
+    trade.entry_supply_pct = None
+    trade.entry_float_turnover = None
+
+    if strategy in _VWAP_LOG_STRATEGIES:
+        trade.entry_vwap_distance_pct = _signed_vwap_distance_pct(bars, cfg)
+    if strategy in ("vwap_meanrev", "vwap_meanrev_1h"):
+        rsi_period = cfg.get("rsi_period", DEFAULT_CONFIG["rsi_period"])
+        trade.entry_htf_rsi = _vwap_htf_rsi_at(htf_bars, rsi_period, trade.entry_time)
+
+    trade.entry_atr_pct = _entry_atr_pct(bars, trade.entry_price, cfg)
+    _apply_entry_time_derivatives(trade)
+
+
 def write_csv(trades: list[Trade], output_path: str, cfg: dict) -> None:
-    if not trades:
-        return
     with open(output_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
             "trade_num", "symbol", "grade", "side", "entry_time", "exit_time",
             "entry_price", "exit_price", "stop_loss", "tp1_price", "tp2_price",
             "qty", "tp1_hit", "pnl_usd", "pnl_pct", "exit_reason", "bars_held",
+            *ENTRY_LOG_CSV_COLUMNS,
         ])
+        if not trades:
+            print(f"\n  Trades CSV: {output_path} (header only — no trades)")
+            return
         for t in trades:
             notional = t.entry_price * t.qty
             pnl_pct  = (t.pnl_usd / notional * 100.0) if notional else 0.0
@@ -2578,6 +2756,7 @@ def write_csv(trades: list[Trade], output_path: str, cfg: dict) -> None:
                 round(pnl_pct,       4),
                 t.exit_reason,
                 t.bars_held,
+                *[_format_entry_log_cell(getattr(t, col)) for col in ENTRY_LOG_CSV_COLUMNS],
             ])
     print(f"\n  Trades CSV: {output_path}")
 
@@ -3056,6 +3235,19 @@ def main() -> None:
             except Exception as e:
                 print(f"  WARNING: HTF fetch for RSI gate failed: {e}")
 
+        btc_bars_single: Optional[list[Bar]] = None
+        try:
+            btc_bars_single = fetch_binance_ohlcv_for_backtest(
+                BTC_KRAKEN, interval, span_days, no_cache=args.no_cache
+            )
+        except Exception as e:
+            print(f"  WARNING: BTC bars for entry-log D4 failed: {e}")
+
+        bpd_single = max(1, 1440 // INTERVAL_MAP[interval])
+        ideal_rvol_lb = bpd_single * PIPELINE_RVOL_DAYS
+        max_rvol_lb = max(bpd_single * 7, int(len(bars) * 0.5))
+        rvol_lb_single = min(ideal_rvol_lb, max_rvol_lb)
+
         trades, equity_curve = run_backtest(
             bars,
             cfg,
@@ -3069,6 +3261,11 @@ def main() -> None:
             vb_btc_daily_bars=vb_btc_daily_s,
             htf_btc_daily_bars=htf_btc_daily_s,
             vwap_htf_bars=vwap_htf_single,
+            symbol=args.symbol,
+            btc_bars=btc_bars_single,
+            supply=_get_supply(args.symbol, {}),
+            interval_min=INTERVAL_MAP[interval],
+            rvol_lb_override=rvol_lb_single,
         )
 
         print_metrics(

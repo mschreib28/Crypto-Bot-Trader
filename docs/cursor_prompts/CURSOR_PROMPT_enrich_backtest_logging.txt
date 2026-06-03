@@ -1,0 +1,102 @@
+You are enriching the backtest's trade-logging output so that each completed
+trade captures the entry-time screener factor snapshot, not just the exit
+outcome.
+
+## Why
+
+Currently `backtest_trades.csv` has 17 columns: trade_num, symbol, grade,
+side, entry_time, exit_time, entry_price, exit_price, stop_loss, tp1_price,
+tp2_price, qty, tp1_hit, pnl_usd, pnl_pct, exit_reason, bars_held.
+
+These tell us WHAT happened but not the CONDITIONS at entry. To analyze
+which scanner factors actually predict winning trades, we need each trade
+row to include the multi-pillar factor values at the moment of entry.
+
+## Required new columns
+
+Add these columns to the CSV output (preserve existing columns, add these
+after `bars_held`):
+
+| Column | Source | Notes |
+|---|---|---|
+| entry_rvol | screener D1 score | Pair's RVOL at entry bar |
+| entry_change_24h_pct | screener D2 metric | 24h price change % at entry |
+| entry_change_4h_pct | screener D2 alt | 4h price change % at entry |
+| entry_volume_24h_usd | screener D3 | 24h USD volume at entry |
+| entry_market_cap_usd | E1 numerator | Market cap at entry |
+| entry_float_turnover | E1 score | volume_24h_usd / market_cap_usd |
+| entry_btc_4h_change_pct | D4 regime | BTC's own 4h change at entry |
+| entry_supply_pct | S1 metric | Circulating supply ratio if available |
+| entry_vwap_distance_pct | strategy-specific | Signed % distance from VWAP |
+| entry_htf_rsi | vwap_meanrev specific | HTF RSI value at entry |
+| entry_atr_pct | volatility context | ATR / entry_price as % |
+| entry_utc_hour | derived from entry_time | Integer 0-23 |
+| entry_day_of_week | derived | Integer 0=Monday |
+| entry_year_month | derived | "YYYY-MM" for regime analysis |
+
+If any value is unavailable at backtest time, write empty string (not NaN,
+not None — keep CSV clean). Do NOT fail the trade or skip the row if a
+factor is missing.
+
+## Implementation guidance
+
+1. Read `backtest.py`. Find where trades are written to `backtest_trades.csv`.
+   It's probably in a function that opens the CSV and writes a row per
+   trade after each backtest completes.
+
+2. Identify what data is already available in scope at trade-write time:
+   - The Bar list for the symbol (price, volume, timestamps)
+   - The strategy config
+   - The BTC bars (for BTC regime)
+   - The signal/entry context
+
+3. For factors derivable from Bar data already in scope (entry_change_24h_pct,
+   entry_change_4h_pct, entry_btc_4h_change_pct, entry_atr_pct, time
+   derivations): compute them inline from the bars at entry time.
+
+4. For factors that come from the screener (rvol, market_cap, supply_pct):
+   the backtester may not actually run the screener at every entry. Check.
+   If the screener IS run, use its output. If not, compute what you can
+   from the bars and leave market_cap/supply_pct empty for now.
+
+5. For strategy-specific factors (vwap_distance_pct, htf_rsi): the strategy
+   already computes these for its entry decision. Capture them at entry
+   time and pass through to the trade record.
+
+## Constraints
+
+- Do NOT change the existing 17 columns — only APPEND new columns
+- Do NOT change the strategy entry/exit logic — only the LOGGING
+- Do NOT modify any file outside backtest.py and one or two helper files
+  if needed for factor computation
+- Do NOT run backtests as part of this task
+- The CSV must remain readable by pandas / standard CSV parsers
+- Empty fields should be empty string "", not the literal text "None"
+
+## Validation
+
+After your changes, do these checks:
+
+1. `head -1 backtest_trades.csv` should show all 17 original + ~14 new
+   columns separated by commas
+2. Run a short test: `python backtest.py --strategy vwap_meanrev --days 60
+   --interval 4h` and verify it completes without error (it may produce
+   0 trades — that's fine)
+3. If it produces trades, `head -2 backtest_trades.csv` should show one
+   header row + at least one trade row with values in the new columns
+
+## Output
+
+When done, do the following:
+
+1. Print a summary diff: which functions you modified, which factors are
+   populated vs left empty, and why
+2. List any factor that is NOT capturable from current backtest scope
+   (e.g., "market_cap requires external data not loaded by backtester")
+   so the human can decide whether to source that data later
+3. Print the new CSV header line so the human can verify column names
+4. Print ONE LINE at the end: "Trade logging enriched with N new columns.
+   Ready to re-run baseline backtest."
+
+DO NOT auto-commit. Leave the change in the working directory for human
+review and git commit.

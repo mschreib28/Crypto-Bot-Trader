@@ -53,3 +53,5 @@ experiments/generations/
 activity_log.json
 backtest_cache/
 backtest_trades.csv
+experiments/experiments.yaml.bak
+experiments/experiments.yaml.preV2.bak

@@ -97,3 +97,21 @@ You can then decide to accept the config and deploy, or set new direction
 to break out of the local optimum.)
 
 (Not yet converged)
+## Parameter Passthrough Status (verified 2026-06-01)
+
+### Working (use freely)
+- `long_min_volume_ratio` — entry filter (in strategy.py)
+- `atr_stop_mult` — stop calculation (in strategy.py)
+
+### BROKEN — silently ignored (DO NOT propose until fixed)
+- `htf_rsi_long_max` — exp_004 and exp_005 identical to baseline
+- `breakeven_requires_tp1` — exp_006 and exp_008 identical to non-breakeven versions
+
+### Likely root cause
+The broken parameters affect logic that lives in `backend/positions/monitor.py`
+(the LIVE position manager), but `backtest.py` simulates exits via a different
+code path that never reads these config fields. The backtester needs to honor
+these parameters in its own exit simulation OR import the monitor logic.
+
+### Affected experiments to re-run after fix
+exp_004, exp_005, exp_006, exp_008

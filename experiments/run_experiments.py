@@ -86,13 +86,14 @@ def run_backtest(exp_id: str, strategy: str, days: int, interval: str,
         "--interval", interval,
     ]
     for key, val in (overrides or {}).items():
-        flag = "--" + key.replace("_", "-")
-        # Booleans become flag-only if true, omitted if false
+        flag_base = key.replace("_", "-")
         if isinstance(val, bool):
             if val:
-                cmd.append(flag)
+                cmd.append(f"--{flag_base}")
+            else:
+                cmd.append(f"--no-{flag_base}")
         else:
-            cmd.extend([flag, str(val)])
+            cmd.extend([f"--{flag_base}", str(val)])
 
     log(f"  RUN {exp_id}: {' '.join(cmd)}")
     try:
