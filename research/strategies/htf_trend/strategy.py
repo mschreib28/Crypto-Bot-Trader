@@ -366,6 +366,9 @@ class HTFTrendStrategy(BaseStrategy):
             return None
         
         # Calculate entry, stop, and targets
+        if trend_direction != 'bullish' and self.config.long_only:
+            return None
+
         if trend_direction == 'bullish':
             side = "buy"
             entry_price = ema20 + (atr * 0.02)  # Small buffer above EMA20
@@ -547,9 +550,10 @@ class HTFTrendStrategy(BaseStrategy):
                         else:
                             confirmation_score = 30.0
                             confidence += confirmation_score
-                            signal_type = (
-                                "BUY" if trend_direction == "bullish" else "SELL"
-                            )
+                            if trend_direction == "bullish":
+                                signal_type = "BUY"
+                            elif not self.config.long_only:
+                                signal_type = "SELL"
             
             return SignalResult(
                 symbol=symbol,

@@ -64,6 +64,9 @@ class VolatilityBreakoutConfig:
     # ATR period
     atr_period: int = 14
 
+    # Direction constraint
+    long_only: bool = True  # Permanently disable short signals; bot is long-only by design
+
     # Monitor-level config (read by position monitor, not used by strategy logic)
     max_hold_candles: Optional[int] = None  # Overrides monitor default when set in DB config
 

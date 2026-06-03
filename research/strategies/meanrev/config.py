@@ -60,6 +60,9 @@ class MeanReversionConfig:
     # Strategy identifier
     strategy_id: str = "mean_reversion"
 
+    # Direction constraint
+    long_only: bool = True  # Permanently disable short signals; bot is long-only by design
+
 
 def get_config_schema() -> Dict[str, Any]:
     """Return the configuration schema for mean reversion strategy.

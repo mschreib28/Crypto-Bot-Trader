@@ -529,6 +529,10 @@ class VolatilityBreakoutStrategy(BaseStrategy):
                 if atr is None or atr == 0:
                     self._clear_breakout_state(bar.symbol)
                     return None
+
+                if breakout_direction != 'long' and self.config.long_only:
+                    self._clear_breakout_state(bar.symbol)
+                    return None
                 
                 # Entry price slightly above retest level
                 if breakout_direction == 'long':
@@ -681,7 +685,10 @@ class VolatilityBreakoutStrategy(BaseStrategy):
                 # Breakout detected
                 breakout_score = 40.0
                 confidence += breakout_score
-                signal_type = "BUY" if direction == 'long' else "SELL"
+                if direction == 'long':
+                    signal_type = "BUY"
+                elif not self.config.long_only:
+                    signal_type = "SELL"
 
             # Volume confirmation
             volume_sma = sum(volumes[-self.config.volume_sma_period:]) / self.config.volume_sma_period

@@ -175,6 +175,7 @@ MEANREV_DEFAULT_CONFIG: dict = {
     "invalidation_vwap_atr_mult":  10.0,  # Effectively disabled — not applicable to meanrev
     "invalidation_rsi_candles":    4,
     "min_stop_pct":                5.0,
+    "long_only":                   True,   # Mirrors MeanReversionConfig; live bot is long-only by design
 }
 
 # Strategy I1 — Bull Flag + Momentum Pullback (mirrors BullFlagConfig + shared exits)
@@ -268,6 +269,7 @@ VOLATILITY_BREAKOUT_DEFAULT_CONFIG: dict = {
     # BTC macro (pipeline uses Binance 1d XBT/USD; live uses Kraken daily in strategy)
     "require_btc_bull_market":       True,
     "btc_ema_period":                200,
+    "long_only":                     True,   # Mirrors VolatilityBreakoutConfig; live bot is long-only by design
 }
 
 
@@ -324,6 +326,7 @@ HTF_TREND_DEFAULT_CONFIG: dict = {
     # BTC macro bull gate (daily close > BTC EMA(btc_ema_period))
     "require_btc_bull_market":        True,
     "btc_ema_period":                 200,
+    "long_only":                      True,   # Mirrors HTFTrendConfig; live bot is long-only by design
 }
 
 # ─── Pipeline grader constants (mirrors pipeline.py — no Redis required) ──────

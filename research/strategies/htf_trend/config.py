@@ -38,6 +38,9 @@ class HTFTrendConfig:
     reversal_body_pct: float = 0.5  # Body must be >= this % of candle range
     reversal_close_position_long: float = 0.7  # Close in top X% for long
     reversal_close_position_short: float = 0.3  # Close in bottom X% for short
+
+    # Direction constraint
+    long_only: bool = True  # Permanently disable short signals; bot is long-only by design
     
     # Stop-loss
     atr_stop_mult: float = 1.5  # Stop distance = ATR * this (minimum)

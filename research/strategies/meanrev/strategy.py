@@ -257,6 +257,9 @@ class MeanReversionStrategy(BaseStrategy):
                 },
             )
         
+        if self.config.long_only:
+            return None
+
         # Generate sell signal (overbought condition)
         # Price should be near upper band (band_position > 0.8) AND RSI overbought
         if band_position > 0.8 and rsi > self.config.rsi_overbought_threshold:
@@ -535,7 +538,10 @@ class MeanReversionStrategy(BaseStrategy):
         # Without ranging market, mean reversion is dangerous
         signal_type = "NONE"
         if is_ranging:
-            signal_type = "BUY" if direction == "bullish" else "SELL"
+            if direction == "bullish":
+                signal_type = "BUY"
+            elif not self.config.long_only:
+                signal_type = "SELL"
         
         return SignalResult(
             symbol=symbol,

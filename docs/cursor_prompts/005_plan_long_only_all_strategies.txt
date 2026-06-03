@@ -1,0 +1,139 @@
+[Run this in /plan mode. Start with: cursor-agent --mode plan]
+
+You are planning a fix to bring long_only enforcement consistency to all crypto
+trading strategies. The previous fix to vwap_meanrev established the pattern.
+We now need to apply the same pattern to volatility_breakout, htf_trend, and
+meanrev.
+
+## Read first
+
+Before planning, read these files for full context:
+- DIAGNOSIS_LONG_ONLY.md (the diagnosis that led to the vwap_meanrev fix)
+- PRE_FLIGHT_LONGONLY.md (per-strategy enforcement state)
+- PROJECT_CONTEXT.md (overall project structure)
+- backtest.py (especially DEFAULT_CONFIG, check_entry_signal, check_htf_trend_entry_signal,
+  check_volatility_breakout_entry_signal, check_meanrev_entry_signal — whichever exist)
+- research/strategies/volatility_breakout/{config,strategy}.py
+- research/strategies/htf_trend/{config,strategy}.py
+- research/strategies/meanrev/{config,strategy}.py
+
+## The Established Pattern (from vwap_meanrev fix)
+
+1. Add `long_only: bool = True` to the strategy's Config dataclass
+2. Add `"long_only": True` to DEFAULT_CONFIG in backtest.py if a shared config
+   is used (or to the strategy-specific config dict if separate)
+3. Gate the short branch in the backtest entry function via cfg.get("long_only", True)
+4. Ensure the live strategy class respects the config flag too (check that
+   strategy.py's signal generation has equivalent gating)
+5. Tests: confirm no test breaks; if a test asserts shorts are produced in
+   pipeline mode, flag it (don't fix)
+
+## Strategies that need this treatment
+
+Per PRE_FLIGHT_LONGONLY.md, these three strategies have inconsistency:
+
+| Strategy | Config has long_only? | Live can short? | Backtest can short? |
+|---|---|---|---|
+| volatility_breakout | No field | Unknown | Implicit long-only |
+| htf_trend | No field | Yes (live can emit shorts) | Implicit long-only |
+| meanrev | No field | Yes (live can emit shorts) | Implicit long-only |
+
+For htf_trend and meanrev, this is the OPPOSITE of vwap_meanrev's bug:
+backtest correctly produces longs only, but live can emit shorts the backtest
+never simulates. This is the more dangerous direction because live behavior
+diverges from what was validated.
+
+## Your Plan task
+
+DO NOT WRITE CODE. Produce a written plan covering:
+
+1. **Verification step**: For each of the three strategies, confirm what
+   PRE_FLIGHT_LONGONLY.md says is accurate by reading the actual code. Flag any
+   discrepancies between what the document claims and what the code shows.
+
+2. **Per-strategy fix specification**: For EACH of the three strategies,
+   specify exactly:
+   - Which Config dataclass to modify and what default to use
+   - Which strategy.py function(s) need gating (if any)
+   - Which backtest.py function(s) need gating (if any)
+   - Whether the existing backtest path already enforces long-only (in which
+     case the strategy.py-only fix is sufficient)
+
+3. **Order of operations**: The order matters. If we modify the Config
+   dataclass first but tests expect the old structure, we break tests
+   transiently. If we modify backtest.py first but Config still allows
+   shorts, the gate is broken until next step.
+
+4. **Test impact**: Which existing tests will be affected? List them with
+   file paths. Predict which will pass / fail after the change.
+
+5. **Rollback plan**: If we commit and the live shadow bot starts behaving
+   incorrectly, how do we revert? What's the minimal revert that doesn't
+   undo the vwap_meanrev fix?
+
+6. **Risk assessment**: For each strategy, what's the likelihood the change
+   breaks existing behavior the user actually wants?
+
+## Output format
+
+Write the plan to PLAN_LONGONLY_FIX_ALL_STRATEGIES.md at the project root.
+
+Use this structure:
+
+```markdown
+# Plan: Long-Only Enforcement Across All Strategies
+
+## Verification of Pre-Flight Claims
+
+<For each strategy, confirm or correct what PRE_FLIGHT_LONGONLY.md says.
+Cite file:line references.>
+
+## Per-Strategy Fix Plan
+
+### volatility_breakout
+- Config change: <exact dataclass, field, default>
+- strategy.py change: <function name, gating location, or "none needed">
+- backtest.py change: <function name, gating location, or "none needed">
+- Live behavior impact: <whether live shadow trades behavior changes>
+
+### htf_trend
+<same structure>
+
+### meanrev
+<same structure>
+
+## Order of Operations
+<numbered list, smallest possible commits>
+
+## Tests Affected
+<list with file paths and predictions>
+
+## Rollback Plan
+<exact git commands and what they undo>
+
+## Risk Assessment
+<per-strategy, with severity>
+
+## Open Questions
+<anything you need the human to decide before implementation>
+```
+
+## After Writing the Plan
+
+End your output with ONE LINE summary describing what the human needs to decide
+before you can proceed to implementation.
+
+Example: "Plan written. Need user to confirm: (1) keep shorts as opt-in via
+--no-long-only for all strategies, (2) whether to add unit tests for the new
+config field per strategy."
+
+## Constraints
+
+- DO NOT MODIFY ANY CODE FILES
+- DO NOT RUN BACKTESTS
+- DO write the plan markdown file
+- DO read the existing code thoroughly before planning
+- If you encounter a strategy that already has long_only enforcement
+  (somehow we missed it in pre-flight), document that finding and skip it
+- If you find another bug while reading the code, note it in the plan's
+  "Open Questions" section — do not fix it

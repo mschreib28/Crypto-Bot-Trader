@@ -1,0 +1,200 @@
+You are setting up a comprehensive baseline sweep across multiple strategies
+and timeframes to identify which combinations have real long-only edge.
+
+## Context
+
+We just fixed a long_only violation in the backtester. The clean baseline
+for vwap_meanrev at 4h is now:
+- 17 trades over 5 years (~3.4/year)
+- 35.3% WR, 3.28 R:R, +$1.60 P&L
+- Statistically unconfirmable at this trade frequency
+
+We need to determine whether the strategy has more edge at different
+timeframes, and whether OTHER strategies have stronger edges. This is
+a sweep across (strategy × timeframe) to identify viable combinations
+before doing any further optimization.
+
+## Strategies and Timeframes to Test
+
+| Strategy | Timeframes to test | Notes |
+|---|---|---|
+| vwap_meanrev | 5m, 15m, 1h, 4h | 4h already done, will re-run for consistency |
+| volatility_breakout | 1h, 4h | Was strong at $23.99 over 5y (unverified post-fix) |
+| htf_trend | 1h, 4h | Was +$7.99 over 5y (unverified post-fix) |
+| meanrev | 1h, 4h | Untested in current round |
+
+That's 4 strategies × varying timeframes = 12 baseline backtests total.
+
+NOTE: bull_flag strategies use intra-day timeframes; skip them for this sweep.
+Swing strategies use daily; also skip.
+
+## Your Task
+
+### Step 1: Pre-flight check — verify long_only enforcement applies to other strategies
+
+For each strategy in the sweep (vwap_meanrev, volatility_breakout, htf_trend,
+meanrev), verify that:
+
+1. The strategy's config has a `long_only` field (or equivalent) and a default
+2. The backtest path used by run_pipeline_backtest honors this for each strategy
+3. If long_only is NOT enforced for a strategy, document the gap in a file
+   called PRE_FLIGHT_LONGONLY.md at the project root
+
+Read these files:
+- research/strategies/volatility_breakout/config.py and strategy.py
+- research/strategies/htf_trend/config.py and strategy.py
+- research/strategies/meanrev/config.py and strategy.py
+- backtest.py (especially check_entry_signal and check_htf_trend_entry_signal
+  and similar functions for the other strategies)
+
+DO NOT FIX any gaps you find — just document them. We need to know before
+running the sweep so we can interpret results correctly.
+
+### Step 2: Build the sweep experiments.yaml
+
+Replace experiments/experiments.yaml with a new file containing all 12
+baselines. Use this exact structure (note: NO config_overrides — pure
+baselines):
+
+```yaml
+# Multi-timeframe baseline sweep
+# Purpose: identify (strategy × timeframe) combos with real long-only edge
+# Generated after long_only fix in backtest.py
+
+baseline:
+  description: "vwap_meanrev 4h baseline (post-long-only fix, reference)"
+  strategy: vwap_meanrev
+  days: 1826
+  interval: 4h
+  config_overrides: {}
+
+experiments:
+  # ─── vwap_meanrev timeframe sweep ───
+  - id: sweep_001_vwap_meanrev_5m
+    description: "vwap_meanrev on 5m bars"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 5m
+    config_overrides: {}
+
+  - id: sweep_002_vwap_meanrev_15m
+    description: "vwap_meanrev on 15m bars"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 15m
+    config_overrides: {}
+
+  - id: sweep_003_vwap_meanrev_1h
+    description: "vwap_meanrev on 1h bars"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 1h
+    config_overrides: {}
+
+  # ─── volatility_breakout timeframe sweep ───
+  - id: sweep_004_volatility_breakout_1h
+    description: "volatility_breakout on 1h bars"
+    strategy: volatility_breakout
+    days: 1826
+    interval: 1h
+    config_overrides: {}
+
+  - id: sweep_005_volatility_breakout_4h
+    description: "volatility_breakout on 4h bars (was strong in prior tests)"
+    strategy: volatility_breakout
+    days: 1826
+    interval: 4h
+    config_overrides: {}
+
+  # ─── htf_trend timeframe sweep ───
+  - id: sweep_006_htf_trend_1h
+    description: "htf_trend on 1h bars"
+    strategy: htf_trend
+    days: 1826
+    interval: 1h
+    config_overrides: {}
+
+  - id: sweep_007_htf_trend_4h
+    description: "htf_trend on 4h bars (was profitable in prior tests)"
+    strategy: htf_trend
+    days: 1826
+    interval: 4h
+    config_overrides: {}
+
+  # ─── meanrev timeframe sweep ───
+  - id: sweep_008_meanrev_1h
+    description: "meanrev (BB+RSI+ADX) on 1h bars"
+    strategy: meanrev
+    days: 1826
+    interval: 1h
+    config_overrides: {}
+
+  - id: sweep_009_meanrev_4h
+    description: "meanrev (BB+RSI+ADX) on 4h bars"
+    strategy: meanrev
+    days: 1826
+    interval: 4h
+    config_overrides: {}
+```
+
+Save the OLD experiments.yaml as experiments.yaml.preSweep.bak before
+overwriting.
+
+### Step 3: Sanity check each strategy invocation
+
+Before kicking off the sweep, do a 60-day smoke test for EACH unique
+(strategy, interval) combination above. This catches any "strategy doesn't
+support this interval" errors immediately rather than 12 hours into a sweep.
+
+For each (strategy, interval) pair, run:
+  python backtest.py --strategy <s> --days 60 --interval <tf>
+
+Capture exit code and last 5 lines of output. If any fail, document the
+failure in PRE_FLIGHT_LONGONLY.md under a "## Strategy/Timeframe Errors"
+section. Remove failing entries from experiments.yaml.
+
+DO NOT proceed to the full sweep if more than 2 (strategy, interval) pairs
+fail smoke tests. Report back and let the human decide.
+
+### Step 4: Document expected runtime
+
+In PRE_FLIGHT_LONGONLY.md, add an estimate:
+- Baseline (vwap_meanrev 4h): completes in ~15 min
+- Each new strategy/timeframe: ?? min (depends on bar count)
+
+For 5m bars, expect significantly longer per-symbol processing.
+Estimate total sweep runtime. The human will decide whether to run
+all 9 in one go or in stages.
+
+## Constraints
+
+- DO NOT run the full 9-experiment sweep yourself. Only smoke tests.
+- DO NOT modify any strategy code. Only experiments/experiments.yaml.
+- DO NOT delete results in experiments/results/ (the baseline.json there
+  is our reference).
+- The 4h baselines we already have should still be reproducible — if you
+  re-run them as part of the sweep, results should match existing JSONs.
+
+## Output
+
+When done, do these things:
+
+1. Print the contents of PRE_FLIGHT_LONGONLY.md
+2. Confirm experiments/experiments.yaml is in place (run `head -30` on it)
+3. Print which smoke tests passed and which failed
+4. Print the estimated total sweep runtime
+5. End with ONE LINE:
+   "Sweep prepared. Run with: python experiments/run_experiments.py"
+   OR
+   "Sweep blocked. See PRE_FLIGHT_LONGONLY.md for issues to resolve first."
+
+## Why this approach
+
+If we just ran the sweep blindly:
+- We might discover hours in that a strategy doesn't support 5m bars (crash)
+- We might discover meanrev/htf_trend also have long_only bugs (junk data)
+- We might run 9 long backtests when 3 would have told us the answer
+
+Pre-flight catches structural issues; smoke tests catch runtime issues.
+Then the actual sweep only runs the combinations we know will produce
+meaningful data.
