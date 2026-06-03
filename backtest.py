@@ -114,6 +114,7 @@ DEFAULT_CONFIG: dict = {
     "reversal_close_position":    0.25,
     "momentum_exclusion_bars":    3,
     "momentum_body_pct_threshold":0.6,
+    "long_only":                  True,   # Mirrors VWAPMeanReversionConfig; gate shorts in check_entry_signal
     "invalidation_vwap_atr_mult": 2.0,
     "invalidation_rsi_candles":   4,
     "min_stop_pct":               5.0,   # for min-profit gate: 1.5 × stop_pct
@@ -990,10 +991,10 @@ def check_entry_signal(
         levels = _compute_stop_and_targets(entry, "buy", bars, atr, cfg)
         return _build_trade("long", entry, levels)
 
-    if long_only:
+    # ── SHORT ── (gated by strategy config; live bot is long-only by default)
+    if cfg.get("long_only", True):
         return None
 
-    # ── SHORT ──
     dev_short = (price - vwap) / vwap * 100.0 if vwap > 0 else 0.0
     if (
         dev_short >= cfg["dev_threshold_pct"] and
@@ -2777,6 +2778,8 @@ def _merge_vwap_cli_overrides(cfg: dict, args: Any, strategy: str) -> None:
         cfg["atr_stop_mult"] = args.atr_stop_mult
     if getattr(args, "breakeven_requires_tp1", None) is not None:
         cfg["breakeven_requires_tp1"] = args.breakeven_requires_tp1
+    if getattr(args, "long_only", None) is not None:
+        cfg["long_only"] = args.long_only
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -2826,8 +2829,13 @@ def main() -> None:
                         help="CSV output path (default: backtest_trades.csv)")
     parser.add_argument("--no-cache",         action="store_true",
                         help="Force re-fetch OHLCV (ignore disk cache)")
-    parser.add_argument("--long-only",        action="store_true",
-                        help="Only trade long setups (no shorts)")
+    parser.add_argument(
+        "--no-long-only",
+        dest="long_only",
+        action="store_false",
+        default=None,
+        help="Allow short signals (default: long-only enforced by strategy config)",
+    )
     parser.add_argument("--supply",
                         help="Override circulating supply (e.g. SNX/USD=332000000,AXS/USD=68000000)")
     parser.add_argument("--relax-pillars",  action="store_true",
@@ -3092,7 +3100,7 @@ def main() -> None:
             cfg,
             args.starting_equity,
             args.risk_pct,
-            args.long_only,
+            cfg.get("long_only", True),
             interval_min,
             relax=relax,
             strategy=args.strategy,
@@ -3115,10 +3123,6 @@ def main() -> None:
 
     # ── Single-symbol mode ─────────────────────────────────────────────────────
     else:
-        if args.strategy == "pullback_vwap" and args.long_only:
-            # --long-only is implicit for pullback_vwap; warn if user set it explicitly
-            pass  # no conflict
-
         if args.interval is not None:
             interval = args.interval
         elif args.strategy == "swing_bull_flag":
@@ -3253,7 +3257,7 @@ def main() -> None:
             cfg,
             args.starting_equity,
             args.risk_pct,
-            long_only=True,
+            cfg.get("long_only", True),
             strategy=args.strategy,
             debug_signal=args.debug_signal,
             swing_daily_bars=swing_daily,

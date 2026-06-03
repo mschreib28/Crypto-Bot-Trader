@@ -1,0 +1,140 @@
+You are diagnosing a bug in the vwap_meanrev strategy. The strategy config
+has `long_only: bool = True` but produces short trades anyway.
+
+## Evidence
+
+Reading `backtest_trades.csv` from a 5-year backtest run:
+
+  By side:
+    long:  16 trades
+    short: 61 trades  ← these should not exist
+
+Sample short trade row:
+  symbol=OP/USD, side=short, entry_price=1.983, stop_loss=2.225,
+  tp1_price=1.741, tp2_price=1.498, pnl=-0.047, exit_reason=invalidation_rsi
+
+This is unambiguously a short structure: stop ABOVE entry, TPs BELOW entry.
+
+Confirmed flag state in research/strategies/vwap_meanrev/config.py line 86:
+  long_only: bool = True  # Permanently disable short signals; bot is long-only by design
+
+Confirmed sell signal generation in research/strategies/vwap_meanrev/strategy.py:
+- Line 700+: computes `deviation_short` (price - vwap) for overbought-side logic
+- Line 755: returns `side="sell"` from somewhere
+
+## Files to investigate
+
+1. research/strategies/vwap_meanrev/config.py
+   - Confirm long_only field exists and default value
+   - Find every reference to long_only in the codebase
+
+2. research/strategies/vwap_meanrev/strategy.py
+   - Find the function that returns side="sell"
+   - Trace how it's called
+   - Check whether it's gated by `if not self.config.long_only` or equivalent
+   - If gating exists, check whether it actually fires
+
+3. backtest.py
+   - Find where the strategy is invoked
+   - Check whether the backtester passes long_only=True to the strategy
+   - Check whether the backtester filters out sell signals after they're generated
+   - Note: backtest may instantiate strategy from a different config path
+     than the live bot does
+
+4. research/strategies/vwap_meanrev/__init__.py and __main__.py if exist
+   - Look for default config object instantiation
+
+## Your task
+
+Write a diagnosis report to DIAGNOSIS_LONG_ONLY.md at the project root.
+
+Use this exact structure:
+
+```markdown
+# Long-Only Violation Diagnosis
+
+## Confirmed Behavior
+
+- Config field long_only exists at: <file:line>
+- Default value: <value>
+- Backtest produces: <N> long, <M> short trades over 5 years
+
+## How sell signals are generated
+
+<Trace the code path from the entry signal generator to the sell return.
+List specific files and line numbers. Quote the relevant lines.>
+
+## Why the long_only flag is bypassed
+
+<Three possibilities — identify which is the actual cause:>
+
+### Possibility A: Flag exists but is never read by short-generation code
+<Check whether strategy.py has any `if self.config.long_only: return None`
+guards before sell signal generation. If absent, the flag is decorative.>
+
+### Possibility B: Flag is read but in the wrong place
+<Maybe the flag is checked in some code paths but not all. Some entry
+functions honor it; others don't.>
+
+### Possibility C: Backtest uses a different config object than live
+<Maybe the backtester loads a custom config that overrides long_only.
+Check backtest.py for any config instantiation that ignores or replaces
+the strategy's default config.>
+
+## Suggested Fix
+
+<Pick the minimal fix. Likely one of:>
+
+1. Add `if self.config.long_only: return None` early in the sell-signal
+   path of strategy.py. Most conservative — leaves the short code in place
+   but gates it.
+
+2. Delete the short-signal code path entirely if the strategy is
+   permanently long-only. Most aggressive — removes ~50-100 lines but
+   simplifies the strategy permanently.
+
+3. Add a backtest.py guard that filters signals with side="sell" when
+   strategy config has long_only=True. Centralized but creates two places
+   that enforce the constraint.
+
+<Recommend ONE option with justification.>
+
+## Risk Assessment
+
+- What happens to live bot behavior if we apply the fix?
+  (Currently SHADOW mode, so live impact is paper trades only)
+- What happens to backtest results?
+  (Will produce ~16 trades over 5 years instead of 77. Sample size will
+  drop. We need to know if these 16 longs are profitable on their own.)
+- What tests cover this?
+  (Check research/strategies/vwap_meanrev/tests/ and backend/tests/.
+  Are there any assertions about long-only behavior?)
+
+## Affected Data
+
+- experiments/results/baseline.json and all exp_*.json files include
+  short trades. After fix, all must be re-run.
+- backtest_trades.csv contains the contaminated trade history.
+
+## Recommendation
+
+<One paragraph: fix or leave alone, and why. If recommending fix,
+specify which of the three options above.>
+```
+
+## Constraints
+
+- DO NOT modify any code. This is a diagnosis pass only.
+- DO NOT run backtests.
+- DO write the diagnosis file.
+- After writing the file, print one line:
+  "Diagnosis written to DIAGNOSIS_LONG_ONLY.md. Recommendation: <fix|defer|investigate>"
+
+## Why these constraints matter
+
+If you fix the bug now without diagnosis, we lose information about:
+- Whether the strategy's short logic was always present and other code paths assume it exists
+- Whether removing shorts breaks any tests
+- Whether the bug was introduced recently (could check git log)
+
+A correct diagnosis takes 15 minutes. An incorrect fix takes hours to undo.
