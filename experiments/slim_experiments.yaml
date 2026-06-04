@@ -1,0 +1,73 @@
+# Slim sweep — 1h and 4h baselines only
+#
+# Skips 5m and 15m to avoid hours-long runs. For your $10/week goal,
+# higher timeframes are the realistic sweet spot anyway (less fee/slippage
+# friction, longer holds, fewer trades to manage).
+#
+# Runtime estimate: ~2-3 hours total for 8 backtests after baseline.
+#
+# Note: baseline = vwap_meanrev 4h. The full yaml is kept at
+# experiments.yaml. Switch by running:
+#   cp experiments/slim_experiments.yaml experiments/experiments.yaml
+# or modify the runner to read a different file via env var.
+
+baseline:
+  description: "vwap_meanrev 4h baseline (reference)"
+  strategy: vwap_meanrev
+  days: 1826
+  interval: 4h
+  config_overrides: {}
+
+experiments:
+  # ─── vwap_meanrev at 1h (only non-4h timeframe in slim) ───
+  - id: sweep_003_vwap_meanrev_1h
+    description: "vwap_meanrev on 1h bars - more signals than 4h"
+    strategy: vwap_meanrev
+    days: 1826
+    interval: 1h
+    config_overrides: {}
+
+  # ─── volatility_breakout ───
+  - id: sweep_004_volatility_breakout_1h
+    description: "volatility_breakout on 1h bars"
+    strategy: volatility_breakout
+    days: 1826
+    interval: 1h
+    config_overrides: {}
+
+  - id: sweep_005_volatility_breakout_4h
+    description: "volatility_breakout on 4h bars (was strong in prior tests)"
+    strategy: volatility_breakout
+    days: 1826
+    interval: 4h
+    config_overrides: {}
+
+  # ─── htf_trend ───
+  - id: sweep_006_htf_trend_1h
+    description: "htf_trend on 1h bars"
+    strategy: htf_trend
+    days: 1826
+    interval: 1h
+    config_overrides: {}
+
+  - id: sweep_007_htf_trend_4h
+    description: "htf_trend on 4h bars (was profitable in prior tests)"
+    strategy: htf_trend
+    days: 1826
+    interval: 4h
+    config_overrides: {}
+
+  # ─── meanrev ───
+  - id: sweep_008_meanrev_1h
+    description: "meanrev (BB+RSI+ADX) on 1h bars"
+    strategy: meanrev
+    days: 1826
+    interval: 1h
+    config_overrides: {}
+
+  - id: sweep_009_meanrev_4h
+    description: "meanrev (BB+RSI+ADX) on 4h bars"
+    strategy: meanrev
+    days: 1826
+    interval: 4h
+    config_overrides: {}

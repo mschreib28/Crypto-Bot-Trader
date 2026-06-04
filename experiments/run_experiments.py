@@ -2,13 +2,14 @@
 """
 Automated backtest experiment runner.
 
-Reads experiments/experiments.yaml, runs each experiment that hasn't been
-completed yet, parses results, writes one JSON per experiment, regenerates
-leaderboard.md.
+Reads an experiments yaml (default experiments/experiments.yaml), runs each
+experiment that hasn't been completed yet, parses results, writes one JSON
+per experiment, regenerates leaderboard.md.
 
 Usage:
     python experiments/run_experiments.py
     python experiments/run_experiments.py --smoke   # short --days for testing
+    python experiments/run_experiments.py --file experiments/slim_experiments.yaml
 
 Designed to be re-runnable. Skips experiments already in results/.
 """
@@ -26,13 +27,12 @@ import yaml
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 RESULTS_DIR = SCRIPT_DIR / "results"
-EXPERIMENTS_YAML = SCRIPT_DIR / "experiments.yaml"
 LEADERBOARD_MD = SCRIPT_DIR / "leaderboard.md"
 RUN_LOG = SCRIPT_DIR / "run.log"
 BACKTEST_PY = PROJECT_ROOT / "backtest.py"
 
-# Per-experiment timeout (1 hour default; smoke mode uses 5 min)
-DEFAULT_TIMEOUT_SECONDS = 3600
+# Per-experiment timeout (4 hours default; smoke mode uses 5 min)
+DEFAULT_TIMEOUT_SECONDS = 14400
 SMOKE_TIMEOUT_SECONDS = 300
 
 
@@ -193,15 +193,29 @@ def main():
                         help="Override to --days 60 with short timeout for testing")
     parser.add_argument("--only", type=str, default=None,
                         help="Run only this experiment id (skip others)")
+    parser.add_argument(
+        "--file", "-f",
+        type=str,
+        default=None,
+        help="Path to experiments yaml (default: experiments/experiments.yaml relative to script)",
+    )
     args = parser.parse_args()
+
+    experiments_yaml = (
+        SCRIPT_DIR / "experiments.yaml"
+        if args.file is None
+        else Path(args.file)
+    )
 
     RESULTS_DIR.mkdir(exist_ok=True, parents=True)
 
-    if not EXPERIMENTS_YAML.exists():
-        log(f"ERROR: {EXPERIMENTS_YAML} not found")
+    log(f"Using experiments file: {experiments_yaml}")
+
+    if not experiments_yaml.exists():
+        log(f"ERROR: {experiments_yaml} not found")
         sys.exit(1)
 
-    with EXPERIMENTS_YAML.open() as f:
+    with experiments_yaml.open() as f:
         cfg = yaml.safe_load(f)
 
     timeout = SMOKE_TIMEOUT_SECONDS if args.smoke else DEFAULT_TIMEOUT_SECONDS

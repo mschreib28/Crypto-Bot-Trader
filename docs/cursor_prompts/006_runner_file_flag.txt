@@ -1,0 +1,72 @@
+You are making a small enhancement to experiments/run_experiments.py to accept
+a configurable experiments yaml filename.
+
+## The Bug
+
+Currently `run_experiments.py` hardcodes `experiments/experiments.yaml` as the
+input. The user wants to maintain multiple yaml files (e.g., experiments.yaml
+for the full set, slim_experiments.yaml for quick runs) and switch between
+them without copying files around.
+
+## The Fix
+
+Add a `--file` (or `-f`) CLI argument to specify the yaml to read.
+Default value: `experiments/experiments.yaml` (current behavior).
+
+Find the existing argparse setup in run_experiments.py — it already has
+`--smoke` and `--only` flags. Add the new flag with the same pattern:
+
+  parser.add_argument(
+      "--file", "-f",
+      type=str,
+      default=None,
+      help="Path to experiments yaml (default: experiments/experiments.yaml relative to script)"
+  )
+
+Then update the constant that points to the yaml. Currently it's something like:
+  EXPERIMENTS_YAML = SCRIPT_DIR / "experiments.yaml"
+
+Change to read from args:
+- If args.file is None, use the default SCRIPT_DIR / "experiments.yaml"
+- Otherwise, use Path(args.file) directly (so user can pass absolute or
+  relative paths)
+
+Make sure error messages reference the actual file being used, not the
+hardcoded path. Look for any log lines or error strings that say
+"experiments.yaml" literally.
+
+## Also raise the timeout
+
+While you're in there: the DEFAULT_TIMEOUT_SECONDS is currently 3600 (1 hour).
+This caused 5m and 15m backtests to time out (they need 1-4 hours each).
+
+Raise it to 14400 (4 hours). Most backtests complete in 15-30 minutes; the
+longer timeout only matters for low-timeframe runs we'd normally skip anyway.
+
+## Validation
+
+After your changes:
+
+1. `python experiments/run_experiments.py --help` should show the new
+   `--file` argument
+2. `python experiments/run_experiments.py --file experiments/slim_experiments.yaml --help`
+   should NOT error (the help text shows before yaml is parsed)
+3. Show me the diff via git diff
+4. Do NOT run any actual backtests
+
+## Constraints
+
+- ONLY modify experiments/run_experiments.py
+- Default behavior must be unchanged (so existing tmux sessions don't break)
+- Do not change the timeout for individual experiments yet; only the default
+- Print the file being used in the first log line so it's visible in run.log
+
+## Output
+
+When done:
+
+1. Print the diff
+2. Confirm: `head -3 experiments/run.log` will show the file path in the
+   first log line on next run (don't run yet, just confirm in your head)
+3. Print one line:
+   "Runner updated. Use: python experiments/run_experiments.py --file <path>"
