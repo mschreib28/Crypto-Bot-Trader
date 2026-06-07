@@ -174,6 +174,11 @@ MEANREV_DEFAULT_CONFIG: dict = {
     "anchored_vwap_lookback":      20,
     "invalidation_vwap_atr_mult":  10.0,  # Effectively disabled — not applicable to meanrev
     "invalidation_rsi_candles":    4,
+    # Failed-recovery invalidation: only exit if RSI recovered above recovery level then dropped
+    # back below floor. Prevents exiting while still oversold (entry thesis still active).
+    "invalidation_rsi_requires_recovery": True,
+    "invalidation_rsi_recovery_level":    45.0,
+    "invalidation_rsi_long_floor":        40.0,
     "min_stop_pct":                5.0,
     "long_only":                   True,   # Mirrors MeanReversionConfig; live bot is long-only by design
 }
@@ -456,6 +461,7 @@ class Trade:
     qty: float                       # Full position quantity
     qty_remaining: float             # Remaining after TP1 partial exit
     tp1_hit: bool = False
+    rsi_recovery_seen: bool = False  # RSI crossed recovery level during trade (failed-recovery invalidation)
     breakeven_stop: Optional[float] = None
     exit_bar: Optional[int] = None
     exit_time: Optional[datetime] = None
@@ -1747,10 +1753,22 @@ def check_exits(
         if rsi is not None:
             rsi_long_floor  = cfg.get("invalidation_rsi_long_floor",  40)
             rsi_short_floor = cfg.get("invalidation_rsi_short_floor", 60)
-            if trade.side == "long"  and rsi < rsi_long_floor:
-                return "invalidation_rsi"
+            requires_recovery = cfg.get("invalidation_rsi_requires_recovery", False)
+            recovery_level = cfg.get("invalidation_rsi_recovery_level", 45)
+            short_recovery = cfg.get("invalidation_rsi_recovery_level_short", 55)
+
+            if requires_recovery:
+                if trade.side == "long" and rsi >= recovery_level:
+                    trade.rsi_recovery_seen = True
+                elif trade.side == "short" and rsi <= short_recovery:
+                    trade.rsi_recovery_seen = True
+
+            if trade.side == "long" and rsi < rsi_long_floor:
+                if not requires_recovery or trade.rsi_recovery_seen:
+                    return "invalidation_rsi"
             if trade.side == "short" and rsi > rsi_short_floor:
-                return "invalidation_rsi"
+                if not requires_recovery or trade.rsi_recovery_seen:
+                    return "invalidation_rsi"
 
     return None  # Hold
 

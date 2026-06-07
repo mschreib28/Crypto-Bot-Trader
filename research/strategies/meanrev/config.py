@@ -63,6 +63,12 @@ class MeanReversionConfig:
     # Direction constraint
     long_only: bool = True  # Permanently disable short signals; bot is long-only by design
 
+    # Exit: failed-recovery RSI invalidation (mirrors MEANREV_DEFAULT_CONFIG in backtest.py)
+    invalidation_rsi_candles: int = 4
+    invalidation_rsi_requires_recovery: bool = True
+    invalidation_rsi_recovery_level: float = 45.0
+    invalidation_rsi_long_floor: float = 40.0
+
 
 def get_config_schema() -> Dict[str, Any]:
     """Return the configuration schema for mean reversion strategy.

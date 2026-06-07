@@ -1,0 +1,120 @@
+[Run this in --mode plan first to get diagnosis, no fixes yet]
+
+You are diagnosing why htf_trend strategy is unprofitable on the long-only
+backtest. Determine whether the strategy logic has a bug, whether the strategy
+was historically profitable only because of shorts (which we just disabled),
+or whether the signal logic just doesn't translate to crypto.
+
+## The Data
+
+5-year baseline of htf_trend at 4h (after long_only fix):
+- 143 trades over 5 years (~28/year, ~2.4/month)
+- 34.3% Win Rate
+- 1.71 R:R ratio
+- -$3.76 total P&L
+- -$7.41 max drawdown
+
+Expectancy per trade: ~-$0.026. The strategy is essentially breakeven with
+a slight bleed.
+
+Pre-fix (with shorts allowed in live but not backtest — backtest WAS already
+long-only) PROJECT_CONTEXT.md listed htf_trend as:
+- 154 trades, 35.7% WR, 2.16 R:R, +$7.99 P&L over 5 years
+
+So the long_only fix removed 11 trades and dropped P&L by $11.75. Either:
+- Those 11 trades that were borderline now don't generate signals (unlikely
+  to cause this big a P&L swing)
+- The pre-fix numbers had subtle differences in HOW trades were sized/exited
+- Something else changed between then and now
+
+## Files to investigate
+
+1. research/strategies/htf_trend/config.py — entry params, RSI thresholds, ATR
+2. research/strategies/htf_trend/strategy.py — generate_signals and evaluate
+3. backtest.py — check_htf_trend_entry_signal function (the duplicated path)
+4. backtest_trades.csv — should contain the 143 htf_trend trades (verify by 
+   re-running baseline if needed). Look at:
+   - Which symbols traded most often
+   - What grades they had
+   - Distribution of exit reasons (max_hold, invalidation_rsi, stop_loss, tp1, tp2)
+   - WR by exit_reason
+
+## Hypotheses to test
+
+For each, find evidence in the code or data:
+
+### H1: The strategy is filtering correctly but the SIGNAL itself has no edge
+Evidence: TP1 hit rate, distribution of exit reasons, year-by-year performance
+If true: the strategy concept doesn't work for crypto. No fix.
+
+### H2: The strategy filters are too lax (entries on bad setups)
+Evidence: pullback_rsi_max too high, missing volatility filter, BTC bull market
+not actually filtering as expected
+If true: tighter filters could fix it. Tunable via scanner experiments.
+
+### H3: The strategy filters are too strict (only takes terrible signals,
+the good ones are filtered out)
+Evidence: htf_ema_fast/slow misalignment with crypto timeframes, RSI thresholds
+mis-calibrated for 24/7 markets
+If true: looser filters could fix it.
+
+### H4: Exit logic exits winners too early
+Evidence: invalidation_rsi exits dominating, low TP1 hit rate
+If true: relax invalidation, longer hold time, different stop placement.
+
+### H5: BTC bull market filter is doing the wrong thing
+Evidence: All trades during BTC bear (40%+ losing years), or all during BTC
+bull (concentration risk)
+If true: rethink the regime filter — maybe a more nuanced regime classifier.
+
+## Your task
+
+DO NOT modify code. DO NOT run backtests. Produce a written diagnosis at
+DIAGNOSIS_HTF_TREND.md following this structure:
+
+```markdown
+# htf_trend Diagnosis
+
+## Verified Data
+
+- Confirm 143 trades from baseline_htf_trend_4h or backtest_trades.csv
+- Year-by-year P&L breakdown if available
+- Exit reason distribution
+- WR by exit reason
+
+## Hypothesis Evaluation
+
+For each H1-H5: evidence found, verdict (likely / unlikely / can't tell)
+
+## Most Likely Root Cause
+
+The single best hypothesis with the strongest evidence
+
+## Recommended Next Steps
+
+EXACTLY ONE of:
+A) Strategy concept is broken, deprecate it
+B) Strategy needs scanner-level tuning (specific params and ranges to try)
+C) Strategy needs code change (specific functions and what change)
+D) Strategy needs different timeframe (specific TF to try)
+E) Need more data first (specific data to collect)
+
+## Risk of Each Path
+
+If you recommend B/C/D: what's the likelihood it actually helps vs being
+another false positive? Be specific.
+```
+
+## Constraints
+
+- DO NOT modify any code or yaml files
+- DO NOT run backtests
+- DO write DIAGNOSIS_HTF_TREND.md
+- Cite specific file:line references for any code claim
+- Pull actual numbers from backtest_trades.csv where possible
+- Acknowledge uncertainty rather than guessing
+
+## Output
+
+End with ONE LINE:
+"Diagnosis: htf_trend needs <one of: deprecation | tuning | code fix | new timeframe | more data>"

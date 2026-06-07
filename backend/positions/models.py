@@ -31,6 +31,7 @@ class Position:
     breakeven_stop_price: Optional[float] = None  # Breakeven stop price (entry + fees)
     trailing_stop_active: bool = False  # Whether ATR trailing stop is active
     trailing_stop_price: Optional[float] = None  # ATR trailing stop price
+    rsi_recovery_seen: bool = False  # RSI crossed recovery level (failed-recovery invalidation)
     # Frozen at open: Kraken live vs paper for this position's lifecycle (monitor uses only this).
     execution_live: bool = False
     # When set, BUY/SELL ledger uses per-strategy SIM balance (Task 3), not global shadow.
@@ -96,6 +97,8 @@ class Position:
             data["trailing_stop_active"] = "true"
         if self.trailing_stop_price is not None:
             data["trailing_stop_price"] = str(self.trailing_stop_price)
+        if self.rsi_recovery_seen:
+            data["rsi_recovery_seen"] = "true"
         if self.execution_live:
             data["execution_live"] = "true"
         if self.strategy_canonical:
@@ -124,6 +127,7 @@ class Position:
         breakeven_stop_price = data.get("breakeven_stop_price")
         trailing_stop_active = data.get("trailing_stop_active", "false").lower() == "true"
         trailing_stop_price = data.get("trailing_stop_price")
+        rsi_recovery_seen = data.get("rsi_recovery_seen", "false").lower() == "true"
         execution_live = str(data.get("execution_live", "false")).lower() == "true"
         strategy_canonical = data.get("strategy_canonical")
         return cls(
@@ -144,6 +148,7 @@ class Position:
             breakeven_stop_price=float(breakeven_stop_price) if breakeven_stop_price else None,
             trailing_stop_active=trailing_stop_active,
             trailing_stop_price=float(trailing_stop_price) if trailing_stop_price else None,
+            rsi_recovery_seen=rsi_recovery_seen,
             execution_live=execution_live,
             strategy_canonical=strategy_canonical if strategy_canonical else None,
         )

@@ -1,0 +1,146 @@
+[Run this in --mode plan first to get diagnosis, no fixes yet]
+
+You are diagnosing why meanrev strategy is catastrophically unprofitable. 
+The numbers strongly suggest a code bug rather than a strategy concept issue.
+
+## The Data
+
+5-year baseline of meanrev at 4h (after long_only fix):
+- 584 trades over 5 years (~117/year, ~10/month)
+- 42.1% Win Rate
+- 1.01 R:R ratio
+- -$167.46 total P&L
+- -$189.22 max drawdown (EXCEEDS starting balance — would have liquidated)
+
+Expectancy per trade: ~-$0.29. This is significantly negative.
+
+## Why this is suspicious
+
+A 1.01 R:R ratio is almost mathematically impossible for a strategy with
+asymmetric TPs (TP1 at 1.0R, TP2 at 2.0R). For wins to average exactly 1.01x
+losses, either:
+- ALL wins are at TP1 (1.0R) and ALL losses are at exactly the stop (1.0R)
+- The wins are getting cut short before reaching TP1
+- There's a calculation bug producing wrong R-multiples
+- The strategy is exiting at random with no relationship to TP/stop logic
+
+584 trades at 42% WR means ~245 wins and ~339 losses. With 1.01 R:R:
+- avg_win × 245 - avg_loss × 339 = -$167
+- If avg_loss = $X, avg_win = $1.01X
+- 245 × 1.01X - 339X = -$167
+- (247.45 - 339)X = -$167
+- -91.55X = -$167
+- X = $1.82 (avg loss size)
+
+So average loss is $1.82, average win is $1.84. The strategy is essentially
+breakeven per trade, just bleeding from frequency and fees.
+
+## Files to investigate
+
+1. research/strategies/meanrev/config.py
+   - Default values: BB period, RSI thresholds, ADX max
+   - Check `tp1_R`, `tp2_R` defaults
+
+2. research/strategies/meanrev/strategy.py
+   - generate_signals(): entry logic. Is it ACTUALLY checking BB+RSI+ADX
+     properly, or is the ranging market filter (adx_max_threshold) failing?
+   - evaluate(): live path
+   - Look for any sign of exit logic that bypasses TP1/TP2
+
+3. backtest.py
+   - check_meanrev_entry_signal: how does pipeline mode handle meanrev
+   - Look for how stops, TPs are computed for meanrev (may be different from
+     vwap_meanrev because of different config dataclass)
+   - Specifically: does meanrev use the same _compute_stop_and_targets() or
+     a different function?
+   - Check the exit logic: does meanrev use TP1/TP2 at all, or just stops?
+
+4. backtest_trades.csv 
+   - 584 meanrev trades — look at exit_reason distribution
+   - If 95%+ of exits are stop_loss + invalidation_rsi (no tp1, tp2), the
+     strategy is never reaching its targets — that's the bug
+
+## Hypotheses to test
+
+### H1: Strategy never hits TPs because exits trigger first
+Evidence: exit_reason distribution shows ~0% tp1 hits
+Likely cause: invalidation_rsi too tight, or stop too close
+Fix scope: small (parameter tuning) or medium (exit logic rewrite)
+
+### H2: TP/stop math is wrong for meanrev (uses vwap_meanrev's calculation)
+Evidence: TP1 distance from entry doesn't match tp1_R config
+Fix scope: medium (custom calculation for meanrev)
+
+### H3: ADX filter not working — strategy trades in trending markets
+Evidence: trades during high-volatility periods (Mar 2024, Nov 2024)
+underperform vs ranging periods
+Fix scope: re-tune adx_max_threshold or use different regime detector
+
+### H4: Strategy concept genuinely doesn't work in crypto
+Evidence: even with correct exits and good ranging detection, expectancy 
+stays negative
+Fix scope: deprecate
+
+### H5: There's a sign error or symbol confusion (longs treated as shorts
+or vice versa)
+Evidence: P&L per trade is symmetric around zero with no skew, OR specific
+symbols have inverted P&L patterns
+Fix scope: critical bug, easy fix
+
+## Your task
+
+DO NOT modify code. DO NOT run backtests. Produce DIAGNOSIS_MEANREV.md:
+
+```markdown
+# meanrev Diagnosis
+
+## Verified Data
+
+- Trade count: 584 (verify from CSV)
+- Exit reason distribution (count and %)
+- Average win size, average loss size (verify the 1.01 R:R)
+- Sample of 5-10 individual trades with entry/exit/stop/tp values
+
+## Hypothesis Evaluation
+
+H1 through H5 with evidence
+
+## Most Likely Root Cause
+
+Single best hypothesis, with confidence level
+
+## Quick Test
+
+A specific simple test that would confirm/deny the diagnosis. Example:
+"If we look at trades where bb_position was >0.5 at entry, P&L should be
+significantly worse than trades with bb_position <0.2" — and the file/CSV
+column to check.
+
+## Recommended Next Steps
+
+ONE of:
+A) Deprecate the strategy entirely
+B) Strategy-level config tuning (specific params, specific ranges)
+C) Code fix (specific function, specific change)
+D) Re-test with different timeframe (specific TF and why)
+E) Need to enrich data before diagnosing (what data)
+
+## Risk Assessment
+
+If C: what's the likelihood the fix works vs introduces new bugs?
+If A: are we sure, or is there a chance this strategy works for a niche?
+```
+
+## Constraints
+
+- DO NOT modify any code or config
+- DO NOT run backtests
+- DO write DIAGNOSIS_MEANREV.md
+- Cite file:line for code claims
+- Pull real numbers from backtest_trades.csv
+- Be willing to say "this strategy should be deprecated" if evidence supports it
+
+## Output
+
+End with ONE LINE:
+"Diagnosis: meanrev needs <deprecation | tuning | code fix | new timeframe | more data>"

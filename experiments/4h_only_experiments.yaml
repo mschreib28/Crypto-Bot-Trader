@@ -1,0 +1,47 @@
+# 4h-only sweep — fast strategy comparison
+#
+# Tests volatility_breakout, htf_trend, and meanrev at 4h to compare against
+# vwap_meanrev's 4h baseline (already in experiments/results/baseline.json).
+#
+# Why 4h-only:
+# - 1h sweep showed vwap_meanrev gets WORSE at 1h (28.6% WR, -$2.52)
+# - Lower timeframes (5m, 15m) take 8+ hours each per backtest
+# - For $10/week goal, fee/slippage friction at low TF is prohibitive
+# - 4h is the sweet spot for the current strategies
+#
+# Runtime estimate: 3 backtests × ~15min each = ~45 min total
+#
+# Usage:
+#   python experiments/run_experiments.py --file experiments/4h_only_experiments.yaml
+
+baseline:
+  description: "vwap_meanrev 4h baseline (reference — already in results/)"
+  strategy: vwap_meanrev
+  days: 1826
+  interval: 4h
+  config_overrides: {}
+
+experiments:
+  # ─── volatility_breakout 4h ───
+  - id: sweep_005_volatility_breakout_4h
+    description: "volatility_breakout 4h — was strong at +$23.99 pre-fix"
+    strategy: volatility_breakout
+    days: 1826
+    interval: 4h
+    config_overrides: {}
+
+  # ─── htf_trend 4h ───
+  - id: sweep_007_htf_trend_4h
+    description: "htf_trend 4h — was +$7.99 pre-fix"
+    strategy: htf_trend
+    days: 1826
+    interval: 4h
+    config_overrides: {}
+
+  # ─── meanrev 4h ───
+  - id: sweep_009_meanrev_4h
+    description: "meanrev (BB+RSI+ADX) 4h — untested in current round"
+    strategy: meanrev
+    days: 1826
+    interval: 4h
+    config_overrides: {}

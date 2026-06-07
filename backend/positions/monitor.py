@@ -1157,18 +1157,54 @@ class PositionMonitor:
                             return
                 
                 if "mean" in strategy_name_lower and "rsi" in symbol_indicators:
-                    # RSI Mean Reversion: Check if RSI fails to mean-revert after M candles
+                    # RSI Mean Reversion: exit only on failed recovery (RSI crossed above
+                    # recovery level, then dropped back below floor). Still-oversold is NOT
+                    # invalidation — it is the entry thesis.
                     rsi = symbol_indicators.get("rsi")
-                    invalidation_rsi_candles = config.get("invalidation_rsi_candles") or config.get("parameters", {}).get("invalidation_rsi_candles", 4)
-                    
+                    params = config.get("parameters", {})
+                    invalidation_rsi_candles = (
+                        config.get("invalidation_rsi_candles")
+                        or params.get("invalidation_rsi_candles", 4)
+                    )
+                    requires_recovery = config.get("invalidation_rsi_requires_recovery")
+                    if requires_recovery is None:
+                        requires_recovery = params.get("invalidation_rsi_requires_recovery", False)
+                    recovery_level = config.get("invalidation_rsi_recovery_level")
+                    if recovery_level is None:
+                        recovery_level = params.get("invalidation_rsi_recovery_level", 45.0)
+                    rsi_long_floor = config.get("invalidation_rsi_long_floor")
+                    if rsi_long_floor is None:
+                        rsi_long_floor = params.get("invalidation_rsi_long_floor", 40)
+                    rsi_short_floor = config.get("invalidation_rsi_short_floor")
+                    if rsi_short_floor is None:
+                        rsi_short_floor = params.get("invalidation_rsi_short_floor", 60)
+                    short_recovery = config.get("invalidation_rsi_recovery_level_short")
+                    if short_recovery is None:
+                        short_recovery = params.get("invalidation_rsi_recovery_level_short", 55)
+
                     if rsi is not None:
                         # Calculate candles since entry
                         entry_time = datetime.fromisoformat(position.entry_time.replace('Z', '+00:00'))
                         current_time = datetime.now(timezone.utc)
-                        interval_str = config.get("interval") or config.get("parameters", {}).get("interval", "5m")
+                        interval_str = config.get("interval") or params.get("interval", "5m")
                         interval_minutes = self._parse_interval_to_minutes(interval_str)
                         time_diff_minutes = (current_time - entry_time).total_seconds() / 60.0
                         candles_held = time_diff_minutes / interval_minutes
+
+                        if requires_recovery:
+                            recovery_seen = position.rsi_recovery_seen
+                            if position.side == "long" and rsi >= recovery_level:
+                                recovery_seen = True
+                            elif position.side == "short" and rsi <= short_recovery:
+                                recovery_seen = True
+                            if recovery_seen and not position.rsi_recovery_seen:
+                                position.rsi_recovery_seen = True
+                                from backend.redis import get_redis_client
+                                from backend.redis.keys import POSITION_KEY
+
+                                redis_client = get_redis_client()
+                                key = POSITION_KEY.format(symbol=position.symbol)
+                                redis_client.hset(key, mapping=position.to_dict())
 
                         # Minimum 2-candle hold before RSI invalidation can fire
                         if candles_held < 2.0:
@@ -1176,16 +1212,16 @@ class PositionMonitor:
                                 f"RSI invalidation skipped for {position.symbol}: "
                                 f"only {candles_held:.2f} candles elapsed (grace period: 2 candles)"
                             )
-                        # Check if RSI still oversold/overbought after M candles
-                        # For long positions: RSI should have reverted from oversold (< 30) to neutral (> 40)
-                        # For short positions: RSI should have reverted from overbought (> 70) to neutral (< 60)
                         elif position.side == "long":
-                            # Long position: RSI should have reverted from oversold
-                            if candles_held >= invalidation_rsi_candles and rsi < 40:
+                            if (
+                                candles_held >= invalidation_rsi_candles
+                                and rsi < rsi_long_floor
+                                and (not requires_recovery or position.rsi_recovery_seen)
+                            ):
                                 logger.warning(
                                     f"RSI invalidation for {position.symbol}: "
-                                    f"RSI={rsi:.1f} still oversold after {candles_held:.1f} candles "
-                                    f"(threshold: {invalidation_rsi_candles} candles)"
+                                    f"RSI={rsi:.1f} dropped below {rsi_long_floor} after recovery "
+                                    f"({candles_held:.1f} candles held)"
                                 )
                                 await self._force_exit_position(
                                     position=position,
@@ -1196,12 +1232,15 @@ class PositionMonitor:
                                 )
                                 return
                         elif position.side == "short":
-                            # Short position: RSI should have reverted from overbought
-                            if candles_held >= invalidation_rsi_candles and rsi > 60:
+                            if (
+                                candles_held >= invalidation_rsi_candles
+                                and rsi > rsi_short_floor
+                                and (not requires_recovery or position.rsi_recovery_seen)
+                            ):
                                 logger.warning(
                                     f"RSI invalidation for {position.symbol}: "
-                                    f"RSI={rsi:.1f} still overbought after {candles_held:.1f} candles "
-                                    f"(threshold: {invalidation_rsi_candles} candles)"
+                                    f"RSI={rsi:.1f} rose above {rsi_short_floor} after recovery "
+                                    f"({candles_held:.1f} candles held)"
                                 )
                                 await self._force_exit_position(
                                     position=position,
