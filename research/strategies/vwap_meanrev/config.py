@@ -25,6 +25,11 @@ class VWAPMeanReversionConfig:
     atr_stop_mult: float = 1.5  # Stop distance = ATR * this multiplier
     swing_lookback_bars: int = 5  # Bars to look back for swing low/high
     stop_buffer_ATR: float = 0.15  # Buffer below swing low (in ATR units)
+    # True = swing stop anchors to the MOST RECENT swing low/high (the structure
+    # being traded). False (legacy) = lowest/highest swing in the whole bar
+    # window, which can place stops at multi-week extremes and inflate the R
+    # denominator. Backtest flag: --swing-stop-recent.
+    swing_stop_recent: bool = False
     
     # Take-profit parameters (Ross Cameron spec: 1:2 R/R = 1.5% stop, 3.0% take profit = 2.0 R)
     tp1_R: float = 1.0  # First target in R-multiples (1.5% if stop is 1.5%)
@@ -47,6 +52,12 @@ class VWAPMeanReversionConfig:
     # Regime filter (HTF)
     regime_slope_threshold: float = 0.001  # EMA slope threshold (0.1% per bar)
     volatility_max_ATR_mult: float = 2.5  # Block if HTF ATR% exceeds this
+    # True = the trend half of the regime filter actually blocks longs when HTF
+    # price < EMA200 AND the EMA200 slope is strongly bearish. False (legacy) =
+    # trend check is advisory only — every path returned allowed=True and only
+    # the volatility cap could block (the documented "1h regime filter" was a
+    # no-op for trend).
+    regime_block_bearish: bool = False
     
     # VWAP calculation
     vwap_session_hours: int = 24  # Session length for VWAP (24h for crypto)

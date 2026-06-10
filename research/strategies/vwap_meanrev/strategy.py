@@ -305,7 +305,6 @@ class VWAPMeanReversionStrategy(BaseStrategy):
                     return (False, f"htf_volatility_too_high: {atr_pct:.2f}%")
             
             # For LONG: Allow if price above EMA200 OR trend is flat (not strongly bearish)
-            # For SHORT: Allow if price below EMA200 OR trend is flat (not strongly bullish)
             # Calculate EMA slope
             ema_series = calculate_ema_series(htf_closes, self.config.htf_ema_slow)
             if len(ema_series) >= 10:
@@ -313,10 +312,22 @@ class VWAPMeanReversionStrategy(BaseStrategy):
                 if slope is not None:
                     # Flat trend: slope within threshold
                     is_flat = abs(slope) < self.config.regime_slope_threshold * 100
-                    is_bullish = current_htf_price > ema200 or (is_flat and slope >= 0)
-                    is_bearish = current_htf_price < ema200 or (is_flat and slope <= 0)
-                    
-                    # Allow trades if trend is favorable or flat
+
+                    # Block longs in a confirmed HTF downtrend when enabled.
+                    # (Legacy behavior computed the trend and returned allowed=True
+                    # on every path — the trend filter never blocked anything.)
+                    if (
+                        getattr(self.config, "regime_block_bearish", False)
+                        and current_htf_price < ema200
+                        and not is_flat
+                        and slope < 0
+                    ):
+                        return (
+                            False,
+                            f"htf_trend_bearish: price={current_htf_price:.2f} < "
+                            f"ema200={ema200:.2f}, slope={slope:.4f}%",
+                        )
+
                     return (True, f"htf_trend_ok: price={current_htf_price:.2f}, ema200={ema200:.2f}, slope={slope:.4f}%")
             
             # Default: allow if price above EMA200 (bullish bias)
@@ -452,14 +463,20 @@ class VWAPMeanReversionStrategy(BaseStrategy):
         # Calculate swing stop
         swing_data = detect_swing_highs_lows(bars, lookback=self.config.swing_lookback_bars)
         
+        use_recent = getattr(self.config, "swing_stop_recent", False)
+
         if side == "buy":
-            # Stop below swing low
+            # Stop below swing low. swing_stop_recent=True anchors to the most
+            # recent swing low; legacy False uses the lowest swing in the window.
             swing_lows = swing_data['lows']
-            swing_stop = min(swing_lows) if swing_lows else entry_price * 0.95
-            
+            if swing_lows:
+                swing_stop = swing_lows[-1] if use_recent else min(swing_lows)
+            else:
+                swing_stop = entry_price * 0.95
+
             # ATR stop
             atr_stop = entry_price - (atr * self.config.atr_stop_mult)
-            
+
             # Use wider of the two
             stop_loss = min(swing_stop, atr_stop) - (atr * self.config.stop_buffer_ATR)
             
@@ -473,7 +490,10 @@ class VWAPMeanReversionStrategy(BaseStrategy):
         else:  # sell
             # Stop above swing high
             swing_highs = swing_data['highs']
-            swing_stop = max(swing_highs) if swing_highs else entry_price * 1.05
+            if swing_highs:
+                swing_stop = swing_highs[-1] if use_recent else max(swing_highs)
+            else:
+                swing_stop = entry_price * 1.05
             
             # ATR stop
             atr_stop = entry_price + (atr * self.config.atr_stop_mult)
@@ -896,9 +916,34 @@ class VWAPMeanReversionStrategy(BaseStrategy):
                     timestamp=timestamp,
                 )
             
-            # Calculate deviation
+            # Calculate deviation — same mode as generate_signals so screener
+            # confidence reflects the actual entry criteria (previously evaluate()
+            # always used ATR-based deviation while the trade path used the
+            # percentage-based Ross Cameron spec).
             deviation = current_price - vwap
             deviation_atr = deviation / atr if atr > 0 else 0
+            deviation_pct = (deviation / vwap) * 100.0 if vwap > 0 else 0.0
+
+            if self.config.use_percentage_deviation:
+                # Negative deviation_pct = price below VWAP (long setup)
+                dev_long_ok = -deviation_pct >= self.config.dev_threshold_pct
+                dev_short_ok = deviation_pct >= self.config.dev_threshold_pct
+                dev_long_ratio = (
+                    -deviation_pct / self.config.dev_threshold_pct
+                    if self.config.dev_threshold_pct > 0 else 0.0
+                )
+                dev_short_ratio = (
+                    deviation_pct / self.config.dev_threshold_pct
+                    if self.config.dev_threshold_pct > 0 else 0.0
+                )
+            else:
+                dev_long_ok = deviation_atr <= -self.config.dev_threshold_ATR
+                dev_short_ok = deviation_atr >= self.config.dev_threshold_ATR
+                dev_long_ratio = (
+                    abs(deviation_atr) / self.config.dev_threshold_ATR
+                    if self.config.dev_threshold_ATR > 0 else 0.0
+                )
+                dev_short_ratio = dev_long_ratio
             
             # Calculate volume ratio
             volume_sma = sum(volumes[-self.config.volume_sma_period:]) / self.config.volume_sma_period
@@ -961,11 +1006,11 @@ class VWAPMeanReversionStrategy(BaseStrategy):
             # LONG setup scoring
             if (
                 long_gate_ok
-                and deviation_atr <= -self.config.dev_threshold_ATR
+                and dev_long_ok
                 and rsi <= self.config.rsi_oversold
             ):
                 # Base confidence from deviation and RSI
-                deviation_score = min(40.0, abs(deviation_atr) / self.config.dev_threshold_ATR * 20.0)
+                deviation_score = min(40.0, dev_long_ratio * 20.0)
                 rsi_score = min(30.0, (self.config.rsi_oversold - rsi) / self.config.rsi_oversold * 30.0)
                 
                 # Volume confirmation
@@ -979,9 +1024,9 @@ class VWAPMeanReversionStrategy(BaseStrategy):
                 signal_type = "BUY"
             
             # SHORT setup scoring (disabled when long_only)
-            elif not self.config.long_only and deviation_atr >= self.config.dev_threshold_ATR and rsi >= self.config.rsi_overbought:
+            elif not self.config.long_only and dev_short_ok and rsi >= self.config.rsi_overbought:
                 # Base confidence from deviation and RSI
-                deviation_score = min(40.0, deviation_atr / self.config.dev_threshold_ATR * 20.0)
+                deviation_score = min(40.0, dev_short_ratio * 20.0)
                 rsi_score = min(30.0, (rsi - self.config.rsi_overbought) / (100 - self.config.rsi_overbought) * 30.0)
                 
                 # Volume confirmation

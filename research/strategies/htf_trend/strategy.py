@@ -373,10 +373,19 @@ class HTFTrendStrategy(BaseStrategy):
             side = "buy"
             entry_price = ema20 + (atr * 0.02)  # Small buffer above EMA20
             
-            # Stop below pullback swing low
+            # Stop below pullback swing low. swing_stop_recent=True anchors to
+            # the most recent swing low (the pullback being traded); legacy
+            # False uses the lowest swing in the whole window.
             swing_data = detect_swing_highs_lows(bars_list, lookback=self.config.swing_lookback_bars)
             swing_lows = swing_data['lows']
-            swing_stop = min(swing_lows) if swing_lows else entry_price * 0.95
+            if swing_lows:
+                swing_stop = (
+                    swing_lows[-1]
+                    if getattr(self.config, "swing_stop_recent", False)
+                    else min(swing_lows)
+                )
+            else:
+                swing_stop = entry_price * 0.95
             
             # ATR stop as minimum
             atr_stop = entry_price - (atr * self.config.atr_stop_mult)

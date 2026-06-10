@@ -45,6 +45,10 @@ class HTFTrendConfig:
     # Stop-loss
     atr_stop_mult: float = 1.5  # Stop distance = ATR * this (minimum)
     swing_buffer_ATR: float = 0.15  # Buffer below swing low (in ATR units)
+    # True = swing stop anchors to the MOST RECENT swing low (the pullback being
+    # traded). False (legacy) = lowest swing in the whole bar window, which can
+    # place stops at multi-week extremes and inflate the R denominator.
+    swing_stop_recent: bool = False
     
     # Take-profit (Ross Cameron spec: 1:2 R/R = 1.5% stop, 3.0% take profit = 2.0 R)
     tp1_R: float = 1.0  # First target in R-multiples (1.5% if stop is 1.5%)

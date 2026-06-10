@@ -91,6 +91,10 @@ INTERVAL_MAP = {
 MAKER_FEE = 0.0016   # 0.16%  BUY fee
 TAKER_FEE = 0.0026   # 0.26%  SELL fee
 
+# Set from CLI in main(); module-level so all strategy paths share them.
+SLIPPAGE_PCT = 0.0   # % adverse slippage applied to every fill (--slippage-pct)
+END_DAYS_AGO = 0.0   # Window ends N days before now — out-of-sample holdout (--end-days-ago)
+
 WARMUP_BARS = 60     # Bars consumed before first signal is eligible
 
 # Strategy defaults — mirrors VWAPMeanReversionConfig
@@ -121,8 +125,15 @@ DEFAULT_CONFIG: dict = {
     "volume_filter_mode":         "conservative",
     "long_min_volume_ratio":      None,  # e.g. 2.0 = require ≥2× volume SMA on signal bar (long)
     "htf_rsi_long_max":           None,  # e.g. 40.0 = require HTF RSI ≤ 40 (see htf_rsi_bars_interval)
-    "htf_rsi_bars_interval":      "4h",  # Binance interval for HTF RSI when htf_rsi_long_max is set
+    "htf_rsi_bars_interval":      "1h",  # Binance interval for HTF RSI when htf_rsi_long_max is set.
+                                         # Live parity: strategy.py uses htf_interval=1h. Was "4h",
+                                         # which made the gate tautological on 4h entry charts
+                                         # (see DIAGNOSIS_PARAMETER_PASSTHROUGH.md).
     "breakeven_requires_tp1":     True,   # Move stop to breakeven only after TP1 partial fill
+    "breakeven_trigger_r":        0.5,    # When breakeven_requires_tp1=false: arm breakeven at this R
+                                          # (mirrors monitor.py early-breakeven path)
+    "swing_stop_recent":          False,  # True = stop below MOST RECENT swing low (not lowest in window)
+    "intrabar_exits":             True,   # Trigger stops/TPs on bar high/low, not close-only (realistic)
 }
 
 # Strategy 6 defaults — mirrors PullbackVWAPConfig
@@ -671,7 +682,10 @@ def fetch_binance_ohlcv(
     pair_slug = _symbol_to_kraken_pair(kraken_symbol)
     cache_file = os.path.join(cache_dir, f"{pair_slug}_{interval_label}_full.json")
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=float(span_days))
+    # Out-of-sample holdout: window is [now - END_DAYS_AGO - span_days, now - END_DAYS_AGO].
+    # Download always extends to now so the cache stays maximal; trimming applies the window.
+    window_end = datetime.now(timezone.utc) - timedelta(days=float(END_DAYS_AGO))
+    cutoff = window_end - timedelta(days=float(span_days))
     cutoff_ms = int(cutoff.timestamp() * 1000)
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -741,8 +755,7 @@ def fetch_binance_ohlcv(
         print(f"  Updated Binance OHLC cache ({len(raw_full)} bars)")
         bars_all = _parse_binance_kline_rows(raw_full)
 
-    utc_now = datetime.now(timezone.utc)
-    trimmed = [b for b in bars_all if cutoff <= b.timestamp <= utc_now]
+    trimmed = [b for b in bars_all if cutoff <= b.timestamp <= window_end]
 
     src = "[cache]" if (cached_rows is not None and not did_extend) else "[network]"
     if trimmed:
@@ -843,15 +856,27 @@ def _compute_stop_and_targets(
     bar_dicts = [{"high": b.high, "low": b.low, "close": b.close} for b in bars]
     swing = detect_swing_highs_lows(bar_dicts, lookback=cfg["swing_lookback_bars"])
 
+    # swing_stop_recent=True: anchor stop to the MOST RECENT swing point (structure
+    # being traded). Default False preserves legacy behavior: lowest/highest swing
+    # in the whole window, which can place stops at multi-week extremes and inflate
+    # the R denominator (see ANALYSIS_ALGO_IMPROVEMENTS.md §2.1).
+    use_recent = bool(cfg.get("swing_stop_recent", False))
+
     if side == "buy":
-        swing_stop = min(swing["lows"]) if swing["lows"] else entry * 0.95
+        if swing["lows"]:
+            swing_stop = swing["lows"][-1] if use_recent else min(swing["lows"])
+        else:
+            swing_stop = entry * 0.95
         atr_stop   = entry - atr * cfg["atr_stop_mult"]
         stop       = min(swing_stop, atr_stop) - atr * cfg["stop_buffer_atr"]
         risk       = entry - stop
         tp1        = entry + risk * cfg["tp1_R"]
         tp2        = entry + risk * cfg["tp2_R"]
     else:
-        swing_stop = max(swing["highs"]) if swing["highs"] else entry * 1.05
+        if swing["highs"]:
+            swing_stop = swing["highs"][-1] if use_recent else max(swing["highs"])
+        else:
+            swing_stop = entry * 1.05
         atr_stop   = entry + atr * cfg["atr_stop_mult"]
         stop       = max(swing_stop, atr_stop) + atr * cfg["stop_buffer_atr"]
         risk       = stop - entry
@@ -1632,7 +1657,12 @@ def check_htf_trend_entry_signal(
     # ── Stop: below swing low or ATR-based minimum ────────────────────────
     bar_dicts  = [{"high": b.high, "low": b.low, "close": b.close} for b in bars]
     swing      = detect_swing_highs_lows(bar_dicts, lookback=cfg["swing_lookback_bars"])
-    swing_stop = min(swing["lows"]) if swing["lows"] else bar.close * 0.95
+    if swing["lows"]:
+        swing_stop = (
+            swing["lows"][-1] if cfg.get("swing_stop_recent", False) else min(swing["lows"])
+        )
+    else:
+        swing_stop = bar.close * 0.95
     atr_stop   = bar.close - atr * cfg["atr_stop_mult"]
     stop_loss  = min(swing_stop, atr_stop) - atr * cfg["swing_buffer_ATR"]
 
@@ -1683,22 +1713,42 @@ def check_exits(
       4. Max bars held
       5. VWAP invalidation (after 2-bar grace, min-profit gate applied)
       6. RSI invalidation (after N candles)
+
+    Trigger prices: when cfg["intrabar_exits"] is true (default), stops trigger
+    on the bar's adverse extreme (low for longs, high for shorts) and targets on
+    the favorable extreme — matching the live monitor, which evaluates live
+    prices, not bar closes. When both a stop and a target are touched within the
+    same bar the intrabar sequence is unknowable, so the stop wins
+    (conservative). Legacy close-only behavior is available via
+    --no-intrabar-exits for A/B comparison; it systematically understates
+    stop-outs on wide-range bars and inflates WR.
     """
     price      = current_bar.close
     bars_held  = bar_idx - trade.entry_bar
-    active_stop = trade.breakeven_stop if (trade.tp1_hit and trade.breakeven_stop) else trade.stop_loss
+    intrabar   = bool(cfg.get("intrabar_exits", True))
 
-    # 1. Stop-loss
-    if trade.side == "long"  and price <= active_stop:
+    if trade.side == "long":
+        stop_ref = current_bar.low  if intrabar else price
+        tp_ref   = current_bar.high if intrabar else price
+    else:
+        stop_ref = current_bar.high if intrabar else price
+        tp_ref   = current_bar.low  if intrabar else price
+
+    # Breakeven stop applies once armed (after TP1, or via the early-arm path
+    # below when breakeven_requires_tp1=false — mirrors monitor.py).
+    active_stop = trade.breakeven_stop if trade.breakeven_stop is not None else trade.stop_loss
+
+    # 1. Stop-loss (checked before targets: conservative same-bar resolution)
+    if trade.side == "long"  and stop_ref <= active_stop:
         return "stop_loss"
-    if trade.side == "short" and price >= active_stop:
+    if trade.side == "short" and stop_ref >= active_stop:
         return "stop_loss"
 
     # 2. TP1 partial exit (update trade state, don't close)
     if not trade.tp1_hit:
         tp1_reached = (
-            (trade.side == "long"  and price >= trade.tp1_price) or
-            (trade.side == "short" and price <= trade.tp1_price)
+            (trade.side == "long"  and tp_ref >= trade.tp1_price) or
+            (trade.side == "short" and tp_ref <= trade.tp1_price)
         )
         if tp1_reached:
             trade.tp1_hit = True
@@ -1710,10 +1760,23 @@ def check_exits(
                 else:
                     trade.breakeven_stop = trade.entry_price * (1.0 - fee_buf)
 
+    # 2b. Early breakeven arming when breakeven_requires_tp1=false
+    # (mirrors monitor.py BREAKEVEN_GUARD path; previously unimplemented, which
+    # made --no-breakeven-requires-tp1 untestable — see
+    # DIAGNOSIS_PARAMETER_PASSTHROUGH.md). Armed stop takes effect next bar.
+    if not cfg.get("breakeven_requires_tp1", True) and trade.breakeven_stop is None:
+        trigger_r = float(cfg.get("breakeven_trigger_r", 0.5))
+        risk = abs(trade.entry_price - trade.stop_loss)
+        fee_buf = MAKER_FEE + TAKER_FEE
+        if trade.side == "long" and tp_ref >= trade.entry_price + trigger_r * risk:
+            trade.breakeven_stop = trade.entry_price * (1.0 + fee_buf)
+        elif trade.side == "short" and tp_ref <= trade.entry_price - trigger_r * risk:
+            trade.breakeven_stop = trade.entry_price * (1.0 - fee_buf)
+
     # 3. TP2 full close
     tp2_reached = (
-        (trade.side == "long"  and price >= trade.tp2_price) or
-        (trade.side == "short" and price <= trade.tp2_price)
+        (trade.side == "long"  and tp_ref >= trade.tp2_price) or
+        (trade.side == "short" and tp_ref <= trade.tp2_price)
     )
     if tp2_reached:
         return "tp2"
@@ -1781,9 +1844,10 @@ def _exit_fill_price(trade: Trade, reason: str, bar: Bar) -> float:
     All other exits (invalidation, max_hold) fill at bar close.
     """
     if reason == "stop_loss":
+        # Breakeven stop applies whenever armed (TP1 path or early-arm path).
         return (
             trade.breakeven_stop
-            if (trade.tp1_hit and trade.breakeven_stop is not None)
+            if trade.breakeven_stop is not None
             else trade.stop_loss
         )
     if reason == "tp2":
@@ -1793,24 +1857,35 @@ def _exit_fill_price(trade: Trade, reason: str, bar: Bar) -> float:
 
 def _compute_pnl(trade: Trade, cfg: dict) -> float:
     """
-    Realized P&L including fees.
+    Realized P&L including fees and (optional) slippage.
     TP1 partial exit at tp1_price, remainder at exit_price.
+
+    Slippage (--slippage-pct) is applied adversely to every fill: entries fill
+    worse by slip, exits (including TP1) fill worse by slip. Position size is
+    unchanged (qty was set at signal time), so this is a pure cost adjustment.
     """
-    entry  = trade.entry_price
-    exit_p = trade.exit_price  # type: ignore[assignment]
+    slip = SLIPPAGE_PCT / 100.0
+    if trade.side == "long":
+        entry  = trade.entry_price * (1.0 + slip)
+        exit_p = trade.exit_price * (1.0 - slip)  # type: ignore[operator]
+        tp1_p  = trade.tp1_price * (1.0 - slip) if trade.tp1_price is not None else None
+    else:
+        entry  = trade.entry_price * (1.0 - slip)
+        exit_p = trade.exit_price * (1.0 + slip)  # type: ignore[operator]
+        tp1_p  = trade.tp1_price * (1.0 + slip) if trade.tp1_price is not None else None
 
     if trade.tp1_hit:
         tp1_qty  = trade.qty * cfg["tp1_partial_pct"]
         rem_qty  = trade.qty - tp1_qty
 
         if trade.side == "long":
-            tp1_gross  = (trade.tp1_price - entry) * tp1_qty
+            tp1_gross  = (tp1_p - entry) * tp1_qty
             rem_gross  = (exit_p - entry) * rem_qty
         else:
-            tp1_gross  = (entry - trade.tp1_price) * tp1_qty
+            tp1_gross  = (entry - tp1_p) * tp1_qty
             rem_gross  = (entry - exit_p) * rem_qty
 
-        tp1_fees = entry * tp1_qty * MAKER_FEE + trade.tp1_price * tp1_qty * TAKER_FEE
+        tp1_fees = entry * tp1_qty * MAKER_FEE + tp1_p * tp1_qty * TAKER_FEE
         rem_fees = entry * rem_qty * MAKER_FEE + exit_p * rem_qty * TAKER_FEE
         return (tp1_gross - tp1_fees) + (rem_gross - rem_fees)
     else:
@@ -2784,9 +2859,25 @@ def write_csv(trades: list[Trade], output_path: str, cfg: dict) -> None:
 
 
 def _merge_vwap_cli_overrides(cfg: dict, args: Any, strategy: str) -> None:
-    """Apply CLI overrides for VWAP mean-reversion strategies."""
+    """Apply CLI overrides. Generic exit/stop knobs apply to ALL strategies;
+    entry-filter knobs apply to VWAP mean-reversion strategies only."""
+    # ── Generic (all strategies — shared check_exits / stop framework) ──────
+    if getattr(args, "intrabar_exits", None) is not None:
+        cfg["intrabar_exits"] = args.intrabar_exits
+    if getattr(args, "swing_stop_recent", None) is not None:
+        cfg["swing_stop_recent"] = args.swing_stop_recent
+    if getattr(args, "breakeven_trigger_r", None) is not None:
+        cfg["breakeven_trigger_r"] = args.breakeven_trigger_r
+    if getattr(args, "tp1_R", None) is not None:
+        cfg["tp1_R"] = args.tp1_R
+    if getattr(args, "tp2_R", None) is not None:
+        cfg["tp2_R"] = args.tp2_R
+    if getattr(args, "max_bars_in_trade", None) is not None:
+        cfg["max_bars_in_trade"] = args.max_bars_in_trade
+
     if strategy not in ("vwap_meanrev", "vwap_meanrev_1h"):
         return
+    # ── VWAP mean-reversion only ────────────────────────────────────────────
     if getattr(args, "rsi_oversold", None) is not None:
         cfg["rsi_oversold"] = args.rsi_oversold
     if getattr(args, "long_min_volume_ratio", None) is not None:
@@ -2797,6 +2888,8 @@ def _merge_vwap_cli_overrides(cfg: dict, args: Any, strategy: str) -> None:
         cfg["htf_rsi_bars_interval"] = args.htf_rsi_bars_interval
     if getattr(args, "atr_stop_mult", None) is not None:
         cfg["atr_stop_mult"] = args.atr_stop_mult
+    if getattr(args, "reversal_body_pct", None) is not None:
+        cfg["reversal_body_pct"] = args.reversal_body_pct
     if getattr(args, "breakeven_requires_tp1", None) is not None:
         cfg["breakeven_requires_tp1"] = args.breakeven_requires_tp1
     if getattr(args, "long_only", None) is not None:
@@ -2864,9 +2957,11 @@ def main() -> None:
                             "Lower pillar thresholds for small paper accounts / low-volume pairs: "
                             "hard floor $10K, RVOL ≥ 1.5×, D3 min $100K, C-grade entries at 0.25× size"
                         ))
-    parser.add_argument("--dev-threshold",  type=float, default=None,
+    parser.add_argument("--dev-threshold", "--dev-threshold-pct",
+                        type=float, default=None, dest="dev_threshold",
                         help="Override dev_threshold_pct (default: 2.0). "
-                             "Lower values = more entry signals (e.g. 1.0, 1.5, 2.5)")
+                             "Lower values = more entry signals (e.g. 1.0, 1.5, 2.5). "
+                             "--dev-threshold-pct is an alias for experiment-runner key mapping.")
     parser.add_argument(
         "--rsi-oversold",
         type=float,
@@ -2912,8 +3007,56 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         dest="breakeven_requires_tp1",
-        help="Move stop to breakeven only after TP1 partial fill (default: true).",
+        help="Move stop to breakeven only after TP1 partial fill (default: true). "
+             "When false, breakeven arms early at --breakeven-trigger-r (mirrors monitor.py).",
     )
+    parser.add_argument(
+        "--breakeven-trigger-r",
+        type=float,
+        default=None,
+        dest="breakeven_trigger_r",
+        help="R-multiple at which breakeven arms when --no-breakeven-requires-tp1 (default: 0.5).",
+    )
+    parser.add_argument(
+        "--intrabar-exits",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="intrabar_exits",
+        help="Trigger stops/TPs on bar high/low instead of close-only (default: true). "
+             "Use --no-intrabar-exits to reproduce legacy close-only results.",
+    )
+    parser.add_argument(
+        "--swing-stop-recent",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="swing_stop_recent",
+        help="Place swing stop below the MOST RECENT swing low instead of the lowest "
+             "swing low in the window (default: false = legacy behavior).",
+    )
+    parser.add_argument(
+        "--slippage-pct",
+        type=float,
+        default=0.0,
+        dest="slippage_pct",
+        help="Adverse slippage %% applied to every fill, entry and exit (default: 0.0; "
+             "0.1-0.3 is realistic for mid-cap crypto spot).",
+    )
+    parser.add_argument(
+        "--end-days-ago",
+        type=float,
+        default=0.0,
+        dest="end_days_ago",
+        help="End the data window N days before now (default: 0). Enables out-of-sample "
+             "splits, e.g. train: --days 1460 --end-days-ago 365, validate: --days 365.",
+    )
+    parser.add_argument("--tp1-R", type=float, default=None, dest="tp1_R",
+                        help="Override tp1_R (first target in R-multiples).")
+    parser.add_argument("--tp2-R", type=float, default=None, dest="tp2_R",
+                        help="Override tp2_R (second target in R-multiples; must be > tp1_R).")
+    parser.add_argument("--max-bars-in-trade", type=int, default=None, dest="max_bars_in_trade",
+                        help="Override max_bars_in_trade (time-based exit).")
+    parser.add_argument("--reversal-body-pct", type=float, default=None, dest="reversal_body_pct",
+                        help="Override reversal_body_pct for vwap_meanrev reversal confirmation.")
     parser.add_argument("--all-pairs",      action="store_true",
                         help="Explicit flag to use the full Kraken USD universe in pipeline mode. "
                              "This is now the DEFAULT when --symbol and --universe are both omitted.")
@@ -2933,6 +3076,15 @@ def main() -> None:
                              "volatility_breakout: COMPRESS/BREAKOUT/VOL/CANDLE  "
                              "htf_trend: EMA200/PULLBACK/EMA50/CANDLE")
     args = parser.parse_args()
+
+    # Module-level knobs shared by all strategy paths
+    global SLIPPAGE_PCT, END_DAYS_AGO
+    SLIPPAGE_PCT = args.slippage_pct
+    END_DAYS_AGO = args.end_days_ago
+    if SLIPPAGE_PCT:
+        print(f"  Slippage : {SLIPPAGE_PCT}% adverse per fill")
+    if END_DAYS_AGO:
+        print(f"  Window   : ends {END_DAYS_AGO:g} days ago (out-of-sample offset)")
 
     # Primary I1 name from docs / TASK D — canonical internal id is bull_flag_5m
     if args.strategy == "bull_flag":
@@ -3084,7 +3236,14 @@ def main() -> None:
             args.strategy in ("vwap_meanrev", "vwap_meanrev_1h")
             and cfg.get("htf_rsi_long_max") is not None
         ):
-            htf_iv = cfg.get("htf_rsi_bars_interval") or "4h"
+            htf_iv = cfg.get("htf_rsi_bars_interval") or "1h"
+            if htf_iv == interval:
+                print(
+                    f"\n  WARNING: --htf-rsi-bars-interval ({htf_iv}) equals the entry interval. "
+                    f"The HTF RSI gate is tautological in this configuration (HTF RSI == entry RSI, "
+                    f"already bounded by rsi_oversold) and will not reject any trades. "
+                    f"Use a different HTF interval (live parity: 1h)."
+                )
             vwap_htf_by_sym = {}
             print(f"\n[VWAP HTF RSI] Fetching {htf_iv} bars ({hist_label}) for HTF RSI gate…")
             for j, sym in enumerate(fetch_list):
@@ -3250,7 +3409,7 @@ def main() -> None:
             args.strategy in ("vwap_meanrev", "vwap_meanrev_1h")
             and cfg.get("htf_rsi_long_max") is not None
         ):
-            htf_iv = cfg.get("htf_rsi_bars_interval") or "4h"
+            htf_iv = cfg.get("htf_rsi_bars_interval") or "1h"
             try:
                 vwap_htf_single = fetch_binance_ohlcv_for_backtest(
                     args.symbol, htf_iv, span_days, no_cache=args.no_cache

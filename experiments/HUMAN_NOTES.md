@@ -103,15 +103,23 @@ to break out of the local optimum.)
 - `long_min_volume_ratio` — entry filter (in strategy.py)
 - `atr_stop_mult` — stop calculation (in strategy.py)
 
-### BROKEN — silently ignored (DO NOT propose until fixed)
-- `htf_rsi_long_max` — exp_004 and exp_005 identical to baseline
-- `breakeven_requires_tp1` — exp_006 and exp_008 identical to non-breakeven versions
+### FIXED 2026-06-09 (was: BROKEN — silently ignored)
+- `htf_rsi_long_max` — root cause was a tautological gate: HTF RSI was computed
+  on the same 4h series as entry RSI (rsi<=30 always implies htf_rsi<=35/40).
+  `htf_rsi_bars_interval` now defaults to **1h** (live parity) and backtest.py
+  prints a WARNING when it equals the entry interval.
+- `breakeven_requires_tp1` — `false` branch now implemented in
+  `backtest.check_exits()`: breakeven arms early at `breakeven_trigger_r`
+  (default 0.5R, mirrors monitor.py). Test with
+  `breakeven_requires_tp1: false` (runner already emits `--no-` for false bools).
 
-### Likely root cause
-The broken parameters affect logic that lives in `backend/positions/monitor.py`
-(the LIVE position manager), but `backtest.py` simulates exits via a different
-code path that never reads these config fields. The backtester needs to honor
-these parameters in its own exit simulation OR import the monitor logic.
+### MAJOR ENGINE CHANGE 2026-06-09 — re-baseline required
+`check_exits()` now triggers stops/TPs on bar high/low (intrabar), not close.
+ALL prior results are optimistic and not comparable. Re-run baseline before any
+new experiments. Legacy behavior available via `intrabar_exits: false`.
+New knobs: `slippage_pct`, `end_days_ago` (OOS splits), `swing_stop_recent`,
+`breakeven_trigger_r`, plus CLI flags for `tp1_R`, `tp2_R`, `max_bars_in_trade`,
+`reversal_body_pct`, `dev_threshold_pct`. See STRATEGY_KNOWLEDGE.md.
 
 ### Affected experiments to re-run after fix
-exp_004, exp_005, exp_006, exp_008
+ALL (engine change). Previously flagged: exp_004, exp_005, exp_006, exp_008
