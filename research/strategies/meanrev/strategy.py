@@ -67,9 +67,12 @@ class MeanReversionStrategy(BaseStrategy):
         # Price change history for RSI calculation
         self._price_changes: Deque[float] = deque(maxlen=config.rsi_period)
         
-        # Rolling window of bars for ATR calculation
-        # Need at least atr_period + 1 bars for ATR calculation
-        self._bars: Deque[MarketDataEvent] = deque(maxlen=max(config.atr_period + 1, config.lookback_period + 10))
+        # Rolling window of bars for ATR + ADX calculation
+        # ATR needs atr_period + 1 bars; ADX(14) needs at least 28 — keep 60 for
+        # a stable smoothed ADX value.
+        self._bars: Deque[MarketDataEvent] = deque(
+            maxlen=max(config.atr_period + 1, config.lookback_period + 10, 60)
+        )
         
         logger.info(
             f"Initialized MeanReversionStrategy: "
@@ -231,7 +234,29 @@ class MeanReversionStrategy(BaseStrategy):
             return None
         
         band_position = (bar.close - lower_band) / band_range
-        
+
+        # ADX regime gate — mean reversion fails in trending markets (module
+        # docstring: "The ADX filter is essential"). Previously this gate only
+        # existed in evaluate() (screener confidence scoring) and in
+        # backtest.py's meanrev entry check, so live trades could fire into
+        # strong trends that the backtest would have rejected. Mirrors
+        # backtest.py semantics: pass when ADX is not computable (graceful),
+        # block when ADX >= adx_max_threshold.
+        bars_list = list(self._bars)
+        if len(bars_list) >= 28:
+            adx = calculate_adx(
+                [b.high for b in bars_list],
+                [b.low for b in bars_list],
+                [b.close for b in bars_list],
+                period=14,
+            )
+            if adx is not None and adx >= self.config.adx_max_threshold:
+                logger.debug(
+                    f"Signal blocked by ADX regime gate: adx={adx:.1f} >= "
+                    f"{self.config.adx_max_threshold} (trending market)"
+                )
+                return None
+
         # Generate buy signal (oversold condition)
         # Price should be near lower band (band_position < 0.2) AND RSI oversold
         if band_position < 0.2 and rsi < self.config.rsi_oversold_threshold:
