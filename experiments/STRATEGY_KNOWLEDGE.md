@@ -14,6 +14,22 @@ explore a parameter not listed here, write a request to HUMAN_NOTES.md under
 - Never propose negative numbers unless explicitly noted as allowed
 - Boolean flags default to false unless noted
 
+## Engine-Level Parameters (ALL strategies, added 2026-06-09)
+
+These affect the backtest engine's exit simulation and data window. They apply
+to every strategy via shared `check_exits()`.
+
+| Parameter | Type | Default | Safe Range | Notes |
+|---|---|---|---|---|
+| `intrabar_exits` | bool | true | true/false | Stops/TPs trigger on bar high/low (realistic, matches live monitor). false = legacy close-only (inflates WR). Only set false for A/B comparison vs old results. |
+| `slippage_pct` | float | 0.0 | 0.0 — 0.5 | Adverse slippage % per fill. 0.1–0.3 realistic for mid-cap crypto spot. |
+| `end_days_ago` | float | 0 | 0 — 1095 | Ends the data window N days before now. Use for out-of-sample splits: train `days: 1460, end_days_ago: 365`, validate `days: 365, end_days_ago: 0`. A config is only a winner if it improves BOTH. |
+| `swing_stop_recent` | bool | false | true/false | true = stop anchored to MOST RECENT swing low instead of lowest swing in window. High-value experiment: changes stop distance and entire R framework. |
+| `breakeven_trigger_r` | float | 0.5 | 0.0 — 1.5 | Only active when `breakeven_requires_tp1: false` — R-multiple at which breakeven arms early (mirrors monitor.py). |
+
+IMPORTANT: results produced before 2026-06-09 used close-only exit triggers.
+They are NOT comparable to new runs. Re-establish the baseline first.
+
 ---
 
 ## VWAP Mean Reversion (vwap_meanrev)
@@ -181,14 +197,22 @@ Becomes: `--long-min-volume-ratio 1.5`
 Verify the flag exists in `backtest.py` by grepping for it. If the flag doesn't
 exist, the runner adds CLI passthrough automatically — but verify first.
 
-Known existing flags (as of last session):
+Known existing flags (as of 2026-06-09):
 - --rsi-oversold
 - --long-min-volume-ratio
 - --htf-rsi-long-max
-- --htf-rsi-bars-interval
+- --htf-rsi-bars-interval  (NOTE: now defaults to 1h; using the entry interval makes the gate tautological)
 - --strategy
 - --days
 - --interval
+- --dev-threshold / --dev-threshold-pct (alias added; experiments may use dev_threshold_pct directly)
+- --tp1-R / --tp2-R / --max-bars-in-trade / --reversal-body-pct (added 2026-06-09)
+- --breakeven-requires-tp1 / --no-breakeven-requires-tp1 (false branch now actually simulated)
+- --breakeven-trigger-r
+- --intrabar-exits / --no-intrabar-exits
+- --swing-stop-recent / --no-swing-stop-recent
+- --slippage-pct
+- --end-days-ago
 
 If you propose a parameter and the CLI flag doesn't exist, document this in
 HUMAN_NOTES.md under `## CLI Flags Needed`.
